@@ -1,0 +1,416 @@
+#!/usr/bin/php -q
+<?php
+
+include_once("/usr/local/sbin/shared_lib");
+
+// This gets called by BKS before every job
+//
+//	-Copy "HCA" from /mnt/restore/0/... => ADS/jobs/x/
+
+if(count($argv) <= 1){
+        $msg = "Insufficient parameters\n\n";
+        $msg .= "Usage: preJob jobID \n";
+        print $msg;
+	exit(1);
+}
+$jobID = $argv[1];
+if(count($argv) > 2){
+	$arg = $argv[2];
+}
+
+$j = null;
+
+try{
+	$j = getJob($jobID);
+}catch(Exception $ex){
+	print "Job $jobID not found. Error:" .$ex->getMessage() ."\n";
+	exit(1);
+}
+
+print "Job type: $j->type\n";
+
+if($j->type == jobType::restoreJob){ 
+	prepRestoreJob($j);
+}else if ( $j->type == jobType::backupJob || $j->type == jobType::rawBackup ||$j->type == jobType::agentBackup || $j->type == 100){
+	prepBackupJob($j);
+}else if ( $j->type == jobType::replicate || $j->type == jobType::rawReplicate ){
+	prepReplicateJob($j);
+}else if ( $j->type == jobType::offsiteJob ){
+	prepOffsiteJob($j);
+}
+
+exit(0);
+
+function prepOffsiteJob($j){ echo "Noop: offsite job\n";  }
+function prepRestoreJob($j){ 
+echo "restore\n";
+	prepJobDir($j);
+	// let's loop thru the VMs and generate the block list for the ABD
+	$msg = "Gathering version information for restore work...";
+	$veid = addJobLog($msg,3, $j->jobID, 0);
+	foreach($j->vmsInJob as $vm){
+		//makeRestoreBlockList($vm, $j->jobID);
+	}
+	updateJobLog("$msg  Complete", 0, $veid);
+}
+function prepReplicateJob($j){ 
+	doJobPolicy($j);
+	prepJobDir($j);
+	// all rep jobs can do this safely.  Easier then figuring exactly who needs it when
+//	if((array_key_exists("backup", $j->Options) && $j->Options["backup"]==1) && (!array_key_exists("doCBT",$j->Options) || $j->Options["doCBT"] == 0)){
+		checkEngineStatus($j);
+		setupBackupVMs($j);
+		$bits = explode(",",trim(file_get_contents($GLOBALS["agentShare"]."/munge.conf")));
+		addJobLog("Agents connecting to A3 on ". $bits[0].":".$bits[1], 0, $j->jobID, 0);
+//	}
+}
+
+
+function doJobPolicy(&$j){
+	if(array_key_exists("policyType", $j->Options) && $j->Options["policyType"] !=0 ){
+		$pt = $j->Options["policyType"];
+		$cmd = $GLOBALS["settings"]->alikeRoot."/hooks/processJobPolicy $j->jobID";
+		addJobLog("Detected policy job (type: $pt), evaluating now", 4, $j->jobID, 0);
+		exec($cmd);
+		$j = getJob($j->jobID);
+	}
+}
+
+function checkEngineStatus($j) {
+	// Check that the engine is ready
+	if(file_exists("/tmp/jads.status") == false) {
+		// Engine is not fully started yet.
+		$cmd = array();
+		$cmd["command"] = "verifyAds";
+		$cmd["site"] = "0";
+		$msg = "Waiting on data engine to finish rebuild: ";
+		$eid = addJobLog($msg, 3, $j->jobID, 0, 17100222);
+
+		try {
+			$barf = issueJavaCmd($cmd, $j->jobID, 0, $eid);
+			$msg = "$msg}<}100";
+			updateJobLog($msg, 0, $eid);
+		}catch(Exception $ex){
+			updateJobLogStatus(1, $eid);
+			$msg = "Failed communicate with data engine: ".$ex->getMessage();
+			addJobLog($msg, 1, $j->jobID, 0);
+			throw $ex;
+		}
+	}
+}
+
+
+function prepBackupJob($j){
+echo "got prepBackupJob \n";
+	checkEngineStatus($j);
+		
+	echo "Prepping BACKUP job stuff...\n";
+	// we should make the dirs, and add all the HCAs (if any)
+	// We can do the fuzzy stuff here too
+	doJobPolicy($j);
+	prepJobDir($j);
+	$bits = explode(",",trim(file_get_contents($GLOBALS["agentShare"]."/munge.conf")));
+	addJobLog("Agents connecting to A3 on ". $bits[0].":".$bits[1], 0, $j->jobID, 0);
+
+	if(array_key_exists("forceFull", $j->Options) && $j->Options["forceFull"] ==1 ){
+		addJobLog("Bypassing all dedup/caching due to job settings (forceFull)", 0, $j->jobID, 0);
+		return;
+	}
+
+	setupBackupVMs($j);
+
+}
+
+// This just preps the CBT and HCAs for the VMs
+function setupBackupVMs($j){
+
+	$as = "/home/alike/Alike/agentShare";
+	$cbtPath = "/home/alike/Alike/remoteDBs/cbtCache";
+	if(!is_dir($cbtPath)){ mkdir($cbtPath); }
+
+	$list = getUUIDPath($j->jobID);
+	foreach($j->vmsInJob as $vm){
+		$uuid = trim(strtoupper(str_replace("-","",$vm->UUID)));
+		echo "VM: $uuid\n";
+		$vmDir = "$as/jobs/$j->jobID/$vm->VMID";	// /home/alike/Alike/agentShare/jobs/
+		if(array_key_exists($uuid, $list)  ){
+			// Agent's should never use the 'agentless' CBT code path.  They require the HCA from the previous commited restore (makeHCA)
+			if(array_key_exists("doCBT",$j->Options) && $j->Options["doCBT"] == 1 && $vm->virtTech != 10){
+				// look at cbtCache/VMID.HCV, inside should be name of prevCBT snapshot w/ a timestamp
+				// make sure we have a backup from that snap (ts), otherwise disallow CBT
+				$cfile = "$cbtPath/$vm->VMID".".HCV";
+				if(!file_exists($cfile)){ 
+					addJobLog("No previous HCV marker found at $cfile.", 4, $j->jobID, $vm->VMID);
+					continue; 
+				}
+				$parts = explode("_", file_get_contents($cfile));
+				if(!isset($parts[2])){ 
+					addJobLog("Previous HCV marker is malformed. Skipping.", 4, $j->jobID, $vm->VMID);
+					continue; 
+				}
+				$oldTs = trim($parts[2]);
+				$path = "/mnt/restore/0/".$list[$uuid];
+				$verPath = "$path/$oldTs";
+				addJobLog("Found previous HCV marker with version $oldTs", 4, $j->jobID, $vm->VMID);
+				if(is_dir($verPath)){
+					$stamp = "$vmDir/cbt.HCV";
+					exec("echo $oldTs > $stamp");
+					$msg = "Found previous backup (CBT) for use ($oldTs)";
+					addJobLog($msg, 0, $j->jobID, $vm->VMID);
+					$cmd = "cp $verPath/*.hca $vmDir/";
+					exec($cmd);
+					continue;
+				}else{
+					$msg = "Previous CBT backup version ($oldTs) from HCV is missing from restoreFS. Baseline required.";
+					addJobLog($msg, 2, $j->jobID, $vm->VMID);
+				}
+			}
+				// we have a backup to use for the HCA
+				$ts = makeHCA($vmDir, $vm, $uuid, $list[$uuid], $j->jobID);
+				if($ts > 0){
+					// job log -> ?
+					$msg = "Found previous backup (delta) for cachemap";
+					addJobLog($msg, 0, $j->jobID, $vm->VMID);
+					$cbtStamp = "$vmDir/$ts.HCV";
+					exec("touch $cbtStamp");
+				}
+			//if($j->type != jobType::replicate){
+			//}
+		}else{
+			// try fuzzy match
+			$res = makeFuzzyHCA($vmDir, $vm, $list, $j->jobID);
+			if($res){
+				$msg = "Detected initial backup of system, found similar system for cachemap.";
+				addJobLog($msg, 2, $j->jobID, $vm->VMID);
+			}else{
+				// initial, job will take longer
+				$msg = "Detected initial backup of system, please note backup times will be longer.";
+				addJobLog($msg, 0, $j->jobID, $vm->VMID);
+			}
+		}
+	}
+
+}
+
+function getVerBS($inf){
+        if(!file_exists($inf)){
+                addJobLog("Checking info.meta file, but file does not exist ($inf)", 2, $j->jobID, $vm->VMID);
+                return "";
+        }
+        $meta = json_decode(file_get_contents($inf));
+        if ($meta === null && json_last_error() !== JSON_ERROR_NONE) {
+                addJobLog("Checking info.meta file, exists but fails decoding ($inf)", 2, $j->jobID, $vm->VMID);
+                return "";
+        }
+        return $meta->blockSize;
+}
+
+function makeFuzzyHCA($vmDir, $vm, $list, $jobID){
+	$vms = getSimiarVMs($vm->UUID);
+	if(!empty($vms)){
+		echo "We got stuff";
+		$uuid = trim(strtoupper(str_replace("-","",$vms[0])));
+		if(array_key_exists($uuid, $list)){
+			echo "We found a fuzzy match ($uuid)\n";
+			if(makeHCA($vmDir, $vm, $uuid,  $list[$uuid], $jobID) != -1){
+				return true;
+			}
+			return false;
+		}
+	}
+	return false;
+}
+
+function prepJobDir($j){
+	// make the job dir, and all the vm subdirs
+	echo "Prepping job dir: $j->jobID\n";
+
+	$path = $GLOBALS["settings"]->jobsPath ."/$j->jobID";
+	$vlp = $GLOBALS["settings"]->logsPath ."/";
+
+	addJobLog("Prepping ADS job folders (base and VM logs)", 4, $j->jobID, 0);
+	echo "Making base Job Dir: $path\n";
+	@mkdir($path);
+
+	foreach($j->vmsInJob as $vm){
+		$vpath = "$path/$vm->VMID";
+		
+		echo "Making VM dir: $vpath\n";
+		@mkdir($vpath);
+		
+		$vp = $vlp . $vm->VMID;
+		echo "Making VM log dir: $vp\n";
+		@mkdir($vp);
+	}
+}
+
+
+function getUUIDPath($jid){
+	$file = "/mnt/restore/0/uuid.list";
+	if(!file_exists($file)){
+		$msg = "RestoreFS not available (uuid.list missing).  Is the DataEngine service running?";
+		addJobLog($msg, 1, $jid, 0);
+		echo "$msg\n";
+		exit(1);
+	}
+
+	$raw = explode("\n",trim(file_get_contents($file)) );
+	$out = array();
+	foreach($raw as $l){
+		$bits = explode("=", $l);
+		if(count($bits) >=2){
+			$out[trim($bits[0])] = trim($bits[1]);
+		}
+	}
+
+	return $out;
+}
+
+function makeHCA($jobDir, $vm, $uuid, $folder, $jobID){
+	$path = "/mnt/restore/0/$folder";
+	print "Making HCA for $vm->VMName\n";
+
+	$files = array();
+	$dir = opendir($path); 
+	while(false != ($file = readdir($dir))) {
+		if(($file != ".") and ($file != "..") ) {
+			$files[] = $file; // put in array.
+		}  
+	}
+	natsort($files);
+	$files = array_reverse($files);// we want the most recent
+	$winner = $files[0];
+
+	$curBS = getSetting("blockSize") * 1024;	// bs in bytes
+	$verBS = getVerBS("$path/$winner/info.meta");
+	if($verBS != $curBS){
+		$j = getJob($jobID);
+		// we need our blocksize doesn't match
+		print "The previous version selected for HCA use has a different blocksize:  $vm->VMName\n";
+		if($vm->virtTech == 10){
+			// noop.  Agent's require the HCA for their CBT process.
+		}else if(array_key_exists("doCBT", $j->Options) && $j->Options["doCBT"] ==1 ){ 
+			addJobLog("CBT version has differnt blocksize! unable to use. (Cur: $curBS vs $verBS)", 2, $jobID, $vm->VMID);
+			return -1;
+		}else if(array_key_exists("QHB", $j->Options) && $j->Options["QHB"] ==1 ){
+			// QHB can have a BS mismatch
+		}else{
+			addJobLog("HCA (cache) version has differnt blocksize. Unable to use, so CBT must be rebuilt. (Cur: $curBS vs $verBS)", 4, $jobID, $vm->VMID);
+			return -1;
+		}
+	}
+	
+
+	if(empty($files)){
+		print "Odd, I couldn't find any versions for $vm->VMName\n";
+		addJobLog("Could not find version for HCA for $vm->VMName", 4, $jobID, 0);
+		return 0;
+	}
+	$i=0;
+	$d= "";
+	while(true){
+		$f = "$path/$winner/".$i.".hca";
+		if(file_exists($f)){
+			echo "I found: $f\n";
+			$d = $jobDir ."/$i.HCA";	// note: hca/hcl content must be in lower case
+//			$cmd = "cp $f $d ";
+//			echo shell_exec($cmd);
+			if (copy($f, $d)) {
+				addJobLog("Copied HCA $f to $d", 4, $jobID, 0);
+			} else {
+				$err = error_get_last();
+				addJobLog("Failed to copy HCA $f from restoreFS!  Error: ".$err['message'], 1, $jobID, 0);
+			}
+		}else{
+			break;
+		}
+		$i++;
+	}
+	$cmd = array();
+        $cmd["command"] = "lockVersion";
+        $cmd["version"] = $winner;
+        $cmd["uuid"] = $uuid;
+        $cmd["site"] = "0";
+        $cmd["lockFile"] = $d;
+
+	$eid = addJobLog("Locking backup version $winner.  Sending Engine cmd...", 4, $jobID, 0);
+	issueJavaCmd($cmd, $jobID, $vm->VMID, 0);
+	updateJobLog("Locking backup version $winner.  Sending Engine cmd... Complete ",4, $eid);
+	addJobLog("Created HCA for $vm->VMName from ts: $winner ($uuid)", 4, $jobID, 0);
+
+	return $winner;
+}
+
+function makeRestoreBlockList($vm, $jid){
+	// get version ts
+	// make sure hcl is there
+	// make sure job path is there
+	// loop over hcl and write the line number for all non-blank blocks to this file
+
+	$uuid = str_replace("-","",strtoupper($vm->UUID));
+	$uglyName = trim(shell_exec("cat /mnt/restore/0/uuid.list | grep $uuid |tr '=' ' ' | awk {'print \$2'}" )) ;
+	echo "I got $uglyName\n";
+	$sql = "SELECT timestamp from vm_version where vmid=$vm->VMID and vmversion=$vm->VM_Version";
+	$ts = dbGetColumn("nimbus", $sql);
+
+	if($ts==0){
+		echo "Unable to find backup version for VM\n";
+		addJobLog("Unable to find backup version ($vm->VM_Version) for VM ($vm->VMID) in system. Removing from job.",2, $jid, $vm->VMID);
+		$sql = "delete from job_vms where vmid=? and jobid=?";
+		dbSet("nimbus",$sql, array($vm->VMID, $jid) );
+		return;
+	}
+
+	$jobBase = $GLOBALS["settings"]->jobsPath ."/$jid";
+	$vmpath = "$jobBase/$vm->VMID";
+	exec("mkdir -p $vmpath");
+	$base = "/mnt/restore/0/$uglyName/$ts/";
+	$i =0;
+	while(true){
+		$cnt=0;
+		$hcl = $base ."$i.hcl";
+		if(file_exists($hcl)){
+			$lines = array();
+			$file = fopen($hcl, "r");
+			while(!feof($file)) {
+				$line = trim(fgets($file));
+				if($line == "CODA"){ echo "Skipping CODA!\n"; continue; }
+				//if($line != "59071590099d21dd439896592338bf95"){ 
+				if(!isBlankBlock($line)){
+//					echo "Adding print on line $cnt ($line)\n";
+					array_push($lines, $cnt);
+				}else{
+//					echo "Skipping blank on line $cnt ($line)\n";
+				}
+				$cnt++;
+			}
+			fclose($file);
+			$blklist = "$vmpath/$i.bkl";
+			file_put_contents($blklist, implode(PHP_EOL, $lines));
+			if(empty($lines)){
+				echo "We found no data for this version! (disk $i)\n";
+				addJobLog("Completed blocklist for restore (possible blank disk)",4, $jid, $vm->VMID);
+			}else{
+				echo "Wrote blocklist to $blklist\n";
+				addJobLog("Completed blocklist for restore",4, $jid, $vm->VMID);
+			}
+		}else{
+			break;
+		}
+
+		$i++;
+	}
+}
+
+function isBlankBlock($str){
+	if($str == "59071590099d21dd439896592338bf95") { return true; }	// 512
+	if($str == "b6d81b360a5672d80c27430f39153e2c") { return true; }	// 1MB
+	if($str == "b2d1236c286a3c0704224fe4105eca49") { return true; }	// 2MB
+	if($str == "b5cfa9d6c8febd618f91ac2843d50a1c") { return true; }	// 4MB
+	if($str == "96995b58d4cbf6aaa9041b4f00c7f6ae") { return true; }	// 8MB
+
+	return false;
+
+}
+
+?>

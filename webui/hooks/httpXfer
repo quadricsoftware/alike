@@ -1,0 +1,101 @@
+#!/usr/bin/php -q
+<?php
+
+include_once("/usr/local/sbin/shared_lib");
+
+if($argc < 3){
+        $msg = "Insufficient parameters\n\n";
+        $msg .= "Usage: <src file> <target url>\n";
+        print $msg;
+        exit(1);
+}
+$src = $argv[1];
+$dst = $argv[2];
+$max=0;
+if($argc == 4 && $argv[3] == "upload"){
+	upload($src, $dst);
+}else{
+	if($argc == 4 && is_numeric($argv[3])){
+		$max = $argv[3];
+	}
+	download2($src, $dst, $max);
+	//download($src, $dst);
+}
+
+function download($src, $dst){
+	set_time_limit(0);
+	$fp = fopen ($dst, 'w+');
+	//Here is the file we are downloading, replace spaces with %20
+	$ch = curl_init(str_replace(" ","%20",$src));
+	curl_setopt($ch, CURLOPT_TIMEOUT, 50);
+	// write curl response to file
+	curl_setopt($ch, CURLOPT_FILE, $fp); 
+	curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+	// get curl response
+	echo curl_exec($ch); 
+	curl_close($ch);
+	fclose($fp);
+}
+
+function download2($src, $dst, $max){
+	$arOpts=array(
+	    "ssl"=>array(
+		"verify_peer"=>false,
+		"verify_peer_name"=>false,
+	    ),
+	); 
+
+	$rh = fopen($src, 'rb',false, stream_context_create($arOpts));
+	$wh = fopen($dst, 'w+b');
+	$amt =0;
+	$chunk = 1024 * 4;
+	if (!$rh || !$wh) { return false; }
+	while (!feof($rh)) {
+		if (fwrite($wh, fread($rh, $chunk)) === FALSE) {
+		    return false;
+		}
+		flush();
+		$amt+= $chunk;
+		if($max > 0 && $amt >= $max) { return true; }
+	}
+	fclose($rh);
+	fclose($wh);
+	if(!file_exists($dst)){
+		echo "Failed to download file";
+	}
+}
+
+
+function upload($src, $dst){
+	if(!file_exists($src)){
+		echo "Can't find file to upload: $src";
+		exit(1);
+	}
+	if(!function_exists('curl_version') ){
+		echo "WARNING: Could not find libcurl extension, using command as fallback.\n";
+		return shell_upload($src, $dst);
+	}
+
+
+	$curl = curl_init();
+	curl_setopt( $curl, CURLOPT_PUT, 1 );
+	curl_setopt( $curl, CURLOPT_INFILESIZE, filesize($src) );
+	curl_setopt( $curl, CURLOPT_INFILE, ($in=fopen($src, 'r')) );
+	curl_setopt( $curl, CURLOPT_CUSTOMREQUEST, 'PUT' );
+	curl_setopt( $curl, CURLOPT_HTTPHEADER, [ 'Content-Type: application/octet-stream' ] );
+	curl_setopt( $curl, CURLOPT_URL, $dst );
+	curl_setopt( $curl, CURLOPT_RETURNTRANSFER, 1 );
+	$result = curl_exec($curl);
+	echo $result;
+	curl_close($curl);
+	fclose($in);
+}
+
+// this is inferior as the curl cmd loads the entire binary to memeory before uploading.
+function shell_upload($src, $dst){
+	$cmd = "curl --insecure -L -silent -S -X PUT --data-binary $src \"$dst\" 2>1";
+	$cmd = "curl --insecure -L -silent -S -X PUT \"$dst\" --upload-file $src";
+	echo shell_exec($cmd);
+}
+
+?>

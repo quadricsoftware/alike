@@ -1,0 +1,118 @@
+<project name="blockvaulter" default="dist" basedir=".">
+  <description>
+    Block Vaulter
+  </description>
+  <!-- set global properties for this build -->
+  <property name="src" location="src"/>
+  <property name="build" location="build"/>
+  <property name="dist" location="dist"/>
+  <property name="lib" location="lib" />
+  <property name="conf" location="conf" />
+  <property name="gensource" location="../../gen/src/headers/generated" />
+
+
+  <target name="init">
+    <!-- Create the time stamp -->
+    <tstamp/>
+    <!-- Create the build directory structure used by compile -->
+    <mkdir dir="${build}"/>
+  </target>
+
+<!-- Some aliases -->
+  <target name="/Build" depends="dist" />
+  <target name="/build" depends="dist" />
+  <target name="/Rebuild" depends="clean,dist" />
+  <target name="/rebuild" depends="clean,dist" />
+  <target name="/Clean" depends="clean" />
+  <target name="/clean" depends="clean" />
+  
+
+  <target name="compile" depends="init"
+        description="compile the source">
+    <!-- Compile the java code from ${src} into ${build} -->
+    <javac 
+		destdir="${build}" 
+		verbose="false" 
+		includeantruntime="false"
+		target="1.8"
+		source="1.8"
+		debug="on"
+		excludes="**/test/**">
+	<src path="${src}"  />
+	<src path="${gensource}" />
+	<classpath>
+		<fileset dir="${lib}">
+			<include name="*.jar" />
+		</fileset>
+	</classpath>
+    </javac>
+	
+	<javah destdir="${gensource}" class="quadric.util.Flocker" classpath="${build}" />
+	<javah destdir="${gensource}" class="quadric.util.SharedMem" classpath="${build}" />
+
+  </target>
+  
+  <target name="compileWithTests" depends="init"
+        description="compile the source">
+    <!-- Compile the java code from ${src} into ${build} -->
+    <javac 
+		srcdir="${src}" 
+		destdir="${build}" 
+		verbose="false" 
+		includeantruntime="false"
+		target="1.8"
+		source="1.8"
+		debug="on">
+	<classpath>
+		<fileset dir="${lib}">
+			<include name="*.jar" />
+		</fileset>
+	</classpath>
+		
+    </javac>
+  </target>
+
+  <target name="dist" depends="compile"
+        description="generate the distribution">
+    <!-- Create the distribution directory -->
+    <mkdir dir="${dist}/lib"/>
+
+    <!-- Put everything in ${build} into the MyProject-${DSTAMP}.jar file -->
+    <jar jarfile="${dist}/lib/blockvaulter.jar" basedir="${build}">
+	    <manifest>
+	    <attribute name="Main-Class" value="quadric.blockvaulter.BlockVaulter"/>
+	  </manifest>
+  </jar>
+    <!-- Put all LIBS here for fun -->
+    <copy todir="${dist}/lib">
+	<fileset dir="${lib}" />
+    </copy>
+    
+    <!-- Copy config here too -->
+    <copy todir="${dist}/lib">
+	<fileset dir="${conf}" />
+    </copy>
+    
+    <echotimestamp />
+  </target>
+
+
+  <target name="clean"
+        description="clean up">
+    <!-- Delete the ${build} and ${dist} directory trees -->
+    <delete dir="${build}"/>
+    <delete dir="${dist}"/>
+  </target>
+  
+  <macrodef name="echotimestamp">
+  <sequential>
+    <local name="timestamp" />
+    <tstamp>
+      <format property="timestamp" pattern="yyyy-MM-dd HH:mm:ss" />
+    </tstamp>
+    <echo message="${timestamp}" />
+  </sequential>
+</macrodef>
+<echotimestamp />
+  
+</project>

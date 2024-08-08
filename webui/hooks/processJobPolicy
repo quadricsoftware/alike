@@ -1,0 +1,200 @@
+#!/usr/bin/php -q
+<?php
+
+include_once("/usr/local/sbin/shared_lib");
+include_once("/usr/local/sbin/common_lib");
+include_once("/usr/local/sbin/xen_common");
+
+// This gets called before every job
+//
+
+if(count($argv) <= 1){
+        $msg = "Insufficient parameters\n\n";
+        $msg .= "Usage: processJobPolicy jobID \n";
+        print $msg;
+	exit(1);
+}
+$jobID = $argv[1];
+if(count($argv) > 2){
+	$arg = $argv[2];
+}
+
+$j = null;
+
+try{
+	$j = getJob($jobID);
+}catch(Exception $ex){
+	print "Job $jobID not found. Error:" .$ex->getMessage() ."\n";
+	exit(1);
+}
+
+
+if(!array_key_exists("policyType", $j->Options)){
+	echo "No policy info found for job.\n";
+}else if( $j->Options["policyType"]==0){
+	echo "Not a policy job!\n";
+}
+
+$p=$j->Options["policyType"];
+if($p ==1){
+	addJobLog("Found a host policy", 4, $j->jobID, 0);
+	processHostPolicy($j);
+}else if($p==2){
+	echo "Processing String based policy.\n";
+	$tag = $j->Options["policyFilterString"];
+	addJobLog("Processing Keyword  policy, searching for systems matching \"$tag\" this may take a moment...", 0, $j->jobID, 0);
+	processStringPolicy($j);
+
+}else if($p==3){
+	echo "Processing Tag based policy.\n";
+	$tag = $j->Options["policyFilterString"];
+	addJobLog("Processing XenServer Tag policy, searching for tag \"$tag\" this may take a moment...", 0, $j->jobID, 0);
+	processTagPolicy($j);
+}
+
+$j = getJob($j->jobID);
+$num = count($j->vmsInJob);
+if($num ==0){
+	addJobLog("Processing complete.  No VMs were found!", 2, $j->jobID, 0);
+}else{
+	$vz = "VMs were";
+	if($num == 1){ $vz = "VM was"; }
+	addJobLog("Processing complete.  $num $vz matched and added to the job.", 0, $j->jobID, 0);
+}
+
+exit(0);
+
+print "Job type: $j->type\n";
+
+function makeVM($uuid,$name,$virt, $hostID, $poolID, &$db){
+	print "adding $uuid to VM table\n"; 
+	$sql = "INSERT into VM (VMName,virtTech,hostID,deleteFlag, maxVersions, UUID, poolID, maxVersionsOffsite,authProfile) VALUES(?,?,?,NULL,5,?,?,5,0)";
+	$id = dbSet("nimbus", $sql, array($name,$virt,$hostID,$uuid,$poolID));
+	//	VMID|VMName|virtTech|hostID|deleteFlag|maxVersions|UUID|poolID|maxVersionsOffsite|authProfile|accessIP
+	addJobLog("Adding DB entry for newly included VM ($name).", 4, $j->jobID, 0);
+	return $id;
+}
+function processHostPolicy($j){
+	echo "Processing Host based policy.\n";
+	// get all the VMs on any host in the job
+	$hids =$j->Options["policyHosts"];
+	$msg = "We found ". count($hids) ." hosts to add.";
+	addJobLog("$msg", 0, $j->jobID, 0);
+
+        // filter out anyone that might be ignored
+        $ignored = getVmsByTag("AlikeIgnore");
+
+	foreach($hids as $hid){
+		$h = getHost($hid);
+		$sql = "SELECT v.VMID, tv.uuid, tv.name, tv.poolID ,h.uuid as hostUUID,h.virtType from tm_vminfo tv, tm_vhost th, host h left join vm v on v.UUID = tv.uuid where h.hostID=? and h.uuid = th.uuid and tv.hostUUID = th.uuid";
+		if($h->type == 10){
+			$sql = "SELECT * from VM where hostID = ?";
+		}
+		$all = dbGet("nimbus", $sql, array($hid) );
+		foreach ($all as $key => $v) {
+		    foreach ($ignored as $ignoreMe) {
+			if ($v->uuid === $ignoreMe->uuid) {
+			    unset($all[$key]);
+			    break;
+			}
+		    }
+		}
+
+		foreach($all as $v){
+			$id=0;
+			if(!$v->VMID){ 
+				$id = makeVM($v->uuid, $v->name, $v->virtType, $hid, $v->poolID, $db);
+			}
+			else{ $id=$v->VMID; }
+			$sql = "INSERT into job_vms (jobID,VMID, VM_Version) values(?, ?,0)";
+			dbSet("nimbus", $sql, array($j->jobID, $id) );
+		}
+		// jobID|VMID|VM_Version
+	}
+}
+
+function processStringPolicy($j){
+	$q = $j->Options["policyFilterString"];
+	$sql = "SELECT v.VMID, tv.uuid, tv.name, tv.poolID ,h.hostID, h.virtType from tm_vminfo tv, tm_vhost th, host h left join vm v on v.UUID = tv.uuid where tv.name LIKE '%$q%' and h.uuid = th.uuid and tv.hostUUID = th.uuid";
+	$all = dbGet("nimbus", $sql);
+
+        // filter out anyone that might be ignored
+        $ignored = getVmsByTag("AlikeIgnore");
+        foreach ($all as $key => $v) {
+            foreach ($ignored as $ignoreMe) {
+                if ($v->uuid === $ignoreMe->uuid) {
+			echo "Ignoring this guy $key!\n";
+                    unset($all[$key]);
+                    break;
+                }
+            }
+        }
+
+	foreach($all as $v){
+		$id=0;
+		try{
+			if(!$v->VMID){ 
+				$id = makeVM($v->uuid, $v->name, $v->virtType, $v->hostID, $v->poolID, $db);
+				addJobLog("Added a new VM ($v->name) to VMs", 0, $j->jobID, 0);
+			}
+			else{ $id=$v->VMID; }
+			if(!is_numeric($id)){
+				echo "Bad VMID for VM: $v->uuid. Skipping.\n";
+				continue;
+			}
+			$sql = "INSERT into job_vms (jobID,VMID, VM_Version) values(?, ?,0)";
+			dbSet("nimbus", $sql, array($j->jobID, $id));
+		}catch(Exception $ex){
+			addJobLog("Failed to add VM ($id) to Job: ".$ex->getMessage(), 2, $j->jobID, 0);
+		}
+
+	}
+}
+
+function processTagPolicy($j){
+	$resFile = $GLOBALS["tempPath"] ."/". $j->jobID.".policy";
+	$tag = $j->Options["policyFilterString"];
+
+	$vms = getVmsByTag($tag);
+	// filter out anyone that might be ignored
+	$ignored = getVmsByTag("AlikeIgnore");
+	foreach ($vms as $key => $v) {
+	    foreach ($ignored as $ignoreMe) {
+		if ($v->uuid === $ignoreMe->uuid) {
+		    unset($vms[$key]);
+		    break; 
+		}
+	    }
+	}
+	$guys = array();
+
+		foreach($vms as $v){
+
+			$vmid = getVMID($v->uuid);
+			if($vmid==0){
+				$vm = makeNewVM($v->uuid);
+				$vmid= $vm->vmid;
+			}
+			if(!is_numeric($vmid)){
+				echo "Bad VMID for VM: $v->uuid. Skipping.\n";
+				continue;
+			}
+
+			try{
+				$sql = "INSERT into job_vms (jobID,VMID, VM_Version) values(?, ?,0)";
+				dbSet("nimbus", $sql, array($j->jobID, $vmid) );
+				array_push($guys, $vmid);
+			}catch(Exception $ex){
+				echo "Error in query:\n$sql\n";
+				echo $ex->getMessage();
+			}
+
+		}
+
+	if(empty($guys)){
+		addJobLog("Tag policy processing found no matches for '$tag'", 2, $j->jobID, 0);
+	}
+
+}
+
+?>

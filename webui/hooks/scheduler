@@ -1,0 +1,147 @@
+#!/usr/bin/php -q
+<?php
+
+include_once("/usr/local/sbin/shared_lib");
+include_once("/usr/local/sbin/common_lib");
+
+if(!isADSMounted() && schedulerState() ){
+        echo "ADS is not mounted, scheduled tasks are disabled.\n";
+        syslog(LOG_WARNING,"ADS is not mounted, scheduled tasks are disabled.");
+        exit();
+}
+
+if(file_exists("/mnt/ads/read_only")) {
+	// Read-only mode is engaged...
+	exit(0);
+}
+
+//if(!schedulerState()){
+//        echo "Scheduler disabled\n";
+//        syslog(LOG_WARNING,"Scheduler service is disabled, scheduled tasks will not run.");
+//        exit();
+//}
+
+//if(getSetting("readOnlyMode") == "true"){
+//        syslog(LOG_WARNING,"Read only mode enabled.  Scheduled tasks disabled.");
+//        die("Read only mode enabled.  Schedules disabled");
+//}
+
+killallButMe();
+
+function killallButMe(){
+	$us =  basename(__FILE__);
+	$pids = explode(PHP_EOL,trim(shell_exec("pgrep $us")));
+	$cnt = count($pids);
+	if($cnt > 1) {
+		$pid = getmypid();
+		echo "PID count: $cnt (us: $us)\n";
+		foreach($pids as $p){
+			if($p == $pid){ continue; }
+			echo "Killing other $us: $p\n";
+			exec("kill -9 $p");
+		}
+	}
+}
+
+$ss = getSchedulesToMonitor();
+
+$schedRunning = schedulerState();
+$ro = false;
+if(getSetting("readOnlyMode") == "true"){ $ro = true; }
+
+foreach($ss as $s){
+	$doit = shouldRun($s);
+	if($doit){
+		if($schedRunning == false){
+			syslog(LOG_WARNING,"Scheduled job ($s->name) failed to run because Scheduler Service is disabled!");
+		}else if($ro == true){
+			syslog(LOG_WARNING,"Scheduled job ($s->name) failed to run because the system is in READ-ONLY MODE!");
+		}else{
+			doRun($s);
+		}
+	}
+}
+
+
+function shouldRun($s){
+	if($s->isActive ==0){ return false;}
+
+	$now = time();
+	$dayOfWeek = date("w", $now);	// our days are 0-6. Sun =0, Sat=6
+	$dayOfMonth = date("j", $now);
+
+	if($now - $s->lastran < 90){
+		echo "Skipping job we just ran $s->name\n";
+		return false;
+	}
+
+	if($s->scheduleType == 2){
+		// one off job
+		$diff = abs($now - $s->timestamp);
+		if($diff <= 75){
+			return true;
+		}
+	}else if($s->scheduleType == 0){
+		// daily
+		if(!in_array($dayOfWeek, $s->days)){ return false; }
+		return matchTime($s);
+
+	}else if($s->scheduleType == 3){
+		// weekly
+		if(!in_array($dayOfWeek, $s->days)){ return false; }
+		return matchTime($s);
+	}else if($s->scheduleType == 1){
+		// monthly
+		$sMonth = date("j", $s->timestamp);
+		if($sMonth == $dayOfMonth){
+			return matchTime($s);
+		}
+	}else if($s->scheduleType == 5){
+		// skip these
+	}else{
+		echo "Found a schedule of UNKNOWN TYPE: $s->name ($s->scheduleType)\n";
+		syslog(LOG_WARNING, "Alike scheduler found schedule of unknown type($s->scheduleType) $s->name");
+	}
+
+	return false;
+}
+
+function matchTime($s){
+	$now = time();
+	$nowHour = date("G", $now);
+	$nowMin = date("i", $now);
+	$sHour = date("G", $s->timestamp);
+	$sMin = date("i", $s->timestamp);
+	if($sHour == $nowHour && $sMin == $nowMin){ return true; }
+	if($s->occurances <=1){ return false; }	// only 1 occurance
+
+	while($s->occurances != 1){
+		$s->timestamp += $s->interval;
+		$sHour = date("G", $s->timestamp);
+		$sMin = date("i", $s->timestamp);
+		if($sHour == $nowHour && $sMin == $nowMin){ return true; }
+		$s->occurances--;
+	}
+	return false;
+
+}
+
+function doRun($s){
+	echo "<". time() ."> Running Schedule: $s->name\n";
+	syslog(LOG_NOTICE, "Beginning Alike Job ($s->name)");
+	$base = $GLOBALS['settings']->scripts;
+
+	//if ( $s->jobType == jobType::backupJob ){
+		$cmd = "$base/jobRunner -s $s->scheduleID";
+		exec($cmd. " > /dev/null &");   // you must dev null to background
+//	}else{
+//		$base = $GLOBALS['settings']->alikeRoot;
+//		$cmd = "wine $base/AlikeCmd.exe -i scheduleRunNow $s->scheduleID";
+//		$res = shell_exec($cmd);
+//	}
+
+}
+
+
+
+?>

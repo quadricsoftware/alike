@@ -1,0 +1,63 @@
+#!/usr/bin/php -q
+<?php
+
+include_once("/usr/local/sbin/shared_lib");
+
+/*
+	This script enumerates all the meta information on hosts.
+	It is run by cron, and never outputs to a job log
+*/
+
+
+if(isADSMounted() ==  false){
+	echo "Cannot run enumeration when ADS is not mounted\n";
+	gen_log(LOG_DEBUG, "ADS not mounted, no metainfo gathering will occur");
+	exit(1);
+}
+
+
+cleanVmInfos();
+gatherAllSimple();
+cleanStaleVmEntries();
+
+
+function gatherAllSimple(){
+	$start = time();
+	echo "Gathering all Xen host information...\n";
+	echo shell_exec("/home/alike/Alike/hooks/gatherXenMeta 0");
+	echo "Gathering all Hyper-v host information...\n";
+	echo shell_exec("/home/alike/Alike/hooks/gatherHVMeta 0");
+	echo "Gathering all Physical (Windows) host information...\n";
+	echo shell_exec("/home/alike/Alike/hooks/gatherPhyMeta 0");
+
+	$total = time() - $start;
+	echo "Complete in $total seconds\n";
+}
+
+
+function cleanStaleVmEntries(){
+	try{
+		$sql = "SELECT * FROM vm WHERE NOT EXISTS (SELECT 1 FROM tm_vminfo WHERE vm.uuid = tm_vminfo.uuid);";
+		$guys =  dbGet("nimbus", $sql);
+		foreach($guys as $g){
+			$sql = "select count(*) from vm_version where vmid=?";
+			$num = dbGetColumn("nimbus", $sql, array($g->VMID) );
+			if($num ==0){
+				dbSet("nimbus", "DELETE from vm where vmid=$g->VMID");
+			}
+		}
+        }catch(Exception $ex){
+                gen_log(LOG_ERR, "Failure in DB update: ". $ex->getMessage());
+        }
+}
+
+function cleanVmInfos(){
+
+        try{
+                dbSet("nimbus","DELETE FROM tm_vminfo WHERE uuid IN ( SELECT vi.uuid FROM tm_vminfo vi LEFT JOIN vm v ON vi.uuid = v.uuid WHERE v.uuid IS NULL)"); // clean any tm_vminfo w/ no vm entry
+        }catch(Exception $ex){
+                gen_log(LOG_ERR, "Failure in to clean TmInfos: ". $ex->getMessage());
+        }
+}
+
+?>

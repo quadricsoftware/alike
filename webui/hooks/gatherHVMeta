@@ -1,0 +1,168 @@
+#!/usr/bin/php -q
+<?php
+include_once("/usr/local/sbin/common_lib");
+include_once("/usr/local/sbin/hv_common");
+include_once("/usr/local/sbin/shared_lib");
+
+
+if( (count($argv) == 2 && $argv[1] == "-h") ){
+        echo "Usage:\n";
+        echo "gatherHVMeta <hostID>\n";
+        echo "If hostID is 0, or omitted, all HV hosts will be included.\n\n";
+        exit(0);
+}
+
+$hid =0;
+if(count($argv) >=2){
+	$hid = $argv[1];
+	if(!is_numeric($hid)){
+		echo "Invalid hostID: $hid\n";
+		exit(1);
+	}
+        if(count($argv) > 3 && $argv[2] == '-j'){
+                echo "I got jobid: $argv[3]\n";
+                $GLOBALS["__insta_job_id"] = $argv[3];
+                gen_log(LOG_INFO, "Starting enumeration for hostID: $hid");
+        }
+
+}
+
+
+$start = microtime(true);
+
+
+try{
+	if($hid==0){
+                gen_log(LOG_INFO, "Starting enumeration for all Hyper-v hosts");
+		$seen = array();
+		$hosts = getHosts();
+		foreach($hosts as $h){
+			if($h->type != 3){ continue; }
+			if(in_array($h->uuid, $seen)){ continue; }
+			array_push($seen, $h->uuid);
+			updateFromHost($h->hostID);
+		}
+	}else{
+		echo "Updating 1 host\n";
+		try{
+			$test = getHost($hid);
+		}catch(Exception $ex){
+			die($ex->getMessage(). "\n");
+		}
+		updateFromHost($hid );
+	}
+}catch(Exception $ex){
+	die($ex->getMessage(). "\n");
+	exit(1);
+}
+
+$t1 = microtime(true);
+$sec = ($t1 - $start);
+echo "Completed API stuff in $sec seconds.\n";
+
+function updateFromHost($hid, $isInitial=false){
+	$h = getHost($hid);
+	gen_log(LOG_INFO, "Beginning update for host: $h->nativeName");
+	$st = agentStatus($h->name);
+	if(empty($st) || !is_object($st)){
+		throw new Exception("Failed to connect to host agent! ($h->name)");
+	}
+	recordAgent($hid, $st, true);
+	$ip = $h->name;
+	gen_log(LOG_INFO, "Checking Agent status...  Received: ".$st->version);
+
+
+	$q =  "SELECT DNSHostName, Name,NumberOfProcessors,TotalPhysicalMemory,HypervisorPresent from Win32_ComputerSystem";
+	$out= agentWmiCmd($ip, $q );
+	$hvInfo1 = agentParseWmi($out);
+	$h->totalMemory = $hvInfo1->TotalPhysicalMemory;
+	$h->numcpu = $hvInfo1->NumberOfProcessors;
+	$h->nativeName = $hvInfo1->Name;
+
+	$q = "SELECT Caption,Version,FreePhysicalMemory  from Win32_OperatingSystem";
+	$out= agentWmiCmd($ip, $q );
+	$hvInfo = agentParseWmi($out);
+	$h->osName = $hvInfo->Caption;
+	$h->freeMemory =$hvInfo->FreePhysicalMemory;
+
+	gen_log(LOG_INFO, "Collecting VM information...");
+	$vms = getVmsOnHvHost($h, true);
+	gen_log(LOG_INFO, "Scrubbing orphaned data");
+	cleanOrphans($vms, $h->uuid);
+
+	gen_log(LOG_INFO, "Updating local DBs");
+	try{
+		$sql = "UPDATE host set uuid=?, poolID=?, lastUsed=? where hostID=?";
+		dbSet("nimbus", $sql, array($h->uuid, $h->poolID, time(), $h->hostID) );
+		$q =  "INSERT OR REPLACE INTO tm_vhost (uuid,name,poolid,nativeName,numcpu,totalMemory,freeMemory,osName) VALUES (?,?,?,?,?,?,?,?)";
+                dbSet("nimbus",$q, array( $h->uuid,$h->name,$h->poolID,$h->nativeName,$h->numcpu,$h->totalMemory,$h->freeMemory,$h->osName  ) );
+                echo "Updated tm_vhost for $h->name \n";
+
+		echo "culling orphaned tm_vminfos\n";
+		dbSet("nimbus", "delete from tm_vminfo where hostUUID NOT IN (select uuid from host) and uuid not in (select uuid from vm where virttech=10)") ;
+
+		foreach($vms as $vm){
+			// isHidden is the new virttype!
+                        $q =  "INSERT OR REPLACE INTO tm_vminfo (uuid,name,osName,powerState,isTemplate,isHidden,hostUUID,poolid,size,ipaddress) VALUES (?,?,?,?,?,?,?,?,?,?)";
+                        dbSet("nimbus",$q, array( $vm->uuid, $vm->name, $vm->osName,$vm->powerState, 0, 3,$vm->hostUUID, $vm->poolID,$vm->size,$vm->ipaddress  ) );
+
+			$sql= "delete from tm_vmdisk where vmuuid =?" ;
+			dbSet("nimbus",$sql,  array($vm->uuid));
+
+                        foreach($vm->disks as $v){
+                                $q =  "INSERT INTO tm_vmdisk (vmuuid, uuid,name,size,position) VALUES (?,?,?,?,?)";
+                                dbSet("nimbus", $q, array( $vm->uuid, $v->uuid, "Disk $v->userdevice", $v->size,$v->userdevice  ) );
+                        }
+		}
+	}catch(Exception $ex){
+		gen_log(LOG_ERR, "Failure in DB update: ". $ex->getMessage());
+	}
+	gen_log(LOG_INFO, "Collection complete");
+}
+
+
+function getVmSize($vm){
+	$sz=0;
+	foreach($vm->disks as $d){ $sz += $d->size; }
+	return $sz;
+}
+function getAllVmInfoForHost($hostUuid){
+	$q = "SELECT uuid from tm_vminfo where hostuuid=?";
+	return dbGetArray("nimbus", $q, array($hostUuid) );
+}
+function vmHasBackup($uuid){
+	$q = "select count(*) as num from vm v, vm_version vv where v.vmid = vv.vmid and uuid=?";
+	return dbGetColumn("nimbus", $q, array($uuid) );
+}
+function deleteVmInfo($uuid){
+	$q = "delete from tm_vminfo where uuid=?";
+	dbSet("nimbus", $q, array($uuid) );
+}
+
+function cleanOrphans($vms, $hostUuid){
+	$infs = getAllVmInfoForHost($hostUuid);	// get all vms from the db
+	foreach($vms as $v){
+		if(in_array($v->uuid, $infs)){
+			$index = array_search($v->uuid, $infs);
+			unset($infs[$index]);
+		}
+	}
+	// now we have a list of uuids that dont exist.  check if they have backups.  if not, delete them
+	foreach($infs as $v){
+		$num = vmHasBackup($v);
+		echo "VM $v has $num backups\n";
+		if($num > 0){
+			echo "$v has a backup, drop it\n";
+			$index = array_search($v, $infs);
+			unset($infs[$index]);
+		}
+	}
+
+	foreach($infs as $v){
+		echo "Deleting $v\n";
+		deleteVmInfo($v);
+	}
+}
+
+
+?>

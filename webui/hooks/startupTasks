@@ -1,0 +1,98 @@
+#!/usr/bin/php -q
+<?php
+
+include_once("/usr/local/sbin/shared_lib");
+
+
+//if(count($argv) <= 1){
+//        $msg = "Insufficient parameters\n\n";
+//        $msg .= "Usage: postJob jobID <arg>\n";
+ //       $msg .= "Available args: ";
+ //       $msg .= "(None yet)\n";
+//        print $msg;
+//	exit(1);
+//}
+//$jobID = $argv[1];
+//if(count($argv) > 2){
+//	$arg = $argv[2];
+//}
+
+echo "Checking for pre-start tasks\n";
+
+checkDBSchema();
+cancelOldJobs();
+return;
+checkForJobsToResume();
+
+function checkForJobsToResume(){
+	// getResumeFiles
+	// look in validate for files, split and look for jobIDs to resume
+	$files = array();
+	$vbase = $GLOBALS["settings"]->adsPath ."/validate/";
+	foreach (glob($vbase."*.cursor") as $file) {
+		$guy = basename($file,".cursor").PHP_EOL;
+		$bits = explode("_",$guy);
+		if(count($bits) < 2){ continue; }
+		$vmid = $bits[1];
+		$jobid = $bits[0];
+                $cmd = $GLOBALS["settings"]->scripts."/jobRunner -r $jobid $vmid";
+//		echo "I want to RESUME this job: $jobid and vm: $vmid\n$cmd\n";
+                exec($cmd. " > /dev/null &");   // you must dev null to background
+	}
+}
+
+function cancelOldJobs(){
+	$sql = "UPDATE job set status = 5 where status = 0 or status=2 or status =3";
+	dbSet("nimbus", $sql);
+}
+
+function scrubABDsIfNeeded(){
+	// no longer needed since persistentABDs
+		$sql = "SELECT count(*) from appliance";
+		$num = dbGetColumn("nimbus", $sql);
+
+		if($num > 0){
+			echo "Found $num orphaned ABDs to cleanup.  Please wait, this can take a little while...\n";
+			$res = exec("wine ". $GLOBALS["settings"]->alikeRoot."/XenTool.exe -X 2> /dev/null");
+			if($res !=0){
+				$msg = "Failed to cleanout old (orphaned) ABDs!";
+				echo "$msg ($res)\n";
+				syslog(LOG_WARNING, $msg);
+				return false;
+			}else{
+				echo "ABD Cleanup complete.\n";
+				$sql = "update ABDNet set checkedOut=0";
+				dbSet("nimbux", $sql);
+				echo "Reset ABDNet checkouts.\n";
+			}
+			
+		}
+
+	}catch(Exception $ex){
+		print "Failed to access nimbusdb:" .$ex->getMessage() ."\n";
+		return false;
+	}
+	return true;
+}
+function checkDBSchema(){
+	try{
+		createColumnIfNeeded("tm_vminfo","ipaddress","VARCHAR");
+	}catch(Exception $ex){
+		syslog(LOG_ERROR, "Failed to check/update DB schemas. ". $ex->getMessage());
+	}
+}
+
+function createColumnIfNeeded($table, $column, $type){
+	$sql = "PRAGMA table_info($table)";
+	$tabs = dbGet("nimbus", $sql);
+	foreach($tabs as $col){
+		if($col->name== $column){ return; }
+	}
+	echo "Didn't find $column, let's add it\n";
+	$sql = "ALTER TABLE $table ADD $column $type";
+	dbSet("nimbus", $sql);
+
+
+}
+
+?>

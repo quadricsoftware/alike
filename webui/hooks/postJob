@@ -1,0 +1,93 @@
+#!/usr/bin/php -q
+<?php
+
+include_once("/usr/local/sbin/shared_lib");
+
+// This gets called by BKS before every job
+//
+
+if(count($argv) <= 1){
+        $msg = "Insufficient parameters\n\n";
+        $msg .= "Usage: postJob jobID <arg>\n";
+        $msg .= "Available args: ";
+        $msg .= "(None yet)\n";
+        print $msg;
+	exit(1);
+}
+$jobID = $argv[1];
+if(count($argv) > 2){
+	$arg = $argv[2];
+}
+
+$j = null;
+
+try{
+	$j = getJob($jobID);
+}catch(Exception $ex){
+	print "Job $jobID not found. Error:" .$ex->getMessage() ."\n";
+	exit(1);
+}
+
+print "Job type: $j->type\n";
+
+if($j->type == jobType::restoreJob){ 
+	completeRestoreJob($j);
+}else if ( $j->type == jobType::backupJob || $j->type == jobType::rawBackup ||$j->type == jobType::agentBackup){
+	completeBackupJob($j);
+}else if ( $j->type == jobType::replicate || $j->type == jobType::rawReplicate ){
+	completeReplicateJob($j);
+}else if ( $j->type == jobType::offsiteJob ){
+	// do something?
+}
+
+// return any lingering ABDs
+disownABDs($j->jobID);
+
+$cmd = $GLOBALS["AR"]."/hooks/jobMailer $j->jobID > /dev/null &";
+exec($cmd);
+
+
+
+function prepOffsiteJob($j){ echo "Noop: offsite job\n";  }
+
+function completeRestoreJob($j){ 
+	cleanJobDir($j);
+}
+
+function completeReplicateJob($j){ 
+	if(array_key_exists("backup", $j->Options) && $j->Options["backup"]==1){
+                completeBackupJob($j);
+        }else{
+		cleanJobDir($j);
+	}
+}
+
+function completeBackupJob($j){
+	echo "Post BACKUP job stuff...\n";
+	// we should make the dirs, and add all the HCAs (if any)
+	// We can do the fuzzy stuff here too
+
+	updateJobStats($j->jobID);	
+
+	cleanJobDir($j);
+	$temp = $GLOBALS["settings"]->alikeRoot ."/temp/prog";
+
+	foreach($j->vmsInJob as $vm){
+		$cmd = "rm -f $temp/".$vm->VMID."_*.map";
+		exec($cmd);
+	}
+}
+
+function cleanJobDir($j){
+	// make the job dir, and all the vm subdirs
+	echo "Cleaning job dir: $j->jobID\n";
+	if(!is_numeric($j->jobID)){ return; }
+
+	$path = $GLOBALS["settings"]->jobsPath ."/$j->jobID";
+
+	exec("rm -fr $path");
+
+}
+
+
+?>

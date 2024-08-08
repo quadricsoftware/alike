@@ -1,0 +1,131 @@
+#!/usr/bin/php -q
+<?php
+
+include_once("/usr/local/sbin/shared_lib");
+include_once("/usr/local/sbin/common_lib");
+include_once("/usr/local/sbin/insta_common");
+include_once("/usr/local/sbin/xen_common");
+
+
+if(count($argv) <= 2){
+        $msg = "Insufficient parameters\n\n";
+        $msg .= "Usage: processVM jobID vmID\n";
+        $msg .= "Available args: ";
+        print $msg;
+        exit(1);
+}
+$jobID = $argv[1];
+$vmID = $argv[2];
+
+$specialArg = 0;
+if(count($argv) >= 4){
+	$specialArg = $argv[3];
+}
+
+// In case we want to use the new gen_log stuff
+$GLOBALS["__insta_job_id"] = $jobID;
+$GLOBALS["__insta_vm_id"] = $vmID;
+
+
+$res=0;
+$j = null;
+
+try{
+	if(checkForCancel($jobID)){
+		echo "--Skipping $vmID for $jobID (cancelled)\n";	
+	}
+	$j = getJob($jobID);
+
+	if($j->type == jobType::restoreJob){
+		doRestoreVM($j, $vmID);
+	}else if ( $j->type == jobType::backupJob || $j->type == jobType::rawBackup ||$j->type == jobType::agentBackup){
+		doBackupVM($j, $vmID);
+	}else if ( $j->type == jobType::replicate || $j->type == jobType::rawReplicate ){
+		doReplicateVM($j, $vmID);
+	}else if ( $j->type == jobType::offsiteJob ){
+		$manual=false;
+		if($specialArg){ $manual = true; }
+		doVaultVM($j, $vmID, $manual);
+	}
+	globalWrapUp();
+
+//	$prog = getJobVmProgress($jobID, $vmID) * -1;
+
+
+}catch(Exception $ex){
+	if(!checkForCancel($jobID)){ 
+		$msg = $ex->getMessage();
+		if(empty($msg)){ $msg = "Unknown empty exception"; }
+		addJobLog($msg, 1, $jobID, $vmID);
+		echo "$msg\n";
+	}
+	updateJobStatus($jobID, 3);
+
+	// negative progress is shown as errored progress in the UI
+	// -1 has historically been used, but -anything will show the graph where the VM failed
+	$prog = getJobVmProgress($jobID, $vmID) * -1;
+	if($prog ==0){ $prog = -1; }
+	markFailedVM($jobID,$vmID, $prog);
+
+	$jprog = calcJobProgress($jobID);
+	updateJobProgress($jobID, $jprog);
+
+}finally{
+	if(is_object($j) && $j->type == jobType::offsiteJob ){ return; }
+
+	$fl = getJobLockFile($jobID);
+	if(file_exists($fl)){
+		$fp = fopen($fl, "r+") or die("Couldnt open lock file");
+		decrementLocked($fp, $fl);
+		fclose($fp);
+	}else{
+		syslog(LOG_NOTICE, "Job ctrl file not found for Job $jobID");
+	}
+}
+
+exit($res);
+
+function globalWrapUp() {
+	// Force dbs to get synced up
+	exec("/usr/local/sbin/dbSyncer -a");
+}
+
+function kickoffVault($vmid, $jid, $schedID ){
+	$j = getJob($jid);
+	if(!array_key_exists("vaultEnable",$j->Options) || $j->Options["vaultEnable"] !=1){  return; }
+
+	$edition = getEdition();
+
+	if($edition != 2){
+		gen_log(LOG_WARNING, "Skipping vault job due to licensing (not DR Edition)");
+		return;
+	}
+
+	$versid = "";
+	$sql = "SELECT vmversion from VM_Version where vmid=? and jobid=?";
+	$versid = dbGetColumn("nimbus", $sql, array($vmid, $jid) );
+	if(is_numeric($versid)){
+		addJobLog("Spawning Vault job for new backup",0, $jid, $vmid);
+		$cmd = $GLOBALS["settings"]->scripts."/jobRunner -v $vmid $versid $schedID";
+		$res = shell_exec($cmd. " > /dev/null &");  
+		addJobLog("Spawning cmd: ". $cmd,4, $jid, $vmid);
+		addJobLog("Spawning result: ". $res,4, $jid, $vmid);
+	}else{
+		addJobLog("Failed to spawn Vault job: Couldn't find new backup from this job.",1, $jid, 0);
+		return false;
+	}
+	return true;
+}
+
+
+
+function markFailedVM($jobID,$vmID, $prog=-1){
+	updateJobVM($jobID,$vmID, $prog);
+}
+function updateJobVM($jobid, $vmid, $versionID){
+	$sql = "UPDATE job_vms set vm_version = ? where jobID=? and VMID=?";
+	dbSet("nimbus", $sql, array($versionID, $jobid, $vmid) );
+}
+
+
+?>
