@@ -1,0 +1,35 @@
+#!/usr/bin/php -q
+<?php
+
+
+function msHex($i, $count) {
+	$foo = strtoupper(dechex($i));
+	return str_pad($foo, $count, "0x0000000000000000", STR_PAD_LEFT);
+}
+
+function toShortHex($i) {
+	return msHex($i, 10);
+}
+
+function toLongHex($i) {
+	return msHex($i, 18);
+}
+
+if($argc < 2) {
+	die("Need DB location argument");
+}
+$dbFile = $argv[1];
+
+//echo "DB FILE IS: $dbFile\n";
+
+$db = new PDO("sqlite:$dbFile");
+$foo = $db->query("SELECT txNo, state FROM flag WHERE siteId=0");
+echo toShortHex(1)."\n";
+while($row = $foo->fetch()) {
+	$txNoRaw = $row['txNo'];
+	$txNo = toLongHex($txNoRaw);
+	echo $txNo." ". $row['state']."\n";
+}
+echo "0000000000000000"
+
+?>

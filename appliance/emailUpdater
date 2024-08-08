@@ -1,0 +1,73 @@
+#!/usr/bin/php -q
+<?php
+include_once("/usr/local/sbin/common_lib");
+
+updateSystem();
+
+function updateSystem(){
+	$enable = getSetting("smtpNotify");
+	if(strToLower($enable) != "true"){ 
+		echo "SMTP is disabled.  Disabling CRON\n";
+		disableCron();
+		return;
+	}
+
+	$o = new stdClass();
+	$o->to = getSetting("smtpToAddress");
+	$o->from = getSetting("smtpFromAddress");
+	$o->user = getSetting("smtpUsername");
+	$o->pass = getSetting("smtpPassword");
+	$o->server = getSetting("smtpServer");
+	$o->port = getSetting("smtpPort");
+	$o->useAuth = getSetting("useSMTPAuth");
+	$o->useSSL = getSetting("useSMTPSSL");
+
+	updateMSMTP($o);
+//	updateMailRC($o->to);
+	//enableCron($o->to);
+	disableCron();
+}
+
+function updateMSMTP($o){
+	$str = "defaults\n";
+	$str .= "add_missing_date_header on\n";
+	$str .= "logfile		/home/alike/logs/mail.log\n";
+
+	if(strToLower($o->useAuth) == "true"){ 
+		$str .= "auth		on\n";
+	}
+	if(strToLower($o->useSSL) == "true"){ 
+		$str .= "tls		on\n";
+		$str .= "tls_trust_file 	/etc/ssl/certs/ca-certificates.crt\n";
+	}
+	$str .= "account		alike\n";
+	$str .= "host		$o->server\n";
+	$str .= "port		$o->port\n";
+	$str .= "from		$o->from\n";
+	if(strToLower($o->useAuth) == "true"){ 
+		$str .= "user		$o->user\n";
+		$str .= "password	$o->pass\n";
+	}
+	$str .= "account default : 	alike";
+	file_put_contents("/etc/msmtprc",$str);
+
+//	$tmpFile = "/tmp/msmtp.conf";
+//	if(file_exists($tmpFile)){
+//		unlink($tmpFile);
+//	}
+//	echo shell_exec("sudo /usr/local/sbin/privTool smtpconf 1");
+
+}
+
+function updateMailRC($email){
+	exec("echo 'alias alike ".$email."' > /home/alike/.mailrc");
+}
+
+function disableCron(){
+	exec("/usr/local/sbin/addCronMail -d");
+}
+function enableCron($email){
+	exec("/usr/local/sbin/addCronMail $email");
+}
+
+?>

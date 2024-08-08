@@ -1,0 +1,93 @@
+#!/usr/bin/php -q
+<?php
+declare(ticks = 1);
+pcntl_signal(SIGINT,  "sig_handler");
+pcntl_signal(SIGTERM, "sig_handler");
+
+
+function sig_handler($sig) {
+	if($sig == SIGINT || $sig == SIGTERM ){
+		exec("echo \"Caught shutdown.\" > /home/alike/logs/container.log");
+		exec("echo \"Syncing state...\" >> /home/alike/logs/container.log");
+		echo "Shutdown complete. Exiting cleanly.\n";
+		exit(0);
+	}
+}
+
+$hostIP = getenv('HOST_IP');
+if($hostIP === false || empty($hostIP)){
+        echo "HOST_IP could not be found!\n";
+        echo "Please enter your HOST_IP variable in the /home/alike/.env file!\n";
+        exit(1);
+}
+echo "Host IP is $hostIP\n";
+
+
+echo "Setting timezone\n";
+exec("cp --remove-destination /home/alike/configs/localtime /etc/localtime");
+
+exec("rm -f /mnt/share/docker.up");
+
+// make sure there's no previous mail settings
+exec("rm -f /etc/ssmtp/ssmtp.conf");
+
+$CHK="/mnt/share/app.chk";
+$VAL = shell_exec("echo \$RANDOM | md5sum | head -c 20; echo;");
+file_put_contents($CHK, $VAL);
+
+echo "Setting kernel parameters\n";
+echo "Adding Debian specific fixup\n";
+exec("/sbin/sysctl fs.protected_regular=0");
+
+$def = "/home/alike/defaults";
+exec("cp -n $def/configs/nginx.conf /home/alike/configs/");
+exec("cp -n $def/certs/fullchain.pem /home/alike/certs/");
+exec("cp -n $def/certs/privkey.pem /home/alike/certs/");
+
+echo shell_exec("chown alike /run/php");
+
+echo shell_exec("/etc/init.d/rsyslog start");
+echo shell_exec("/etc/init.d/ssh start");
+echo shell_exec("/etc/init.d/nginx start");
+echo shell_exec("/etc/init.d/php7.4-fpm start");
+echo shell_exec("chown alike /run/php");
+
+echo shell_exec("/etc/init.d/cron start");
+
+exec("chown -R alike.alike /home/alike/Alike/DBs");
+exec("chgrp -R alike /home/alike/logs");
+exec("chmod g+w /home/alike/logs");
+
+exec("/usr/bin/sqlite3 /home/alike/Alike/DBs/manager.db \"select val from settings where key='installID'\" > /home/alike/Alike/inst.id");
+
+setSetting("managerIP", $hostIP);
+
+echo "Configuring scheduled tasks\n";
+exec("su - alike -c '/usr/local/sbin/managerTasks'");
+exec("/usr/bin/crontab -u alike /usr/local/sbin/manager_crontab");
+if(file_exists("/usr/local/sbin/manager_crontab")){
+	exec("rm /usr/local/sbin/manager_crontab");
+}
+
+echo "A3 Manager Startup complete.\n";
+
+echo "Listening for events.\n";
+
+exec("touch /mnt/share/docker.up");
+exec("echo 1 > /tmp/sched_svc_status");
+echo "Enabling web UI\n";
+exec("cp -f /home/alike/Alike/docroot/redirect.html /home/alike/Alike/docroot/index.html");
+
+
+echo "A3 Manager startup complete.\n";
+
+function setSetting($key, $val){
+        $db = "/home/alike/Alike/DBs/manager.db";
+        $dbc = new PDO("sqlite:$db");
+        $sql = "INSERT or REPLACE INTO settings values(?,?)";
+        $st = $dbc->prepare($sql);
+        $res = $st->execute(array($key, $val) );
+}
+
+
+?>

@@ -1,0 +1,159 @@
+#!/usr/bin/php -q
+<?php
+include_once("/usr/local/sbin/common_lib");
+include_once("/usr/local/sbin/shared_lib");
+include_once("/usr/local/sbin/insta_common");
+
+try{
+$flk = "/tmp/freq_task.flk";
+$lock = qflock($flk, 1);
+
+checkForProcs();
+
+updateADSStatus();	// sets the json status file for the UI and components
+updateODSStatus();
+cleanOrphanSyms();
+
+$GLOBALS["isADSMounted"] = isADSMounted();
+
+// we run the tasks below every 5 minutes.  Can stop services and notify if trouble is found
+parseLogs();
+checkFreeSpace();
+
+if($GLOBALS["isADSMounted"] ){
+	exec("/usr/local/sbin/dbSyncer --unsafe");
+}
+
+cleanAlikeTemp();
+qunflock($lock);
+}catch(Exception $ex){
+	syslog(LOG_ERR, "Failed to run frequentSchedTasks: ". $ex->getMessage());
+}
+
+
+function parseLogs(){
+	slurpDmesg();
+	slurpEngineLog();
+}
+
+function cleanAlikeTemp(){
+	$cmd = "find /home/alike/Alike/temp/ -mindepth 1 -type f -mtime +5 -delete";
+	echo shell_exec($cmd);
+	
+	if(is_dir("/home/alike/Alike/temp/jv/")){
+		$cmd = "find /home/alike/Alike/temp/jv/ -type f -mmin +300 -delete";
+		echo shell_exec($cmd);
+	}
+
+}
+
+function checkFreeSpace(){
+	exec("sudo logrotate /etc/logrotate.d/a2.engine");
+
+	// check the local disk (min 500MB)
+	$use = getDiskUsageLocal();
+	$free = bytesToString($use->free);
+	$tot = bytesToString($use->total);
+	if($use->free <= (500 * 1024 * 1024)){
+		if(schedulerState()){
+			$msg = "No free space on local A3 (root) partition.  Only $free available. STOPPING SERVICES to prevent damage.";
+			addAlarm($msg, 1);
+			syslog(LOG_EMERG, $msg);
+			echo "Stopping Alike services...";
+			exec("sudo /usr/local/sbin/stopAlike --no-web");
+			echo "Done.\n";
+
+			sysmail("A3 System Drive Full- services stopped", $msg);
+		}else{
+			$msg = "No free space on local A3 (root) partition. Only $free available (of $tot).  Services cannot start until more space is available.";
+			syslog(LOG_WARN, $msg);
+			addAlarm($msg, 1);
+		}
+	}else{
+		//echo "Looks like we're ok on local space.\n";
+	}
+	$use = getDiskUsageRD();
+	$free = bytesToString($use->free);
+	$tot = bytesToString($use->total);
+	// check the DB ram disk (min 50MB)
+	if($use->free < (50 * 1024 * 1024)){
+		if(schedulerState()){
+			$msg = "No free space on A3 database partition.  Only $free available (of $tot total). Stopping services to prevent damage.";
+			syslog(LOG_EMERG, $msg);
+			addAlarm($msg, 1);
+			echo "Stopping Alike services...";
+			exec("sudo /usr/local/sbin/stopAlike --no-web");
+			echo "Done.\n";
+			sysmail("A3 DB Partition Full- services stopped", $msg);
+		}else{
+			$msg= "A3 DB partition is critically low.  Only $free available (of $tot).  Services cannot be started until this is corrected.";
+			syslog(LOG_WARN, $msg);
+			addAlarm($msg, 1);
+		}
+	}else{
+		//echo "Looks like we're ok on RAMDISK space.\n";
+		//echo "A3 DB tmpfs is good: $free/$tot\n";
+	}
+
+	if($GLOBALS["isADSMounted"]){
+		$use = getADSInfo();
+		$free = bytesToString($use->free);
+		$tot = bytesToString($use->total);
+		if(schedulerState()){
+			if($use->free < 1024 * 1024 * 500){	// 500MB min?
+				$msg = "No free space on A3 ADS.  Only $free available (of $tot). Stopping services to prevent damage.";
+				syslog(LOG_EMERG, $msg);
+				addAlarm($msg, 1);
+				echo "Stopping Alike services...";
+				exec("sudo /usr/local/sbin/stopAlike --no-web");
+				echo "Done.\n";
+				sysmail("A3 ADS Full!  Services stopped", $msg);
+			}else{
+				$res = false;
+				$err = "Unknown ADS I/O error";
+				$tst = "/mnt/ads/ads.test.perm";
+				if (  ($fp = @fopen($tst, "w"))!==false ) {
+					if(fwrite($fp,"TEST") !== FALSE){ $res = true; }
+				}else{
+					$err = error_get_last();
+				}
+				if($res == false ){
+					$err = print_r($err, true);
+					$msg = "A3 ADS (/mnt/ads) is READ-ONLY. Stopping services to prevent damage. Error: $err";
+					syslog(LOG_EMERG, $msg);
+					exec("sudo /usr/local/sbin/stopAlike --no-web");
+					sysmail("A3 ADS is read-only  Services stopped", $msg);
+					addAlarm($msg, 1);
+				}else{
+					unlink($tst);
+				}
+                        }
+		}else{
+			if($use->free < 1024 * 1024 * 1024){	// 1GB min?
+				$msg= "A3 ADS is low on space.  Only $free/$tot free.  Services cannot start until more space is available.";
+				syslog(LOG_WARN, $msg);
+				addAlarm($msg, 1);
+			}
+		}
+	}else{
+		syslog(LOG_INFO, "A3 ADS is not mounted.  Please define and mount your ADS before starting the Alike container.");
+	}
+}
+
+function checkForProcs(){
+        $cmd = "ps auwx | grep managerTasks | grep -v grep";
+        $res = trim(shell_exec($cmd));
+        if (empty($res)) {
+                gen_log(LOG_DEBUG, "About to start managerTasks");
+		$desc = array(
+		   0 => array('file', '/dev/null', 'r'),
+		   1 => array('file', '/dev/null', 'w'), 
+		   2 => array('file', '/dev/null', 'w')   
+		);
+		$process = proc_open('/usr/local/sbin/managerTasks', $desc, $pipes);
+                gen_log(LOG_DEBUG, "Started managerTasks when it wasn't runinng! Started: $process");
+        }
+}
+
+
+?>

@@ -1,0 +1,1898 @@
+<?php
+include_once("/usr/local/sbin/shared_lib");
+include_once("/usr/local/sbin/common_lib");
+include_once("/usr/local/sbin/insta_common");
+
+
+function processNimbusRequest($req, $verb, $j ){
+        switch($req){
+                case "jobgraph":
+                        return getJobGraph();
+                        break;
+                case "a3-sysgraph":
+                        return getA3SysGraph();
+                        break;
+                case "status":
+                        return doStatus();
+                        break;
+                case "a3-status":
+                        return getA3Stats();
+                        break;
+                case "a3-details":
+                        return getA3Detail();
+                        break;
+                case "networks":
+                        return getNetworks();
+                        break;
+                case "srs":
+                        return getSrs();
+                        break;
+                case "restore":
+                        return handleRestore($j, $verb);
+                        break;
+                case "auth":
+                        return doAuth($j);
+                        break;
+                case "dashStats":
+                        return getDashStatistics();
+                        break;
+                case "perfStats":
+                        return getPerfStats();
+                        break;
+                case "notifications":
+                        return getAlerts();
+                        break;
+                case "serviceState":
+                        return setServiceState($j);
+                        break;
+                case "abds":
+                        return listABDs($j);
+                        break;
+                case "joblog":
+                        return listJobDetails($j);
+                        break;
+                case "jobs":
+                        return listJobs($j);
+                        break;
+                case "schedules":
+                        return listSchedules($j);
+                        break;
+                case "hosts":
+                        return listHosts($j);
+                        break;
+                case "versions":
+                        return listVersions($j);
+                        break;
+                case "vms-tag":
+                        return listVMsByTag($j);
+                        break;
+                case "vms":
+                        return listVMs($j);
+                case "sync-vms":
+                        return listVMsForMgr($j);
+                        break;
+                case "sources":
+                        return listSources($j);
+                        break;
+                case "vaults":
+                        return listVaults($j);
+                        break;
+                case "backups":
+                        return listBackups($j);
+                        break;
+                case "settings":
+                        return getSettings($j);
+                        break;
+                case "subscription":
+                        return listSubscription($j);
+                        break;
+                case "gfsProfiles":
+                        return listGFSProfiles($j);
+                        break;
+                case "disks":
+                        return listDisks($j);
+                        break;
+                case "templates":
+                        return listXenTemplates($j);
+                        break;
+                case "job":
+                        return handleJob($j, $verb);
+                        break;
+                case "host":
+                        return handleHost($j, $verb);
+                        break;
+                case "schedule":
+                        return handleSchedule($j, $verb);
+                        break;
+                case "vm":
+                        return handleVM($j, $verb);
+                        break;
+                case "version":
+                        return handleVersion($j, $verb);
+                        break;
+                case "gfsProfile":
+                        return handleGFSProfile($j, $verb);
+                        break;
+                case "vaulting":
+                        return handleVaulting($j, $verb);
+                        break;
+                case "abd":
+                        return handleABD($j, $verb);
+                        break;
+                case "abdnet":
+                        return handleABDNet($j, $verb);
+                        break;
+                case "support":
+                        return handleSupport($j, $verb);
+                        break;
+                case "logsummary":
+                        return handleLogSummary($j, $verb);
+                        break;
+                case "logs":
+                        return handleLogs($j, $verb);
+                case "flrDownload":
+                        return flrDownload($j->ds, $j->path);
+                        break;
+//////////////////////////////////////////////
+
+                case "setting":
+                        return updateSetting($j, $verb);
+                        break;
+
+                case "testemail":
+                        $res = sendTestEmail();
+                        if($res->result == "error"){
+                                return returnResult(0, "Error sending mail: $res->message");
+                        }else{
+                                return returnResult(1, "Test email has been sent.");
+                        }
+                        break;
+                case "autotune":
+                        return runCmd("autotune",null, null);
+                        break;
+                case "viewlog":
+                        return getLog($j);
+                        break;
+                case "alerts":
+                        return handleAlerts($j, $verb);
+                        break;
+                case "assignAgent":
+                        return setAgent($j);
+                        break;
+                case "deleteAgent":
+                        return delAgent($j);
+                        break;
+                case "testAgentVM":
+                        return testAgentVM($j);
+                        break;
+                case "testAgent":
+                        return testAgent($j);
+                        break;
+                case "listInstaboots":
+                        return listInstaboots();
+                        break;
+                case "instaboot":
+                        return handleInstaboot($j);
+                        break;
+                case "megamaid":
+                        return srCleanup();
+                        break;
+                case "xenPoolHosts":
+                        return xenPoolHosts();
+                        break;
+                case "subsync":
+                        return doSyncSub();
+                        break;
+                case "subupdate":
+                        return doSubUpdate();
+                        break;
+                case "listInstaboots":
+                        return listInstaboots();
+                        break;
+                case "instaboot":
+                        return handleInstaboot($j);
+                        break;
+                case "megamaid":
+                        return srCleanup();
+                        break;
+                case "xenPoolHosts":
+                        return xenPoolHosts();
+                        break;
+                case "subsync":
+                        return doSyncSub();
+                        break;
+                case "subupdate":
+                        return doSubUpdate();
+                        break;
+		case "browseRestoreFS":
+			echo doBrowseFLR($j);
+			break;
+
+	}
+	returnError( "No such method: $req");
+}
+
+function returnError($str){
+	$r = array();
+	$r["result"] = "error";
+	$r["message"] = $str;
+	returnJSN($r, false);
+}
+function returnResult($rez, $msg){
+	$r = array();
+	$result = "success";
+	if(!$rez){ $result = "error"; }
+	$r["result"] = $result;
+	$r["message"] = $msg;
+	returnJSN($r, true);
+}
+function returnJSN($r, $gzip=true){
+	$str = json_encode($r);
+        if($str === false){
+                print json_last_error();
+		return;
+	}
+	if($gzip){
+		$str = gzencode(json_encode($r));
+		header("Content-type: text/javascript");
+		header('Content-Encoding: gzip');
+	}
+	print $str;
+}
+
+function sendIPC($key, $val, $pass ){
+	$arr = array();
+	$arr[$key] = $val;
+	return sendIPCv2($arr, $pass);
+}
+function sendIPCv2($arr, $pass ){
+	$args ="";
+	foreach($arr as $key => $val){
+		$args .= "$key $val ";
+	}
+        $bks = "BackupScheduler";
+        if(isProcessRunning($bks)==false){
+                returnError("BackupScheduler service is not started!");
+                return;
+        }
+
+	$base = $GLOBALS['settings']->alikeRoot;
+	$cmd = "wine $base/AlikeCmd.exe -i $args";
+
+        $res = shell_exec($cmd);
+
+        if (strpos($res, 'rror') !== false){
+                returnError(false,$res);
+        }else{
+                return returnResult(true, $pass);
+        }
+}
+
+function delAgent($d){
+        $r = array();
+        $res = "success";
+        $msg = "Agent deleted";
+        try{
+                deleteAgent($d->guid);
+        }catch(Exception $ex){
+                $res = "error";
+                $msg = $ex->getMessage();
+        }
+        $r["result"] = $res;
+        $r["message"] = $msg;
+        return returnJSN($r);
+}
+
+
+function setAgent($d){
+	$r = array();
+	$res = "success";
+	$msg = "Agent updated";
+	try{
+		updateVMAgent($d->agent);
+	}catch(Exception $ex){
+		$res = "error";
+		$msg = $ex->getMessage();
+	}
+        $r["result"] = $res;
+        $r["message"] = $msg;
+        return returnJSN($r);
+}
+function testAgent($d){
+	$r = array();
+	if(!isset($d->virtType)){ $d->virtType =10; }
+
+	$r = doTestAuth($d->virtType, $d->ip, $d->username, $d->password);
+        return returnJSN($r);
+}
+function testAgentVM($d){
+
+        $r = array();
+        $res = "error";
+        $message ="Test not started";
+        $code=0;
+        $output;
+	$vm = null;
+	if(!empty($d->uuid)){
+		$vm = getVMRaw($d->uuid);
+	}else if(!empty($d->vmid)){
+		$uuid = getVmUuid($d->vmid);
+		$vm = getVMRaw($uuid);
+	}
+
+	if(empty($vm)){
+		$res = "error";
+		$message = "Could not find VM";
+	}else if(empty($vm->ip)){
+		$res = "error";
+		$message = "Failed to detect IP.  Please set a static Access IP";
+	}else{
+		$out = agentStatus($vm->ip);
+		if(empty($out) || !is_object($out)){
+			$res = "error";
+			$message = "Failed to connect to remote agent ($vm->ip) <br>Please check the Agent is installed and running.";
+		}else{
+			$res = "success";
+			$ver = explode(' ', $out->version);
+			$message = "Detected agent version: &nbsp; ".$ver[0];
+			$out = agentParseWmi(agentWmiCmd($vm->ip, "SELECT name FROM Win32_OperatingSystem"));
+			if(!isset($out->Name) || empty($out->Name)){
+				$res = "error";
+				$message = "Connected to QHB agent (". $ver[0].")<br>&nbsp; but Windows is denied remote WMI ";
+			}else{
+				$message .= "<br> WMI OS:   $out->Name";
+			}
+		}
+	}
+
+        $r["result"] = "success";;
+        $r["thing"] = $res;
+        $r["message"] = $message;
+        return returnJSN($r);
+}
+function doSubUpdate(){
+	$r = array();
+	$r["result"] = "success";
+	$r["message"] = "Sub info updated";
+	$inf = getSubInfo();
+	$r["sockets"] = $inf->sockets;
+	$r["edition"] = $inf->edition;
+	$r["type"] = $inf->type;
+	$r["a3Name"] = $inf->a3Name;
+        returnJSN($r);
+
+}
+function doSyncSub(){
+	$r = array();
+	if( !syncSub() ){
+		$r["result"] = "success";
+		$r["message"] = "Sub synched";
+	}else{
+		$r["result"] = "error";
+		$r["message"] = "Error syncing.  Check logs for details";
+	}
+        returnJSN($r);
+}
+
+
+function getLog($d){
+	$f = "/home/alike/logs/a3.log";
+	if($d->log == "Data"){ $f = "/home/alike/logs/engine.log"; }
+//	else if($d->log == "Syslog"){ $f = "/home/alike/logs/messages"; }
+
+	$log = array();
+        if(file_exists($f)){
+                $file = explode("\n",shell_exec("tail -300 $f"));
+                $max = 300;
+                for ($i = max(0, count($file)-$max); $i < count($file); $i++) {
+                        array_push($log, $file[$i]);
+                }
+        }
+
+
+	$r = array();
+	$r["log"] = array_reverse($log);
+        $r["type"] = $d->log;
+        $r["result"] = "success";
+        $r["message"] = "Most Recent Alike $d->log Logfile";
+	returnJSN($r);
+//	}
+}
+
+function setServiceState($d){
+	$bks = "BackupScheduler";
+	$current = schedulerState();
+	if($current==true && $d->state == "start"){
+		$msg = "Services are already running";
+		return returnResult(true, $msg);
+	}else if($current==false && $d->state == "stop"){
+		$msg = "Services are already stopped";
+		return returnResult(true, $msg);
+	}
+	$res = manageServices($d->state);
+	if($res=="OK"){
+		$verb = "stopping";
+		if($s->stat == "start"){ $verb = "starting"; }
+		$msg = "Services are $verb";
+		return returnResult(true, $msg);
+	}else{
+		$msg = "Service $d->state failed:$ret ";
+		return returnResult(true, $msg);
+	}
+}
+
+function getA3SysGraph(){
+
+	$r = array();
+        $r["cpuFree"] = 100 - getCPUUsage();
+        $mem = getMemory();
+        $r["memory"] = $mem->total;
+        $r["memFree"] = $mem->free;
+        $r["adsNet"] = getNetUsage("0");
+	$r["result"] = "success";
+	$r["message"] = "Enjoy!";
+	returnJSN($r);
+}
+function getJobGraph(){
+        $s = getDashStats(30);
+
+	$r = array();
+	$r["result"] = "success";
+	$r["message"] = "Enjoy!";
+        $r["deltas"] = $s->deltas;
+        $r["dedup"] = $s->dedup;
+        $r["protected"] = $s->protected;
+        $r["dates"] = $s->dates;
+	returnJSN($r);
+}
+
+function getStatus(){
+	$r = array();
+	$r["systemStatus"] = "running";
+	if(!file_exists("/mnt/ads/docker.up")){
+		$r["systemStatus"] = "loading";
+	}
+	$sub = getSubInfo();
+	
+	$r["a3Name"] = "WHAT IS MY NAME"; //$sub->a3Name;
+
+	$nfoFile = $GLOBALS['settings']->alikeRoot ."/alike.bld.nfo";
+	$nfo = json_decode(file_get_contents($nfoFile), false);
+        $r["alikeBuild"] = $nfo->alikeBuild;
+        $r["alikeVersion"] = $nfo->alikeVersion;
+
+        $r["alikeEdition"] = getEdition();
+        $r["isTrial"] = "true";
+        $r["isSubscription"] = "false";
+        $r["daysLeft"] = "0";
+        $r["latest_build"] = getSetting("latest_build");
+        $r["isOC"] = "0";
+        $r["runningJobs"] = getActiveJobs();
+        $r["notifications"] = getAlerts2();
+        $r["cpuPerc"] = getCPUUsage();
+        $r["numCPU"] = getCPUCount();
+        $mem = getMemory();
+        $r["srvMemTotal"] = $mem->total;
+        $r["srvMemFree"] = $mem->free;
+        $r["netUsage"] = getNetUsage();
+        $r["site0Usage"] = getNetUsage("0");
+        
+	$r["virtualStored"] = getVirtProtected();
+        $r["actualStored"] = getActStored();
+        $r["dedupPerc"] = getADSDedup();
+	$r["activeVMs"] = getVMsInJobs();
+	$r["showInitialWelcome"] = "true";
+	$promoSeen = 0;
+	if(getSetting("promoSeen") == "true") {
+		$promoSeen = 1;
+	} else if(file_exists("/home/alike/Alike/docroot/promo.html") == false) {
+		// If this file does not exist, don't spam them with it!
+		$promoSeen = 1;
+	} else if(getSetting("showInitialA3Welcome") != "false") {
+		// Do not double-up on them. It's just rude.
+		$promoSeen = 1;
+	}
+	$r["_promoSeen"] = $promoSeen;
+	if(getSetting("showInitialWelcome") != "false") {
+		// Do not double-up on them. It's just rude.
+		$r["showInitialWelcome"] = "false";
+	}
+	
+	$ads = getStat("dataStoreShare");
+	$adsDefined = "true";
+	if($ads == ""){ $adsDefined ="false"; }
+	$r["ADSDefined"] = $adsDefined;
+
+	$r["ADSReady"] = testADSPath();
+	$svcs = getServiceStates();
+	$state = "mixed";
+	if($svcs->allon == true){ 
+		$state = "running";
+	} else if($svcs->alloff ==true){ 
+		$state = "stopped";
+	}
+
+        $r["serviceState"] = $state;
+	
+	// Some Java purge/maint stuff
+	$r["result"] = "success";
+
+	returnJSN($r);
+}
+
+function getJavaStatus() {
+	$java = new stdClass();
+	$java->purgeTime = 0;
+	$java->lastPurge = 0;
+	$java->currentPurge = 0;
+	$java->totalPurge = 0;
+	$java->totalJournals = 0;
+
+	$java->rebuildActive =0;
+	$java->rebuildPercent = 100;
+	if(!file_exists("/tmp/jads.status")){
+		$java->rebuildPercent = 0;
+		$java->rebuildActive =1;
+		if(file_exists("/tmp/jads.progress")){
+			$java->rebuildPercent = @file_get_contents("/tmp/jads.progress");
+		}
+	}
+
+	$contents = @file_get_contents("/tmp/metrics/0_purge.stats");
+	if($contents != "") {
+		$contents = explode("\n", $contents);
+		if(count($contents) > 1) {
+			$java->currentPurge = $contents[0];
+			$java->totalPurge = $contents[1];
+		}
+	}
+	$contents = @file_get_contents("/tmp/metrics/0_maint.stats");
+	if($contents == "") {
+		return $java;
+	}
+	$contents = json_decode($contents);
+	if(is_object($contents) == false) {
+		return $java;
+	}
+	$java->purgeTime = $contents->purgeTime;
+	$java->lastPurge = $contents->lastPurge;
+	$java->lastRecon = $contents->lastRecon;
+	//$java->debug = print_r($contents, true);
+	return $java;
+}
+
+
+function doAuth($d){
+	$out = checkAuth($d);
+	if($out->result == "success"){
+		syslog(LOG_INFO, "User $d->user logged in successfully.");
+		$r = getStatus();
+		$r["showInitialA3Welcome"] = getSetting("showInitialA3Welcome");
+		// Do not double-up on them. It's just rude.
+		$r["showInitialWelcome"] =  getSetting("showInitialWelcome");
+		$r["message"] = $out->message;
+		$r["status"] = $out->status;
+		$r["result"] = "success";
+		#$r["session"] = session_id();
+		$r["session"] = $out->session;
+		return returnJSN($r, false);
+	}
+	syslog(LOG_WARNING, "User $d->user login attempt failed.");
+	return returnError($out->message );
+}
+
+// this is called the 1st time
+function getDashStatistics(){
+	$s = getDashStats(30);
+	$ads = getADSInfo();
+	$ods = getDSInfo(1);
+        $mem = getMemory();
+
+        //$r = array();
+	$r = getStatus();
+
+        $r["deltas"] = $s->deltas;
+        $r["dedup"] = $s->dedup;
+        $r["protected"] = $s->protected;
+        $r["dates"] = $s->dates;
+
+        $r["virtualStored"] = getVirtProtected();
+        $r["actualStored"] = getActStored();
+        $r["dedupPerc"] = getADSDedup();
+
+	$r["adsBorn"] = filemtime("/mnt/ads/ads.dat");
+	$r["adsType"] = $ads->type;
+	$r["adsTypeStr"] = $ads->typeStr;
+	$r["adsFree"] = $ads->free;
+        $r["adsTotal"] = $ads->total;
+        $r["adsUsed"] = $ads->total - $ads->free;
+
+	$r["ods"] = $ods;
+	if($ods->isDefined){
+		$r["odsBorn"] = filemtime("/mnt/ods1/owner.id");
+		$r["odsType"] = $ods->type;
+		$r["odsTypeStr"] = $ods->typeStr;
+		$r["odsFree"] = $ods->free;
+		$r["odsTotal"] = $ods->total;
+		$r["odsUsed"] = $ods->used;
+		$r["odsIsCloud"] = $ods->isCloud;
+		$r["odsDefined"] = 1;
+	}else{
+		$r["odsDefined"] = 0;
+	}
+
+
+	//$r["alikeOS"] = "A2 Rev1.2";
+        $r["srvMemTotal"] = $mem->total;
+        $r["srvMemFree"] = $mem->free;
+        $r["licensedHosts"] = getHostCount(true);
+        $r["totalHosts"] = getHostCount(false);
+
+	$r["activeVMs"] = getVMsInJobs();
+
+
+        $r["localDisk"] = getDiskUsageLocal();
+        $r["dbDisk"] = getDiskUsageSR();
+
+        $r["protectedVMs"] = getVMCount(true);
+        $r["totalVMs"] = getVMCount(false);
+        $r["totalVMSize"] = getTotalVMSize();
+
+	$nfoFile = $GLOBALS['settings']->alikeRoot ."/alike.bld.nfo";
+	$nfo = json_decode(file_get_contents($nfoFile), false);
+        $r["alikeBuild"] = $nfo->alikeBuild;
+        $r["alikeVersion"] = $nfo->alikeVersion;
+
+	//$bldFile = $GLOBALS['settings']->alikeRoot ."/build.num";
+        //$r["alikeBuild"] = trim(file_get_contents($bldFile));
+	$bldFile = $GLOBALS['settings']->alikeHome ."/a3.rev";
+        $r["a3Rev"] = trim(file_get_contents($bldFile));
+	$r["licenseType"] = "Subscription";
+
+	$sub = getSubscriptionDetails();
+
+        $r["grantedSockets"] = $sub->granted;
+        $r["edition"] = $sub->edition;
+        $r["subType"] = $sub->type;
+        $r["haveMSP"] = 0;
+	if($sub->type == 5){ 
+		$r["haveMSP"] = 1;
+	}
+
+        $r["numCPU"] = getCPUCount();
+        $r["cpuPerc"] = getCPUUsage();
+        $r["netUsage"] = getNetUsage();
+        $r["site0Usage"] = getNetUsage("0");
+
+	$r["message"] = "Here are your Dash stats (old)";
+	$r["result"] = "success";
+	returnJSN($r, false);
+}
+function getPerfStats(){
+//        $ndb = setupDB($GLOBALS['settings']->nimbusDB);
+	$s = getDashStats(30);
+        $r = array();
+        $r["jobCount"] = 1;
+        $r["deltas"] = $s->deltas;
+        $r["dedup"] = $s->dedup;
+        $r["protected"] = $s->protected;
+        $r["dates"] = $s->dates;
+	$r["message"] = "Here are your Perf Stats";
+	$r["result"] = "success";
+	returnJSN($r);
+}
+function getAlerts($webCall=true){
+	$secAgo =  60 * 60 * 24 * 14; // 2 weeks
+	$notes = getJobLogs(0, $secAgo);
+
+	if(!$webCall){
+		return $notes;
+	}else{
+		$r = array();
+		$r["alerts"] = $notes;
+		$r["message"] = "Alerts";
+		$r["result"] = "success";
+                $cache = json_encode( $r);
+		$str = gzencode($cache);
+		header("Content-type: text/javascript");
+		header('Content-Encoding: gzip');
+		print $str;
+	}
+}
+
+// just for the mgr polling cron
+function getA3Stats(){
+	$r = array();
+	$stats = getStatsForMgr();
+	$r["stats"] = $stats;
+	$r["message"] = "A3 Stats";
+	$r["result"] = "success";
+	return returnJSN($r);
+}
+// for the A3 details page
+function getA3Detail(){
+	$r = array();
+	$stats = getA3Details();
+	$r["stats"] = $stats;
+	$r["message"] = "A3 Details";
+	$r["result"] = "success";
+	return returnJSN($r);
+}
+
+function doStatus(){
+	$r = getStatus();
+	$r["message"] = "Enjoy!";
+	$r["result"] = "success";
+	$str = json_encode($r);
+	if($str === false){ 
+		print json_last_error();
+	}else{
+		print $str;
+	}
+}
+
+// used for the restore wiz
+function getSrs(){
+	// $srs["uuid"] { name, free, uuid } // get one for each host, and also one for each pool
+	$r = array();
+	$srs = getSrGroups();
+	$r["srs"] = $srs;
+	$r["message"] = "All known SRs";
+	$r["result"] = "success";
+	return returnJSN($r);
+}
+// used for the restore wiz
+function getNetworks(){
+	$r = array();
+	$nets = getXenNetworks();
+	$r["networks"] = $nets;
+	$r["message"] = "All known Networks";
+	$r["result"] = "success";
+	return returnJSN($r);
+}
+
+
+function handleAlerts($d, $verb){
+	if($verb == "dismiss"){
+		dismissAlert($d->id);
+		return returnResult(true,"Alert Dismissed");
+	}else if($verb == "dismissAll"){
+		dismissAlert(0);	// zero is all
+		return returnResult(true,"All Alerts Dismissed");
+	}else{
+		return getAlerts();
+	}
+	returnError("Alert request not recognized: $verb ". print_r($d,true) );
+}
+
+
+function handleInstaboot($j) {
+	syslog(LOG_INFO, "Entering handleInstaboot");
+	$myStr = json_encode($j);
+	syslog(LOG_INFO, "Gorp is $myStr");
+	$rando = createUuid(); 
+	$tmpPath = "/tmp/$rando.cmd";
+	file_put_contents($tmpPath, $myStr);
+	return runCmd("instaboot", $tmpPath,null);	
+}
+
+function srCleanup() {
+	$r["message"] = "This method was depreciate";
+	$r["result"] = "error";
+	$cmd = "sudo /usr/local/sbin/manageSR clean";
+	syslog(LOG_INFO, "Now a no-op");
+	returnJSN($r);
+}
+
+function handleABD($d, $verb){
+	if($verb == "deployAll"){
+		return runCmd("deployAll",null, null);
+	} else if($verb == "import"){
+		return runCmd("deploy",$d->poolid, null);
+	} else if($verb == "delete"){
+		return runCmd("delete",$d->poolid, null);
+	} else if($verb == "cull"){
+		return runCmd("cull",$d->id, null);
+	} else if($verb == "cull-idle"){
+		return runCmd("cull-idle",$d->poolid, null);
+	} else if($verb == "spawn"){
+		return runCmd("spawn",$d->id, null);
+	} else if($verb == "diag"){
+		return runCmd("diag",$d->poolid, null);
+        } else if($verb == "setnet"){
+                setABDNet($d->poolid, $d->xennet);
+                $r = array();
+                $r["message"] = "ABD xennet: $d->xennet for $d->poolid";
+                $r["result"] = "success";
+                return returnJSN($r);
+	} else if($verb == "setDHCP"){
+		$useDHCP = true;
+		if(isset($d->useManualIP)){ $useDHCP=false; }
+		setABDDhcp($d->poolid, $d->xennet, $useDHCP);
+		$r = array();
+		$r["message"] = "ABD Settings";
+		$r["result"] = "success";
+		return returnJSN($r);
+
+	}
+	returnError("ABD request not recognized ($verb) ");
+}
+
+function handleSupport($d, $verb){
+	if($verb == "package"){
+                $pack = packageLogs();
+		header("Content-Type: application/octet-stream");
+		header("Content-Transfer-Encoding: Binary");
+		header("Content-disposition: attachment; filename=\"support.7z\"");
+		echo readfile($pack);
+		if(file_exists($pack)){
+			unlink($pack);
+		}
+		return;
+        }
+        returnError("Support request not recognized: ($verb) ". print_r($d,true) );
+}
+function handleLogSummary($d, $verb){
+	$r = array();
+	$r["entries"] = getLogSummary($verb);
+	$r["message"] = "Log entries";
+	$r["result"] = "success";
+	return returnJSN($r);
+	
+}
+function handleLogs($d, $verb){
+	$fp = $GLOBALS['settings']->alikeRoot ."/logs";
+	$fname = "A3.log";
+        if($verb == "a3"){
+		$fp = "/home/alike/logs/a3.log";
+	}else if($verb == "engine" || $verb == "all"){
+		$fname = "A3_data.log";
+		$fp = "/home/alike/logs/engine.log";
+	}else if($verb == "syslog"){
+		$fname = "A3_syslog";
+		$fp = "/homa/alike/logs/syslog";
+	}
+
+	header("Content-Type: application/octet-stream");
+	header("Content-Transfer-Encoding: Binary");
+	header("Content-disposition: attachment; filename=\"$fname\"");
+        ob_clean();
+        flush();
+
+	readfile($fp);
+	exit();
+}
+function flrDownload($ds, $filePath){
+        $fp = "/mnt/restore/$ds/$filePath";
+        if(!file_exists($fp)){
+                returnError("File does not exist! ($fn)");
+        }
+        $fname = basename($fp);
+
+//      ob_start("ob_gzhandler");
+
+        header("Content-Type: application/octet-stream");
+        header("Content-Transfer-Encoding: Binary");
+        header('Content-Length: ' . filesize($fp) );
+        header("Content-disposition: attachment; filename=\"$fname\"");
+        ob_clean();
+        flush();
+
+        readfile($fp);
+        exit();
+}
+
+
+
+function handleABDNet($d, $verb){
+	if($verb == "set"){
+		$msg = "ABD network assigned";
+		$result = "success";
+		$res = setABDIP($d);
+		if($res!=""){
+			$result = "error";
+			$msg = "Could not assign IP: $res";
+		}
+		$r = array();
+		$r["message"] = $msg;
+		$r["result"] = $result;
+		return returnJSN($r);
+
+	}else if($verb == "delete"){
+		deleteABDNet($d->id);
+		$r = array();
+		$r["message"] = "Network removed";
+		$r["result"] = "success";
+		return returnJSN($r);
+	}else if(isset($d->id)){
+		$r = array();
+		$r["ABDNet"] = getABDNet($d->id);
+		$r["message"] = "Network removed";
+		$r["result"] = "success";
+		return returnJSN($r);
+	}
+
+	returnError("ABDNet request not recognized: ($verb) ". print_r($d,true) );
+}
+
+function handleSchedule($d, $verb){
+	$id =0;
+	if (isset($d->id)){ $id = $d->id;  }
+	$verb = trim($verb);
+	if($verb == "run"){
+		$name="";
+		 if ($id > 0){
+			return runCmd("runNow", $id, null);
+		}else if (isset($d->name)){ 
+			return runCmd("runNow", $d->name, null);
+		}
+		returnError("Could not run Schedule ($verb $id $name). Incorrect info provided." );
+	}else if ($verb == "set"){
+		$s = setSchedule($d);
+		return returnJSN($s);
+	}else if ($verb == "delete"){
+		 if ($id >0){
+			deleteSchedule($d->id);
+			return returnResult(true, "Schedule Deleted");
+		}
+	}else if ($verb == "status"){
+		 if ($id >0 && isset($d->status)){
+			$msg = "Schedule has been enabled";
+			if($d->status ==0){
+				$msg = "Schedule has been disabled";
+			}
+			setScheduleStatus($id, $d->status);
+			return returnResult(true, $msg);
+		}
+	}else if($d->id > 0){
+		$r = array();
+		$r["Schedule"] = getSchedule($d->id);
+		$r["message"] = "Schedule Details";
+		$r["result"] = "success";
+		return returnJSN($r);
+	}
+        returnError("Schedule request ($verb $id) not recognized");
+}
+
+// quickbackup, set, delete, 
+function handleVM($d, $verb){
+	if ($verb == "quickbackup"){
+		return runCmd("quickBackup",$d->uuid, null);
+		//return returnResult(false, "Quick Backup not implemented yet");
+	}else if ($verb == "set"){
+		$msg = "VM has been updated";
+		switch($d->type){
+			case "offsiteversions":
+				updateVM($d->vmuuid,"offsitemax",$d->value);
+				break;
+			case "onsiteversions":
+				updateVM($d->vmuuid,"onsitemax",$d->value);
+				break;
+			case "authprofile":
+				updateVM($d->vmuuid,"authprofile",$d->value);
+				break;
+			case "accessip":
+				updateVM($d->vmuuid,"accessip",$d->value);
+				break;
+		}
+		return returnResult(true, $msg);
+
+	}else if ($verb == "delete"){
+		deleteVM($d->id);
+		return returnResult(true, "VM has been deleted");
+	}
+	returnError("VM request not recognized");
+}
+
+function handleVersion($d, $verb){
+        if($verb =="delete"){
+
+		purgeVersion($d->uuid, $d->ts, $d->ds);
+		$r = array();
+		$r["uuid"] =$d->uuid;
+		$r["result"]="success";
+		$r["message"]="Backup has been deleted";
+		return returnJSN($r);
+        }else if($verb =="validate"){
+		return runCmd("validate",$d->uuid, $d->ts, $d->ds);
+        }else if($verb =="retain"){
+		$site=0;
+		if(isset($d->offsite) && $d->offsite==1){ 
+			$site=1;
+		}
+		$str= setVersionRetention($d->vmid, $d->version, $site);
+		return returnResult(true, "VM Version $str");
+        }else if($verb =="info"){
+		$r = array();
+		$r["info"] = getVmVersion($d->uuid, $d->ts);
+		$r["result"]="success";
+		$r["message"]="Backup details";
+		return returnJSN($r);
+	}
+	returnError("Version request not recognized");
+}
+
+
+function handleVaulting($d, $verb){
+        if($verb =="runSystemJob"){
+		return returnResult(false, "You can't run a manual OSV Maint job.");
+        }else if($verb == "manualVault"){
+		if(!isODSMounted()){
+			return returnError("Offsite Vault storage (ODS) not configured!<br>Please setup your ODS location from the A3 console before attempting to vault backups.");
+		}
+		if($d->ds == 1) {
+			return runCmd("reverseVaultVm",$d->uuid, $d->ts, null);
+		}
+		return runCmd("vaultVm",$d->uuid, $d->ts, null);
+        }else if($verb == "setState"){
+		returnError("Vault SetState not implemented!");
+        }else if($verb =="getState"){
+		returnError("Vault getState not implemented!");
+        }
+	returnError("Vaulting request not recognized");
+}
+function handleJob($d, $verb){
+	$jid = 0;
+	if(isset($d->jobID)){ $jid =$d->jobID; }
+	else if(isset($d->id)){ $jid =$d->id; }
+	if($verb == "delete"){
+		if($jid ==0){ return returnError("Cannot delete JobID 0"); }
+		deleteJob($jid);
+		return returnResult(1, "The job has been deleted");
+	}else if($verb == "cancel"){
+		if($jid ==0){ return returnError("Cannot cancel JobID 0"); }
+		return runCmd("cancel", $jid, null, null);
+	}
+	returnError("Unclear WS command for Job ($verb)");
+}
+function handleHost($d, $verb){
+	$msg = "Doing a host thing";
+	$result = "success";
+	if($verb =="edit"){
+		$msg = editHost($d->host);
+	}else if($verb == 'test' ){
+		try{
+			$user = null;
+			if(isset($d->user)){ $user = $d->user; }
+			$pass = null;
+			if(isset($d->pass)){ $pass = $d->pass; }
+			$msg = doTestAuth($d->type, $d->ip, $user, $pass);
+			if($msg== null){ returnError("Failed to test host"); }
+			else if($msg->result == "error"){ returnError($msg->message); }
+			$h = null;
+			if($d->type ==2){
+                                $hosts = getHostsFromXen();
+                                if($hosts == null){ return returnError("Failed to test Host (meta returned blank)"); }
+                                foreach($hosts as $h){
+                                        $h->username = $d->user;
+                                        $h->password = $d->pass;
+                                }
+                                $r["hosts"] = $hosts;
+			}else if($d->type ==3){
+				include_once("/usr/local/sbin/hv_common");
+				$h = getHostFromHV($d->ip);
+				$r["hosts"] = $h;
+			}
+			$r["message"] = "Host details";
+
+		}catch(Exception $ex){
+			$err = $ex->getMessage();
+			return returnError("Failed to test Host ($err)");
+		}
+	}else if($verb == 'add' ){
+		try{
+			$msg = doAddHost($d->host);
+			$r["hostAdded"] = 1;
+		}catch(Exception $ex){
+			$err = $ex->getMessage();
+			return returnError("Failed to add Host ($err)");
+		}
+	}else if($verb == "delete"){
+		$msg =delHost($d->guid);
+	}else if( $verb =="refresh"){
+		return runCmd("refresh", $d->guid, null, null);
+	}else if(isset($d->id)){
+		return getHostDetails($d->id);
+	}else{
+		return returnError("Unclear WS command for Host ($verb)");
+	}
+	$r["message"] = $msg;
+        $r["result"] = $result;
+        returnJSN($r);
+}
+
+
+function handleGFSProfile($d, $verb){
+        $r = array();
+        $msg = "";
+        $result = "success";
+        if($verb =="set"){
+                setGFSProfile($d->gfs);
+                $msg = "GFS Profile updated";
+        }else if($verb == "delete"){
+                delGFSProfile($d->id);
+                $msg = "GFS Profile deleted";
+        }else if(isset($d->id)){
+//                 $r["GFSProfile"] =getGFSProfile($d->id);
+		$msg = "Function depreciated";
+		$result = "error";
+        }else if($verb == "push"){	// the mgr is sending all of their profiles for use to add if needed
+		$cnt = 0;
+		foreach($d->profiles as $p){
+			$cnt += setGfsProfile($p);
+		}
+		$msg = "Profiles updated.  Added $cnt new profiles";
+	
+        }else if($verb == "remix"){
+		foreach($d->profiles as $p){
+			remixGfsId($p->orig, $p->new);
+		}
+	}
+        $r["message"] = $msg;
+        $r["result"] = $result;
+        returnJSN($r);
+}
+
+function listGFSProfiles($d){
+        $r = array();
+
+        $r["gfsProfiles"]= getGFSProfiles();
+        $r["message"] = "GFSProfiles";
+        $r["result"] = "success";
+        returnJSN($r);
+}
+
+function listSubscription($d){
+	$r = array();
+
+	$sub = readLicFile();
+	$term = "Monthly";
+	if($sub->subDays == 365){ $term = "Yearly"; }
+	else if($sub->subDays != 30){ $term = "$sub->subDays days"; }
+	if($sub->type ==1 ){ $sub->sockets = 64; }
+	else if($sub->type ==5 ){ $term .= " (Per-VM)"; }
+
+	$socks = getAvailableSockets();
+
+	$sess = 0;
+	if(file_exists("/tmp/qs.sess")){
+		$sess = trim(file_get_contents("/tmp/qs.sess"));
+	}
+	$r["isOffline"] = false;
+	if(isOfflineSub()){
+		$r["isOffline"] = true;
+		if(!$sub){
+			$r["unlicensed"] = true;
+		}
+	}
+
+	$r["session"] = $sess;
+	$r["edition"] = $sub->edition;
+	$r["grantedSockets"] = $sub->sockets;
+	$r["planTotalSockets"] = $sub->totalSockets;
+	$r["usedSockets"] = $socks->socketsUsed;
+	$r["availableSockets"] = $socks->socketsFree;
+
+	$r["company"] = $sub->company;
+	$r["subName"] = $sub->subName;
+	$r["term"] = $term;
+	$r["supportSession"] = $sub->supportSession;
+	$r["type"] = $sub->type;
+	$r["status"] = $sub->status;
+	$r["daysLeft"] = $sub->enddate;
+	$r["a3guid"] = getInstallID();
+	$r["a3build"] = getA3Build();
+	$r["a3Name"] = $sub->a3Name;
+
+        $r["message"] = "Subscription";
+        $r["result"] = "success";
+        returnJSN($r);
+}
+
+function listDisks($d){
+        $r = array();
+
+        $isUUID=false;
+        $id = $d->vmuuid;
+        if(isset($d->vmid)){
+                $id = getVMUuid($d->vmid);
+        }
+	$v = new stdClass();
+	$v->UUID = $d->vmuuid;
+	getVMDisksForSchedule($v);
+
+        $r["Disks"]= $v->Disks;
+        $r["VM"]= $v;
+        $r["uuid"]= $d->vmuuid;
+
+        $r["message"] = "Versions";
+        $r["result"] = "success";
+        returnJSN($r);
+}
+
+function listXenTemplates($d){
+        $r = array();
+
+	$justDefault = false; // getting the defaults is super slow
+
+	if(isset($d->hid)){
+		xen_connect($d->hid);
+		$hoster = getHost($d->hid);	
+		$temps = getXenTemplates($hoster->poolID, $justDefault);
+		asort($temps);
+		$r["templates"]= $temps;
+	}else{
+		$temps = [];
+		$masters = getPoolMasters();
+		foreach($masters as $m){
+			try{
+				xen_connect($m);
+				$hoster = getHost($m);
+				$templates = getXenTemplates($hoster->poolID, $justDefault);
+				sort($templates);
+				$temps[$hoster->poolID] = $templates;
+			}catch(Exception $ex){
+				syslog(LOG_WARNING, "Failed to connect to Xen host ($m->name) in connectByVm: ". $ex->getMessage());
+			}
+		}
+		$r["templates"] = $temps;
+
+	}
+
+        $r["message"] = "Templates";
+        $r["result"] = "success";
+        returnJSN($r);
+}
+
+
+function listVersions($d){
+	$r = array();
+        $h = getVersions($d->uuid );
+        $r["versions"]= $h;
+//        $r["VM"]= getVMByGuid($d->uuid);
+
+        $r["message"] = "Versions";
+        $r["result"] = "success";
+        returnJSN($r);
+	
+}
+function listVaults($d){
+        $r = array();
+
+	$uuid = null;
+	if(isset($d->uuid)){ $uuid = $d->uuid; }
+	$r["odsStatus"] = isODSMounted();
+	$r["VmVersions"]= getVaults($uuid);
+	$r["vaults"] = 1;
+	$r["message"] = "Vaults";
+        $r["result"] = "success";
+        returnJSN($r);
+}
+
+function listBackups($d){
+        $r = array();
+	$uuid = null;
+	if(isset($d->uuid)){ $uuid = $d->uuid; }
+	$r["VmVersions"]= getVersionsByDay($uuid);
+	$r["backups"] = 1;
+	$r["message"] = "Backups";
+        $r["result"] = "success";
+        returnJSN($r);
+}
+function listVMsByTag($d){
+        $r = array();
+        $r["message"] = "VMs";
+        $r["result"] = "success";
+	$vms = getVmsByTag($d->q);
+	$guys = array();
+	foreach($vms as $v){
+		$dood = getVM($v->uuid);
+		$dood->Disks = getDisksForVM($v->uuid);
+		$dood->totalSize =0;
+		foreach($dood->Disks as $disk){ $dood->totalSize += $disk->size; }
+		array_push($guys, $dood);
+	}
+	$r["VMs"] = $guys;
+        returnJSN($r);
+}
+
+function listVMs($d){
+        $r = array();
+	
+	$r["VMs"]= getAllVMs();
+	
+        $r["message"] = "VMs";
+        $r["result"] = "success";
+        returnJSN($r);
+}
+
+function listVMsForMgr($d){
+        $r = array();
+	
+	$r["VMs"]= getAllVMsForMgr();
+	
+        $r["message"] = "VMs";
+        $r["result"] = "success";
+        returnJSN($r);
+}
+
+
+// for the UI Schedules.  List all things that can be added to a job
+function listSources($d){
+        $r = array();
+
+	if(isset($d->backups)){
+		$r["sources"]= getAllVMsWithBackups();
+		$r["message"] = "All Systems with backups";
+
+	}else if(isset($d->search)){
+		if(isset($d->isTag)){
+			$r["sources"] = array();
+			$guys = getVmsByTag($d->search);
+			foreach($guys as $g){
+				$v = new stdClass();
+				$v->name = $g->{"name-label"};
+				$v->uuid = $g->uuid;
+				array_push($r["sources"], $v);
+			}
+			
+			$r["message"] = "Sources for Tag $d->search";
+		}else{
+			// TODO: add seach query
+			$r["sources"]= getAllSources($d->search);
+			$r["message"] = "Sources for $d->search";
+		}
+	}else if(isset($d->isHost)){
+		$r["sources"] = getAllHosts();
+		$r["message"] = "Host Sources";
+	}else{
+		$r["sources"]= getAllSources();
+		$r["message"] = "All Sources";
+	}
+	
+        $r["result"] = "success";
+        returnJSN($r);
+}
+
+
+function listHosts($d){
+
+	$r = array();
+	$h = getHosts();
+
+	if(isset($d->includeSRs) ){
+		foreach($h as $host){
+			$host->SRs = getSRsForHost($host);
+			if($host->type == 2){
+				xen_connect($host->hostID);
+				$host->templates = getXenTemplates($host->poolID);
+			}	
+		}
+	}
+	if(isset($d->includeVMs) ){
+		foreach($h as $host){
+			$host->VMs = getVMsByHost($host->uuid);
+		}
+	}
+
+	$r["Hosts"]= $h;
+        $r["message"] = "Hosts";
+        $r["result"] = "success";
+        returnJSN($r);
+
+}
+
+function listSchedules($d){
+	$r = array();
+
+	try{
+		$s = getAllSchedules(true);
+
+		$r["Schedules"]= $s;
+		$r["message"] = "Schedules";
+		$r["result"] = "success";
+		returnJSN($r);
+	}catch(Exception $ex){
+		if(strpos($ex->getMessage(), "busy") !== false){
+		
+			$r = array();
+			$r["result"] = "error";
+			$r["noDBs"] =1;
+			$r["message"] = $test;
+			return returnJSN($r);
+		}
+	}
+
+}
+function listABDs($d){
+	$r = array();
+        $s = getABDs();
+
+        $r["Pools"]= $s;
+	$p=0;
+	if(getSetting("persistentABDs")=="true"){ $p=1; }
+        $r["persistABDs"]= $p;
+
+        $r["message"] = "ABD List";
+        $r["result"] = "success";
+        returnJSN($r);
+}
+
+function listJobDetails($d){
+	$cache = checkWsCache($d->jobID, 0);
+	$since =0;
+	if(isset($d->since)){ $since = $d->since; }
+
+        if($cache == null || $since > 0){
+		$r = array();
+
+                // new method to calc the total job progress
+                $prog = calcJobProgress($d->jobID);
+                updateJobProgress($d->jobID, $prog);
+                $s = getJoblogDetails($d->jobID, $since);
+                $all = getJobVmProgressAll($d->jobID);
+                $r["Job"]= getJob($d->jobID);
+                $r["vmProgress"]= $all;
+		$r["protectedSize"]= getJobSizeTotal($d->jobID);
+		$r["entries"]= $s;
+		$r["timestamp"]= time();
+		$r["message"] = "JobDetails";
+		$r["result"] = "success";
+
+		$cache = json_encode( $r);
+		if($r["Job"]->status >= 6 ){
+			writeToCache($d->jobID, $cache);
+		}
+	}
+	$str = gzencode($cache);
+	header("Content-type: text/javascript");
+	header('Content-Encoding: gzip');
+        print $str;
+}
+
+function obtainJobIdForInsta($i) {
+		$sql = "SELECT jobID FROM job WHERE target=? ORDER BY timeBegin DESC LIMIT 1";
+		$rez = dbGetColumn("nimbus", $sql, array($i) );
+		if(is_object($rez)) {
+			syslog(LOG_INFO, "Found jobId $rez->jobID");
+			return $rez->jobID;
+		}
+	return -1;
+	
+}	
+
+function listJobs($d){
+	$r = array();
+
+	$lastID = 0;
+	if(!isset($d->since)){
+		// they just want all of them
+		$jerbs = getJobs(9000, null);
+                $r["jobs"] =  $jerbs;
+		
+	}else{
+		$lastID = $d->since;
+		$jerbs =getJobsFromId($lastID);	// this gets all jobs since $lastID 
+		$hot = getActiveJobs();
+                foreach($hot as $j){
+			if($j->status == 2 || $j->status ==3){
+				$prog = calcJobProgress($j->jobID);
+				updateJobProgress($j->jobID, $prog);
+				$j->stage = $prog;
+			}
+                }
+		// this puke just cleans out any duplicates
+		$combo = array_merge($jerbs, $hot);
+		$barf = [];
+		foreach($combo as $c){
+			$id = $c->jobID;
+			if(!isset($barf[$id])){
+				$barf[$id] = $c;
+			}
+		}
+                $r["jobs"] =  array_values($barf);
+	}
+
+	$r["message"] = "Here are your Jobs";
+        $r["result"] = "success";
+        returnJSN($r);
+}
+
+function saveSettingsNimb($d){
+	$r = array();
+	saveAllSettings($d->settings);
+	updateHostname();
+//	$r["given"] = print_r($d,true);
+	$r["message"] = "Settings";
+        $r["result"] = "success";
+        returnJSN($r);
+
+}
+function updateSetting($d, $verb){
+	if($verb == "saveAll"){
+		return saveSettingsNimb($d);
+	}
+
+	$r = array();
+	if($d->setting == "readOnlyMode"){
+                $rof = "/mnt/ads/read_only";
+		file_put_contents($rof, $d->value);
+                if($d->value ==1){
+                        if(!file_exists($rof)){ touch($rof); }
+                }else{
+                        if(file_exists($rof)){ exec("rm $rof"); }
+                }
+        }else{
+		setSettingSync($d->setting, $d->value);
+	}
+//	$r["given"] = print_r($d,true);
+	$r["message"] = "Settings";
+        $r["result"] = "success";
+        returnJSN($r);
+}
+
+function getSettings($d){
+	$r = array();
+	$r["hostIP"] = getSetting("hostIP");
+	$r["smtpNotify"] = getSetting("smtpNotify");
+	$r["a3Hostname"] = getSetting("a3Hostname");
+	$r["a3Name"] = getSetting("a3Name");
+	$r["showTraceMessages"] = getSetting("showTraceMessages");
+
+	$rom = false;
+	$rof = "/mnt/ads/read_only";
+	if(file_exists($rof)){ $rom = true; }
+	$r["readOnlyMode"] = $rom;
+	$r["build"] = getBuild();
+
+	$r["message"] = "Settings";
+        $r["result"] = "success";
+        returnJSN($r);
+
+}
+function getHostDetails($id){
+	$r = array();
+	$h = getHost($id);	
+	$r["host"] = $h;
+	$r["message"] = "Host";
+        $r["result"] = "success";
+        returnJSN($r);
+}
+
+function checkDBs(){
+	$res = "ok";
+	if(!file_exists($GLOBALS['settings']->nimbusDB)){
+		$res = "No DB files found";
+	}else{
+		try{
+			getSetting("uiUser");
+		}catch(Exception $ex){
+			$res = "Settings DB not valid";
+		}
+	}
+	return $res;
+}
+function runCmd($cmd, $arg, $arg2, $arg3=null){
+	if($cmd == "deployAll"){
+		exec($GLOBALS["settings"]->scripts."/jobRunner -a  > /dev/null &");
+		return returnResult(true, "Redeploying ABD template to all pools");
+	}else if ($cmd == "deploy"){
+		exec($GLOBALS["settings"]->scripts."/jobRunner -a $arg  > /dev/null &");
+		return returnResult(true, "Redeploying ABD template to pool");
+	}else if ($cmd == "delete"){
+		exec($GLOBALS["settings"]->scripts."/jobRunner -d $arg  > /dev/null &");
+		return returnResult(true, "Deleting ABD template from pool");
+	}else if ($cmd == "cull-idle"){
+		exec($GLOBALS["settings"]->scripts."/jobRunner -X $arg  > /dev/null &");
+		return returnResult(true, "Culling Idle ABDs on pool $arg");
+	}else if ($cmd == "cull"){
+		exec($GLOBALS["settings"]->scripts."/jobRunner -x $arg  $arg2 > /dev/null &");
+		return returnResult(true, "Culling ABDs");
+	}else if ($cmd == "spawn"){
+		exec($GLOBALS["settings"]->scripts."/jobRunner -w $arg  $arg2 > /dev/null &");
+		return returnResult(true, "Spawning ABDs");
+	}else if ($cmd == "diag"){
+		exec($GLOBALS["settings"]->scripts."/jobRunner -t $arg  > /dev/null &");
+		return returnResult(true, "Running ABD diag");
+	}else if ($cmd == "runNow"){
+		exec($GLOBALS["settings"]->scripts."/jobRunner -s $arg  > /dev/null &");
+		return returnResult(true, "Running Job Now");
+	}else if ($cmd == "quickBackup"){
+		exec($GLOBALS["settings"]->scripts."/jobRunner -b $arg  > /dev/null &");
+		return returnResult(true, "Running Quick Backup");
+	}else if ($cmd == "quickRestore"){
+		exec($GLOBALS["settings"]->scripts."/jobRunner -q $arg  > /dev/null &");
+		return returnResult(true, "Running Quick Restore");
+	}else if ($cmd == "validate"){
+		exec($GLOBALS["settings"]->scripts."/jobRunner -c $arg $arg2 $arg3 > /dev/null &");
+		return returnResult(true, "Validating Backup Now");
+	}else if ($cmd == "vaultVm"){
+		exec($GLOBALS["settings"]->scripts."/jobRunner -qv $arg $arg2 > /dev/null &");
+		return returnResult(true, "Vaulting VM Now");
+	}else if ($cmd == "reverseVaultVm"){
+		exec($GLOBALS["settings"]->scripts."/jobRunner -qvr $arg $arg2 > /dev/null &");
+		return returnResult(true, "Reverse Vaulting VM Now");
+	}else if ($cmd == "cancel"){
+		cancelJob($arg);
+		return returnResult(true, "Cancelling job $arg");
+	}else if ($cmd == "refresh"){
+		exec($GLOBALS["settings"]->scripts."/jobRunner -g  > /dev/null &");
+		return returnResult(true, "Beginning meta-refresh");
+	}else if($cmd == "instaboot") {
+		syslog(LOG_INFO, "About to call jobRunner with -i $arg");
+		exec($GLOBALS["settings"]->scripts."/jobRunner -i $arg  > /dev/null &");
+		return returnResult(true, "Beginning instant boot");
+	}
+}
+
+function listInstaboots(){
+        $r = array();
+	$t=0;
+	$result = "error";
+	$stuff = "";
+	$sr = "";
+	$msg = "VMs";
+	try{
+		$stuff = listInstaVmHosts();
+		foreach($stuff as &$dangerous) {
+			//$barf = print_r($dangerous, true);
+			//syslog(LOG_INFO, "Dangerous is: $barf");
+			$u = $dangerous["vm"];
+			$rez = trim(xen_call("vm-param-get", "uuid=$u", "param-name=\"power-state\""));
+			if(stripos($rez, "invalid") !== false) {
+				syslog(LOG_ERR, "Cannot query power state for VM '$u' with error $rez");
+			} else {
+				$dangerous['power'] = $rez;
+			}
+		}
+		$sr = getDiskUsageSR();
+		$result= "success";
+	}catch(Exception $ex){
+		$msg = $ex->getMessage();
+	}
+	$r["SR"] = $sr;
+	$r["VMs"]= $stuff;
+        $r["message"] = $msg;
+	$r["result"] = $result;
+
+        returnJSN($r);
+}
+
+function xenPoolHosts() {
+	$pools = array();
+	$returnMe = array();
+	$hs = getHosts();
+	foreach($hs as $h) {
+		if($h->type != 2) {
+			continue;
+		}
+		$poolID = $h->poolID;
+		if(array_key_exists($poolID, $pools) == false) {
+			$foo = array();
+			$foo['poolID'] = $poolID;
+			$pools[$poolID] = obtainPoolName($h->hostID, "__masterless");
+		}
+		$poolName = $pools[$poolID];
+		$h = (array) $h;
+		$h['poolName'] = $poolName;
+		$h = (object) $h;
+		array_push($returnMe, $h);
+	}
+	
+
+	$r = array();
+
+	$r["Hosts"] = $returnMe;
+	$r["message"] = "hosts";
+	$r["result"] = "success";
+
+	returnJSN($r);
+}
+
+function obtainPoolName($hostID, $defaultName) {
+	try {
+		xen_connect($hostID);
+		$rez = parse_xen_result(xen_call("pool-list", "params=name-label"));
+		$rez = json_decode($rez, true);
+		$happy = $rez[0]['name-label'];
+		if(empty($happy)) {
+			$happy = $defaultName;
+		}
+		syslog(LOG_INFO, $happy);
+		return $happy;
+	} catch(ErrorException $e) {
+		return "Unreachable Hosts";
+	}
+}
+
+function doPromoSeen() {
+	setSettingSync("promoSeen", "true");
+	$r["result"] = "success";
+	returnJSN($r);
+}
+
+function doBrowseFLR($j){
+	$ds=0;
+	if($j->ds!=""){ $ds = $j->ds; }
+
+	$base = "/mnt/restore/$ds";
+	$len = strlen($base);
+	$want =null;
+	if(isset($j->uuid)){
+		// they want to jump to a specific VM
+		$base = getRestorePathName($j->uuid, $ds);
+		if(isset($j->ts)){ $base .= "/$j->ts"; }
+		$parts = explode('/', $base);
+		$base = implode('/', array_slice($parts, 0, 4));
+		$want = implode('/', array_slice($parts, 4));
+		$want = "/$want";
+
+	}else{
+		// the regular browsing code
+		$want = $j->path;
+		if (substr($want, 0, $len) === $base) { $want = substr($want, $len); }	 // remove the base, just in case
+
+		// check if they're going up a dir
+		if (substr($want, -2) === '..') {
+			$want = substr($want, 0, -3);
+			$parts = explode("/", $want);
+			$lastIndex = count($parts) - 1;
+			unset($parts[$lastIndex]);
+			$want = implode('/', $parts);
+		}
+	}
+	$path = $base . "/$want";
+	$dir = listDir($path);
+
+	foreach($dir as &$d){
+		$d["name"] = basename($d["name"]);
+	}
+
+	$r["data"]=$dir;
+	$r["ds"]=$ds;
+	$r["result"] = "success";
+	$r["relpath"]=$want;
+
+	returnJSN($r);
+
+}
+function downloadFlrFile($d){
+	$site = $d["siteid"];
+	$file = $d["file"];
+	$file = ltrim(str_replace('\\', '', $file), "/");
+
+	
+	$base = "/mnt/restore/$site";
+	$filePath = "$base"."/$file";
+	$fileName = basename($filePath);
+	if(!file_exists($filePath)){
+		returnError(" $filePath could not be found!" );
+		return;
+	}
+
+	header('Content-Type: application/octet-stream');
+	header('Content-Transfer-Encoding: Binary');
+	header('Content-Length: ' . filesize($filePath));
+	header('Content-Disposition: attachment; filename="' . $fileName . '"');
+
+	// Flush the output buffer
+	ob_clean();
+	flush();
+
+	// Read and output the file
+	readfile($filePath);
+
+}
+
+// this is called by the Mgr to sync it's cached db
+function getStatsForMgr(){
+	$r = array();
+        $r["status"] = 2;	// 0 = off, 1=loading, 2=running
+        if(!file_exists("/mnt/ads/docker.up")){ $r["status"] = 1; }
+        $nfoFile = $GLOBALS['settings']->alikeRoot ."/alike.bld.nfo";
+        $nfo = json_decode(file_get_contents($nfoFile), false);
+        $r["build"] = $nfo->alikeBuild;
+
+//        $r["name"] = 'StatsForMgr A3 Name';
+	$r["guid"] = getInstallID();
+        $r["runningJobs"] = getActiveJobs();
+        $r["alerts"] = getAlerts2();
+        $r["numAlerts"] = count($r["alerts"]);
+        $r["cpuFree"] = 100 - getCPUUsage();
+        $r["cpus"] = getCPUCount();
+        $mem = getMemory();
+        $r["memory"] = $mem->total;
+        $r["memFree"] = $mem->free;
+	$ads = getADSInfo();
+	$ods = getDSInfo(1);
+	$r["odsStatus"] = isODSMounted();
+	$r["adsFree"] = $ads->free;
+        $r["adsSize"] = $ads->total;
+	$r["odsFree"] = $ods->free;
+        $r["odsSize"] = $ods->total;
+
+        $r["virtualStored"] = getVirtProtected();
+        $r["actualStored"] = getActStored();
+
+	return $r;
+}
+
+
+// called by A3 detail page
+function getA3Details(){
+        $r = array();
+        $r["status"] = 2;       // 0 = off, 1=loading, 2=running
+        if(!file_exists("/mnt/ads/docker.up")){ $r["status"] = 1; }
+//        $sub = getSubInfo();
+//        $sub2 = getSubscriptionDetails();
+        $nfoFile = $GLOBALS['settings']->alikeRoot ."/alike.bld.nfo";
+        $nfo = json_decode(file_get_contents($nfoFile), false);
+        $r["build"] = $nfo->alikeBuild;
+
+//        $r["subName"] = $sub->subName ?? 'N/A';
+//        $r["subCompany"] = $sub->company ?? 'N/A';
+
+        $r["name"] = getSetting('a3Name');
+//        $r["edition"] = $sub2->edition;
+//        $r["licenses"] = $sub2->granted;
+
+        $r["hostIP"] = getSetting("hostIP");
+        $r["guid"] = getInstallID();
+        $r["uptime"] = shell_exec("uptime -p");
+        $r["alerts"] = getAlerts2();
+        $r["numAlerts"] = count($r["alerts"]);
+        $r["cpuFree"] = 100 - getCPUUsage();
+        $r["cpus"] = getCPUCount();
+        $mem = getMemory();
+        $r["memory"] = $mem->total;
+        $r["memFree"] = $mem->free;
+        $ads = getADSInfo();
+        $ods = getDSInfo(1);
+	$r["odsStatus"] = isODSMounted();
+        $r["adsFree"] = $ads->free;
+        $r["adsSize"] = $ads->total;
+        $r["odsFree"] = $ods->free;
+        $r["odsSize"] = $ods->total;
+        $r["localDisk"] = getDiskUsageLocal();
+        $r["dbDisk"] = getDiskUsageSR();
+
+	$r["adsStatus"] = testADSPath();
+        $r["adsNet"] = getNetUsage("0");
+
+        $r["javaState"] = shell_exec("pgrep java") !== null;
+        $r["blkfsState"] = shell_exec("pgrep blkfs") !== null;
+        $r["instafsState"] = shell_exec("pgrep instafs") !== null;
+
+        $r["virtualStored"] = getVirtProtected();
+        $r["actualStored"] = getActStored();
+	$java = getJavaStatus();
+	$r["engineStats"] = $java;
+
+        return $r;
+}
+
+function handleRestore($j, $verb){
+	$r = array();
+
+	$r["message"] = $verb;
+	if($verb == "quick"){
+		// we have: vmUuid, ds, ts, sr, vhd, template
+		$r["message"] = "Restore job started. ";
+		$out = json_encode($j);
+		$fn = "/tmp/job_ctl/". $j->vmUuid.".gorp";
+		file_put_contents($fn, $out);
+                if(!file_exists($fn)){
+                        $r["result"] = "error";
+                        $r["message"] = "Unable to write control file to /tmp/job_ctl";
+                        return returnJSN($r);
+                }
+
+		exec($GLOBALS["settings"]->scripts."/jobRunner -q $fn  > /dev/null &");
+		
+	}
+	$r["result"] = "success";
+
+	returnJSN($r);
+}
+
+?>

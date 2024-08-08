@@ -1,0 +1,170 @@
+#!/usr/bin/php -q
+<?php
+
+include_once("/usr/local/sbin/common_lib");
+include_once("/usr/local/sbin/common_lib");
+
+$GLOBALS['prog'] = basename($argv[0]);
+if(count($argv) <= 1){
+	usage();
+}
+
+
+if($argv[1] == "restore" || $argv[1] == "safeRestore"){
+        if($argc < 3){ 
+		echo "insufficient parameters\n"; 
+		usage();
+	}
+        $src = $argv[2];
+        $targetDevice = $argv[3];
+        $diskNum = $argv[4];
+        $abd = $argv[5];
+        $jid = $argv[6];
+        $vmid = $argv[7];
+	$comp = false;
+	if(isset($argv[8]) ){
+		if($argv[8] == "true"){ $comp = true; }
+	}
+	if(!file_exists($src)){
+		die("Could not find source version:\n$src\n");
+	}
+	if($argv[1] =="safeRestore"){
+		doSafeRestore($src, $targetDevice, $diskNum, $abd, $jid, $vmid, $comp);
+	}else{
+		doFastRestore($src, $targetDevice, $diskNum, $abd, $jid, $vmid, $comp);
+	}
+
+} else if($argv[1] == "progress" ){
+        if($argc < 5){ 
+		echo "insufficient parameters\n"; 
+		usage();
+	}
+        $jid = $argv[2];
+        $num = $argv[3];
+        $vmid = $argv[4];
+	showProgress($jid, $num, $vmid);
+
+}else{
+	echo "Incorrect usage\n";
+	usage();
+}
+
+function usage(){
+	$prog = $GLOBALS['prog'];
+        $msg = "Usage: \n";
+	$msg .= "$prog <restore> <path> <remote disk> <disk num> <abdip> <job id> <vmid> <useCompress>\n";
+        $msg .= "$prog <progress> <jobid> <disknum> <vmid>\n";
+        print $msg;
+        exit(1);
+}
+
+function showProgress($jid, $disknum, $vmid){
+	$restPath = $GLOBALS["tempPath"] ."/safe_rest.$jid.$vmid.$disknum";
+	if(!file_exists($restPath)){
+		die("NA");
+	}
+	#$cmd = "cat $restPath | tr '\r' '\n'| grep -v -e '^$' | grep -v truncate | tail -n 1 | awk {'print $2'} | tr '%' ' '";
+	$cmd = "tail -1 $restPath";
+	$prog = trim(shell_exec($cmd));
+	if($prog == ""){
+		die("NA");
+	}
+	echo $prog;
+}
+function doFastRestore($src, $device, $disknum, $abd, $jid, $vmid, $comp){
+	$sshOpt = " -q -o ServerAliveInterval=15 -o ServerAliveCountMax=60 -o StrictHostKeyChecking=no";
+	$restPath = $GLOBALS["tempPath"] ."/safe_rest.$jid.$vmid.$disknum";
+	$sz = filesize($src);
+	$port = 2812 + $disknum;
+	$srv = "ssh $sshOpt root@$abd 'nc -l -p $port | dd of=/dev/$device'";
+	$cmd = "dd status=none bs=4M if=$src | pv -n -s $sz 2> $restPath |  nc -w 10 $abd $port";
+
+	if($comp){
+		$srv = "ssh $sshOpt root@$abd 'nc -l -p $port | lz4 -d - - | dd of=/dev/$device'";
+		$cmd = "dd status=none bs=4M if=$src | pv -n -s $sz 2> $restPath | lz4 - - |  nc -w 10 $abd $port";
+	}
+	$out = shell_exec("screen -dmS client$disknum sh -c \"$srv\"");
+
+	$srvcmd = "ssh $sshOpt root@$abd \"ps auxw | grep dd | grep $device| grep -v bash | grep -v grep | sed 's/\s\+/ /g' |cut -d ' ' -f2\"";
+		sleep(1);
+	$pid = trim(shell_exec($srvcmd));
+
+		sleep(1);
+	$tmp = "/tmp/rest.$jid.$vmid.$disknum";
+	file_put_contents($tmp, $cmd);
+	exec("chmod 755 $tmp");
+	$rez = managedRun("/bin/bash ". $tmp);
+	sleep(5);
+
+
+	if($pid != ""){
+		$srv = "ssh $sshOpt root@$abd \"sync;sync;sync; > /dev/null 2>&1\"";
+		$res = shell_exec($srv);
+		$src = "ssh $sshOpt root@$abd \"while test -d /proc/$pid; do sleep 2; done\";";
+		$res = shell_exec($srv);
+	}
+	pcntl_wait($status);
+	foreach(explode(' ',$rez->stdOut) as $code) {
+		if($code != 0 ){
+			$rez->code=$code;
+		}
+	}	
+	if($rez->code != 0){
+		echo "ERROR\n";
+		echo "Error code:i $rez->code. Msg: $rez->stdErr\n";
+	}else{
+		$perc = trim(shell_exec("tail -1 $restPath"));
+		if($perc != 100){
+			echo "ERROR\n";
+			echo "Failed to copy all bytes to device.\n";
+			echo "Ended at $perc% complete.\n";
+			echo $rez->stdOut;
+			echo $rez->stdErr;
+		}else{
+			echo "SUCCESS\n";	// stdout is checked by c#
+		}
+	}
+}
+
+function doSafeRestore($src, $device, $disknum, $abd, $jid, $vmid, $comp){
+	$restPath = $GLOBALS["tempPath"] ."/safe_rest.$jid.$vmid.$disknum";
+	#$cmd = "script -q -c \"scp -c blowfish-cbc $src root@$abd:/dev/$device\" > $restPath";
+	$sz = filesize($src);
+	//$cmd = "script -q -c \"dd bs=4096 if=$src | pv -n -s $sz | ssh root@$abd -c blowfish-cbc  'dd of=/dev/$device' \" > $restPath";
+	//$cmd = "#!/bin/bash\n";
+
+	//$sshOpt = "-c blowfish-cbc  -o ServerAliveInterval=15 -o ServerAliveCountMax=60";
+	$sshOpt = " -o ServerAliveInterval=15 -o ServerAliveCountMax=60 -o StrictHostKeyChecking=no";
+	if(file_exists("/home/alike/use_nohc0") ){
+		$sshOpt = "";
+	}
+
+	$cmd = "dd bs=4096 if=$src | pv -n -s $sz 2> $restPath | ssh root@$abd $sshOpt 'dd of=/dev/$device > /dev/null'; echo \${PIPESTATUS[@]}";
+	if($comp){
+//		exec("scp /home/alike/Alike/bin/lz4 root@$abd:/root/lz4");
+		//$cmd = "script -q -c \"dd status=none bs=4096 if=$src | pv -n -s $sz | lz4 - - |  ssh root@$abd -c blowfish-cbc  '/root/lz4 -d - - | dd of=/dev/$device' \" > $restPath";
+		//$cmd = "#!/bin/bash\n";
+		$cmd = "dd status=none bs=1M if=$src | pv -n -s $sz 2> $restPath | lz4 - - |  ssh root@$abd $sshOpt  'lz4 -d - - | dd of=/dev/$device' > /dev/null;  echo \${PIPESTATUS[@]}";
+	}
+	
+	$tmp = "/tmp/rest.$jid.$vmid.$disknum";
+	file_put_contents($tmp, $cmd);
+	exec("chmod 755 $tmp");
+	$rez = managedRun("/bin/bash ". $tmp);
+	unlink($tmp);
+
+	foreach(explode(' ',$rez->stdOut) as $code) {
+		//if($code != 0 && $code != 127){
+		if($code != 0 ){
+			$rez->code=$code;
+		}
+	}	
+
+	if($rez->code != 0){
+		echo "ERROR\n";
+		echo "Msg: $rez->stdErr\n";
+	}else{
+		echo "SUCCESS\n";	// stdout is checked by c#
+	}
+}
+

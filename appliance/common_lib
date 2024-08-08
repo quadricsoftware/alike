@@ -1,0 +1,2675 @@
+<?php
+
+// This file has common functions for both the system (sbin) and application (alike) scripts to share
+// It is included by all sbin scripts, as well as all the docroot/script/hooks in AlikeHome
+
+$GLOBALS["productVersion"]=7;
+$GLOBALS["AH"]="/home/alike";
+$GLOBALS["AR"]="/home/alike/Alike";
+$GLOBALS["tempPath"]="/home/alike/Alike/temp";
+
+$GLOBALS["jvPath"]= $GLOBALS["tempPath"] ."/jv";
+$GLOBALS["progPath"]= $GLOBALS["tempPath"] ."/prog";
+
+$GLOBALS["agentShare"]="/home/alike/Alike/agentShare";
+
+$GLOBALS["jobPath"]= $GLOBALS["agentShare"]."/jobs";
+$GLOBALS["logPath"]= $GLOBALS["agentShare"]."/logs";
+$GLOBALS["repCache"]= $GLOBALS["agentShare"]."/repCache";
+
+function getInstallID(){
+        $ifile = $GLOBALS["AH"] ."/Alike/inst.id";
+        $inst = trim(file_get_contents($ifile));
+        return $inst;
+}
+
+function isProcessRunning($name){
+        $pids = array();
+        exec("pgrep $name", $pids);
+        if(empty($pids)) { return false;}
+        return true;
+}
+
+function bytesToString($bytes){
+	if ($bytes >= 1099511627776){
+            $bytes = number_format($bytes / 1099511627776, 2) . ' TB';
+        }
+        elseif ($bytes >= 1073741824){
+            $bytes = number_format($bytes / 1073741824, 2) . ' GB';
+        }
+        elseif ($bytes >= 1048576){
+            $bytes = number_format($bytes / 1048576, 2) . ' MB';
+        }
+        elseif ($bytes >= 1024){
+            $bytes = number_format($bytes / 1024, 2) . ' KB';
+        }
+        elseif ($bytes > 1){
+            $bytes = $bytes . ' bytes';
+        }
+        elseif ($bytes == 1){
+            $bytes = $bytes . ' byte';
+        }
+        else{
+            $bytes = '0 bytes';
+        }
+
+        return $bytes;
+}
+function secondsToString($sec){
+	$h= floor($sec / 3600);
+	$m= floor(($sec / 60) % 60);
+	$s= $sec % 60;
+	$res = "";
+	if($h >0){ 
+		$res = "$h hr";
+		if($m >0){ $res .= ", $m min";}
+	}else if($m > 0){
+		$res = "$m min";
+		if($s >0){ $res .= ", $s sec";}
+	}else{
+		$res = "$sec sec";
+	}
+	return $res;
+}
+
+function getGenericDB($dbFile){
+        if(file_exists($dbFile)==false){
+                echo "DB not found!  ($dbFile)\n";
+		throw new Exception("$dbFile not found");
+        }
+        $db = new PDO("sqlite:$dbFile");
+        $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+        return $db;
+}
+
+function getSetting($set){
+        $sql = "SELECT val from settings where name=?";
+	$st = dbGetColumn("nimbus", $sql, array($set) );
+        if(!isset($st) ){ return ""; }
+
+	if($set == "smtpPassword"){ $st = unobfuscate($st); }
+
+        return $st;
+}
+function setSetting($name, $val){
+	if($name == "smtpPassword"){ $val = obfuscate($val); }
+        $sql = "INSERT OR REPLACE INTO Settings (name,val) VALUES (?, ?)";
+        dbSet("nimbus", $sql, array($name, $val));
+}
+
+function getInternal($set){
+        $sql = "SELECT val from Internals where name=?";
+	$st = dbGetColumn("nimbus", $sql, array($set) );
+        if(!isset($st) ){ return ""; }
+        return $st;
+}
+
+function getPoolMasters($poolID=null){
+        if( empty($poolID )){
+                $sql = "SELECT hostID from Host where role=1 and virttype=2 order by poolID";
+		return dbGetArray("nimbus", $sql );
+        }
+        $sql = "SELECT hostID from Host where poolID = ? and role=1 and virttype=2";
+	return dbGetArray("nimbus", $sql, array($poolID) );
+}
+
+function getDiskUsageRD(){
+        $cmd = "df --block-size=1 /home/alike/Alike/DBs 2>/dev/null | grep -v 'Available' | awk '{ print $2 \",\" $4 }'";
+        $bits =  explode(",",trim(shell_exec($cmd)));
+        $out = new stdClass();
+        $out->total = $bits[0];
+        $out->free = $bits[1];
+        return $out;
+}
+function getDiskUsageLocal(){
+        $cmd = "df --block-size=1 / 2>/dev/null | grep  '/$' | awk '{ print $2 \",\" $4 }'";
+        $bits =  explode(",",trim(shell_exec($cmd)));
+        $out = new stdClass();
+        $out->total = $bits[0];
+        $out->free = $bits[1];
+        return $out;
+}
+function getDiskUsageSR(){
+        $cmd = "df --block-size=1 /mnt/instaboot/sr 2>/dev/null | grep -v 'Availabl' | awk '{ print $2 \",\" $4 }'";
+	$res = trim(shell_exec($cmd) );
+        $bits =  explode(",",$res );
+        $out = new stdClass();
+	$out->total = $bits[0];
+	$out->free = $bits[1];
+        $cmd = "du --block-size=1 -s /mnt/instaboot/sr | awk '{ print $1 }'";
+	$out->used = trim(shell_exec($cmd) );
+        return $out;
+}
+
+
+function getMemory() {
+    $data = explode("\n", file_get_contents("/proc/meminfo"));
+        $mem = new stdClass();
+    foreach ($data as $line) {
+        $parts =explode(":", $line);
+        if(count($parts) !=2){ continue; }
+        if($parts[0] == "MemTotal"){
+                $mem->total = preg_replace("/[^0-9,.]/", "", $parts[1]) *1024;
+        }else if($parts[0] == "MemAvailable"){
+                $mem->free = preg_replace("/[^0-9,.]/", "", $parts[1]) *1024;
+        }
+    }
+    return $mem;
+}
+
+function getCPUCount(){
+        //return exec('cat /proc/cpuinfo | grep "physical id" | sort | uniq | wc -l');
+        return exec('grep -c ^processor /proc/cpuinfo  ');
+}
+
+function getADSInfo(){
+        $ads= new stdClass();
+        $ads->total = 0;
+        $ads->free =0;
+	$ads->typeStr = "?";
+	$ads->path = "?";
+	$ads->type = 0;
+
+        $bits = explode(" ",exec("df /mnt/ads 2>/dev/null| grep /mnt/ads | awk '{print $2, $4}'"));
+        if(count($bits) > 1){
+                $ads->total = $bits[0] * 1024;
+                $ads->free = $bits[1] * 1024;
+        }
+	$ads->type = trim(shell_exec("mount  | grep ads | awk '{print $5}'"));
+
+        return $ads;
+}
+
+function getDSInfo($num){
+        $ods= new stdClass();
+        $ods->total = 0;
+        $ods->free =0;
+	$ods->typeStr = "local";
+	$ods->path = "/mnt/ods$num";
+	$ods->type = 0;
+	$ods->isDefined=isODSMountedReal();
+
+	$ods->isCloud = false;
+	$bits = explode(" ",exec("df /mnt/ods$num 2>/dev/null| grep -v Available | awk '{print $2, $4}'"));
+	if(count($bits) > 1){
+		$ods->total = $bits[0] * 1024;
+		$ods->free = $bits[1] * 1024;
+	}
+	$ods->used = $ods->total - $ods->free;
+
+        return $ods;
+}
+
+
+function getS3RegionList(){
+	$s = array();
+	$s["us-east-1"] = "s3.us-east-1.amazonaws.com";
+	$s["us-east-2"] = "s3.us-east-2.amazonaws.com";
+	$s["us-west-1"] = "s3.us-west-1.amazonaws.com";
+	$s["us-west-2"] = "s3.us-west-2.amazonaws.com";
+	$s["ca-central-1"] = "s3.ca-central-1.amazonaws.com";
+	$s["ap-south-1"] = "s3.ap-south-1.amazonaws.com";
+	$s["ap-northeast-1"] = "s3.ap-northeast-1.amazonaws.com";
+	$s["ap-northeast-2"] = "s3.ap-northeast-2.amazonaws.com";
+	$s["ap-southeast-1"] = "s3.ap-southeast-1.amazonaws.com";
+	$s["ap-southeast-2"] = "s3.ap-southeast-2.amazonaws.com";
+	$s["cn-north-1"] = "s3.cn-north-1.amazonaws.com.cn";
+	$s["cn-northwest-1"] = "s3.cn-northwest-1.amazonaws.com.cn";
+	$s["eu-central-1"] = "s3.eu-central-1.amazonaws.com";
+	$s["eu-west-1"] = "s3.eu-west-1.amazonaws.com";
+	$s["eu-west-2"] = "s3.eu-west-2.amazonaws.com";
+	$s["eu-west-3"] = "s3.eu-west-3.amazonaws.com";
+	$s["eu-north-1"] = "s3.eu-north-1.amazonaws.com";
+	$s["sa-east-1"] = "s3.sa-east-1.amazonaws.com";
+	return $s;
+}
+
+function getCPUUsage(){
+        //$cmd ="grep 'cpu ' /proc/stat | awk '{usage=($2+$4)*100/($2+$4+$5)} END {print usage}'";
+        if(file_exists("/tmp/metrics/cpu_usage")==false){ return 0; }
+        $cmd = "cat /tmp/metrics/cpu_usage";
+        return shell_exec($cmd);
+}
+function getNetUsage($site=""){
+        $file = "/tmp/metrics/net_usage";
+
+        if($site!=""){ $file .= "_site$site"; }
+
+        if(file_exists($file)==false){ 
+		$fake = new stdClass();
+		$fake->rx=0;
+		$fake->tx=0;
+		$me = array();
+		$me[0] = $fake;
+		return $me; 
+	}
+        $base = json_decode(file_get_contents("/tmp/metrics/net_usage"));
+        $jave = json_decode(file_get_contents("/tmp/metrics/net_usage_site0"));
+
+        for($i=0; $i < count($base); $i++){
+                $base[$i]->rx += $jave[$i]->rx;
+                $base[$i]->tx += $jave[$i]->tx;
+        }
+        return $base;
+
+
+        $content = file_get_contents($file);
+        return json_decode($content);
+}
+
+function getVirtProtected(){
+        $met = "/tmp/metrics/0.refCount";
+	$blockSize = "/tmp/metrics/0.blockSize";
+        if(!file_exists($met)){ return 0; }
+	if(!file_exists($blockSize)){ return 0; }
+
+        $meat = explode("\n",trim(file_get_contents($met)));
+	$blockSizeReal = explode("\n",trim(file_get_contents($blockSize)));
+
+        if(count($meat) < 1){ return 0; }
+        return $meat[0] * $blockSizeReal[0];
+}
+
+function countFiles($dir, $ext){
+        $full = $dir ."*";
+        $files = glob($full);
+        $files =  preg_grep("/\.$ext$/i", $files);
+        if ( $files !== false ) { return count($files); } 
+	return 0;
+}
+function getSizeOfFiles($dir, $ext){
+        $cmd ="du -cb $dir*.$ext | grep total | awk {'print $1'}";
+        return exec($cmd);
+}
+
+function isLegacy(){ return false; }
+
+function sysmail($subject, $body, $force=false){
+        $enabled = getSetting("enableWarningEmails");
+	if($force ==true){ $enabled = true;}
+	if(!$enabled){ return false; }
+
+//        $to = getSetting("smtpToAddress");
+	$inf = getSubInfo();
+	$to = $inf->ownerEmail;
+	if($to != ""){
+		$s = getSubInfo();
+		$aname = $s->a3Name;
+		$subject .= " [$aname]";
+		$resp = doMail($to, $subject, $body);
+		$log = "Successfully sent email ($subject) to: $to ($resp->message)\n";
+                if($resp->result == "error"){ $log = "Error sending email ($subject): $resp->message\n"; }
+		logmail($log);
+		return $resp;
+	}
+	return false;
+}
+
+// send email to the subscription owner
+function priorityMail($subject, $body){
+	$resp = doMail(null, $subject, $body, true);
+	$log = "Successfully sent email ($subject) to: <subscription owner> ($resp->message)\n";
+	if($resp->result == "error"){ $log = "Error sending email ($subject): $resp->message\n"; }
+	logmail($log);
+}
+
+function doMail($to, $subject, $body, $isPriority=false){
+	;
+}
+
+function logmail($msg){
+	$file = "/home/alike/logs/mail.log";
+	file_put_contents($file, $msg, FILE_APPEND);
+}
+
+// Editions:
+//		0 = Free
+//              1 = STD
+//              2 = DR
+//              5 = MSP
+
+function getEditionString($ed){
+	if($ed == -1){ return "Unknown Edition"; }
+	else if($ed == 0){ return "Free Edition"; }
+	else if($ed == 1){ return "Standard Edition"; }
+	else if($ed == 2){ return "DR Edition"; }
+	else if($ed == 5){ return "MSP Edition"; }
+}
+function getTypeString($t){
+	if($t == -1){ return "Unknown Type"; }
+	else if($t == 0){ return "Commercial"; }
+	else if($t == 1){ return "Trial"; }
+	else if($t == 2){ return "NFR"; }
+	else if($t == 3){ return "Tester"; }
+	else if($t == 5){ return "MSP"; }
+}
+
+function getServiceStates(){
+        $ret = new stdClass();
+        $ret->allon=true;
+        $ret->alloff=false;
+        $ret->sched=true;
+        $ret->engine=true;
+        $ret->rest=true;
+        $ret->web = isProcessRunning("nginx");
+
+        if(!schedulerState()){
+                $ret->sched=false;
+                 $ret->allon=false;
+        }
+        if(!isProcessRunning("java")){
+                $ret->engine=false;
+                $ret->allon=false;
+        }
+        if(!isProcessRunning("blkfs")){
+                $ret->rest=false;
+                $ret->allon=false;
+        }
+
+        if(!$ret->sched && !$ret->engine && !$ret->rest ){ $ret->alloff=true; }
+        //if(!$ret->sched && !$ret->engine && !$ret->rest && !$ret->web){ $ret->alloff=true; }
+
+        return $ret;
+}
+
+
+
+class DBHolder {
+	function __construct($name) {
+		if($name == "nimbus"){ $name = "nimbusdb"; }
+		if($name == "nimbusdb.db"){ $name = "nimbusdb"; }
+
+		if(isset($GLOBALS["openDB"]) && $GLOBALS["openDB"] != null){
+
+$st = debug_backtrace();
+$barf = print_r($st, true);
+			throw new Exception("Tried to open $name DB when handle for ".$GLOBALS["openDB"]." is already open. $barf");
+		}
+
+		$GLOBALS["openDB"] = $name;
+
+		$this->dbn = $name;
+		$this->fp = null;
+		$this->ro = true;
+	}
+	function __destruct() {
+		$GLOBALS["openDB"] = null;
+		if($this->fp){
+			//flock($this->fp, LOCK_UN);
+			fclose($this->fp);
+			$fn = "/tmp/wal-locker".$this->dbn.".db";
+			$GLOBALS[$fn] = false;
+//			syslog(LOG_DEBUG, "DTOR for $this->dbn (closed fp $this->fp)");
+		}else{
+//			syslog(LOG_DEBUG, "DTOR for $this->dbn (did NOT CLOSE fp (-1) )");
+		}
+	}
+
+	private $ro;
+	private $dbn;
+	public $db;
+	private $fp;
+
+	public function flock(){
+		$this->ro =false;
+
+		$fn = "/tmp/wal-locker".$this->dbn.".db";
+		if(isset($GLOBALS[$fn]) && $GLOBALS[$fn] == true){
+			return;	
+		}
+		$cnt=0;
+		$max=25000;
+		while( !$this->fp ) {
+			$oldm = umask(0);
+			$this->fp = @fopen($fn, "w");
+			umask($oldm);
+			if($this->fp) { break; }
+			$cnt++;
+			if($cnt > $max){
+				syslog(LOG_DEBUG, "Failed to get write lock on: $this->dbn");
+				throw new Exception("Failed to get write lock on $this->dbn");
+			}
+			usleep(200000);
+		}
+		$cnt = 0;
+		$hasLogged=false;
+		while(flock($this->fp, LOCK_EX |LOCK_NB) == false) {
+			if($hasLogged == false) {
+				syslog(LOG_INFO, "dbh flock ($this->dbn)  delayed access to DB (busy)");
+				$hasLogged = true;
+			}
+			usleep(200000);
+			if($cnt++ > $max) {
+				syslog(LOG_ERR, "dbh retrying flock access for $this->dbn (busy)");
+				throw new Exception("Failed to get connection (lock) to getDB $this->dbn (busy)");
+			}
+		}
+		if($cnt > 0){
+			$tots = 200 * $cnt;
+			syslog(LOG_DEBUG, "flock ($this->dbn)  worked after a $tots ms delay");
+		}
+		$GLOBALS[$fn] = true;
+//		syslog(LOG_DEBUG, "flocked for $this->dbn on $this->fp");
+	}
+	private function setupDB($dbFile){
+		if(!file_exists($dbFile) && $dbFile != "/home/alike/Alike/DBs/nimbusjobs.db"){
+			syslog(LOG_WARNING, "Asked to open $dbFile, but it isn't there");
+			throw new Exception("$dbFile not found");
+		}
+		$db;
+		$cnt=0;
+		$max =10000;
+		while(true){
+			try{
+				$this->db = new PDO("sqlite:$dbFile");
+				$this->db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+				$this->db->setAttribute(PDO::ATTR_TIMEOUT, 300);	// 5 minute busy timeout
+				if($this->ro == false){
+					$this->db->exec('PRAGMA journal_mode = wal;');	// setting this elevates the db connection to RW everytime.
+				}
+				break;
+			}catch(Exception $ex){
+				$dumbErrors = "/tmp/sql_errors.txt";
+				if(filesize($dumbErrors) > 1024 * 1024 * 10){
+					exec("echo 'Rolled log\n' > $dumbErrors");
+				}
+				if($cnt ==0){ syslog(LOG_INFO, "dbh setupDB  ($dbFile) delayed access to DB (busy)-- have flock: $this->ro"); }
+				usleep(100000);
+			}
+			if($cnt++ > $max){
+				$msg = "Webservice DB encountered an error: ". $ex->getMessage();
+				$msg .= $ex->getTraceAsString();
+				if($this->ro==false){
+					exec("echo '\nError while creating connection to DB: $dbFile (with flock)\n' >> $dumbErrors");
+				}else{
+					exec("echo '\nError while creating connection to DB: $dbFile (WITHOUT flock)\n' >> $dumbErrors");
+				}
+				exec("echo '$msg' >> $dumbErrors");
+				$tots = 100 * $cnt;
+				syslog(LOG_ERR, "DBH setupDB ($dbFile) failed to access db connection (busy $tots ms timeout)");
+				throw new Exception("Failed to get DB connection for $dbFile (with lock)");
+			}
+		}
+		if($cnt > 0){
+			$tots = 100 * $cnt;
+			syslog(LOG_DEBUG, "setupDB ($dbFile) worked after a $tots ms delay");
+		}
+	}
+	public function getDBDirect($dbFile){
+		$this->setupDB($dbFile);
+	}
+	public function getDB(){
+		if($this->dbn =="nimbusdb"){
+			$this->setupDB("/home/alike/Alike/DBs/nimbusdb.db");
+		}else if($this->dbn == "jobLog"){
+				$needCreate =false;
+				if(!file_exists("/home/alike/Alike/DBs/nimbusjobs.db")){ $needCreate = true; }
+				$this->setupDB("/home/alike/Alike/DBs/nimbusjobs.db");
+				if($needCreate){ $this->createJLD(); }
+		} else if($this->dbn == "gfs"){
+				$this->setupDB("/home/alike/Alike/DBs/gfs.db");
+		} else if($this->dbn == "manager"){
+				$this->setupDB("/home/alike/Alike/DBs/manager.db");
+		}else{
+			throw new Exception("Unknown DB: $this->dbn");
+		}
+	}
+	private function createJLD(){
+		$this->db->exec('PRAGMA journal_mode = wal;');
+		$sql = "create table if not exists NimbusJobs (jobID INTEGER PRIMARY KEY AUTOINCREMENT,scheduleID INTEGER(32), begintime INTEGER(32),endtime INTEGER(32), jobName VARCHAR(128),status INTEGER(32),totalSize INTEGER(64),commitedSize INTEGER(64),description VARCHAR(1024));";
+		$this->db->exec($sql);
+
+		$sql  = "create table if not exists NimbusJobEntry (entryID INTEGER PRIMARY KEY AUTOINCREMENT,jobID INTEGER(32), status INTEGER(32),timestamp INTEGER(64), description VARCHAR(1024), messageID INTEGER(32), acknowledged INTEGER(32), vmid INTEGER(32) );";
+		$this->db->exec($sql);
+
+		$sql ="CREATE TABLE IF NOT EXISTS DBVersion (VersionNum INTEGER) ";
+		$this->db->exec($sql);
+	}
+}
+
+////////////////////////////////////////////////////
+function getDB($name, $readOnly=false){
+        $dbh = new DBHolder($name);
+        if($readOnly == false){ $dbh->flock(); }
+        $dbh->getDB();
+        return $dbh;
+}
+function dbSet($name, $sql, $params = []){
+        $dbh;
+        try{
+                $dbh = getDB($name, false);
+                $st = $dbh->db->prepare($sql);
+                $st->execute($params);
+                return $dbh->db->lastInsertId();
+        }finally{ unset($dbh); }
+}
+function dbGet($name, $sql, $params = []){
+        $dbh;
+        try{
+                $dbh = getDB($name, true);
+                $st = $dbh->db->prepare($sql);
+                $st->execute($params);
+                return $st->fetchAll(PDO::FETCH_OBJ);
+        }finally{ unset($dbh); }
+}
+function dbGetArray($name, $sql, $params = []){
+        $dbh;
+        try{
+                $dbh = getDB($name, true);
+                $st = $dbh->db->prepare($sql);
+                $st->execute($params);
+                $all = $st->fetchAll();
+                $out = array();
+                foreach($all as $a){
+                        if(isset($a[0])){
+                                array_push($out, $a[0]);
+                        }
+                }
+                return $out;
+        }finally{ unset($dbh); }
+}
+function dbGetOne($name, $sql, $params = []){
+        $res = dbGet($name, $sql, $params);
+        if(count($res) >=1){
+                return $res[0];
+        }else{ return null; }
+}
+function dbGetColumn($name, $sql, $params = []){
+        $dbh;
+        try{
+                $dbh = getDB($name, true);
+                $st = $dbh->db->prepare($sql);
+                $st->execute($params);
+                return $st->fetchColumn();
+        }finally{ unset($dbh); }
+}
+////////////////////////////////////////////////////
+
+
+
+
+function isSocketMunge(){
+	$smb =getSetting("useSmbMunge");
+	$mungeconf= $GLOBALS["agentShare"] ."/munge.conf";
+	if($smb == "true" || !file_exists($mungeconf)){
+		return false;
+	}
+	return true;
+}
+
+function getHVQSIPath($vmid){
+	$cust = getSetting("customInstanceName");
+	$base = "";
+	if($cust != ""){
+		$base = $cust;	
+	}else{
+		$base = "inst_" . substr(getInstallID(),0,4);
+	}
+	return "$base/vm_$vmid";
+}
+
+function disownABDs($pid=0){
+	$sql = "UPDATE appliance set vmOwner=0";
+	if($pid > 0){
+		$sql = "UPDATE appliance set vmOwner=0 where vmOwner=$pid";
+	}
+	dbSet("nimbus",$sql);
+
+	if($pid == 0){
+		echo "Checking for ABDNet state...\n";
+		$sql = "select * from abdnet";
+		$nets = dbGet("nimbus", $sql);
+		foreach($nets as $l){
+			$sql ="select count(*) from appliance where ip=?";
+			$cnt = dbGetColumn("nimbus", $sql, array($l->ip));
+			echo "$cnt active abd using IP: $l->ip\n";
+			if($cnt ==0){
+				// no ABD
+				if($l->checkedOut){
+					echo "Although nobody's using it, this IP is checked out.  Checking $l->ip back in\n";
+					// we have NO abd, and it's checked out
+					$sql = "update abdnet set checkedout=0 where ID=?"; 
+					dbSet("nimbus",$sql, array($l->ID) );
+				}
+			}else{
+				// yes ABD
+				if ($cnt > 1){
+					echo "Multiple abds found with IP $l->ip\n";
+					// DANGER.  We have more than 1 abd for this IP?  wtf?
+					syslog(LOG_ERR, "Found $cnt ABDs with the same IP checkedout/in use ($l->ip)!  Please remove ABDs manually.");
+					$sql = "update abdnet set checkedout=0 where ID=?";
+					dbSet("nimbus",$sql, array($l->ID) );
+					$sql = "delete from appliance where ip=?";
+					dbSet("nimbus",$sql, array($l->ip) );
+				}
+				if($l->checkedOut ==0){
+					echo "Although this ip is not checked out, an ABD is using it.  Checking OUT $l->ip back in\n";
+					// we have an abd, and it's NOT checked out
+					$sql ="update abdnet set checkedout=1 where ID=?";
+					dbSet("nimbus",$sql, array($l->ID) );
+				}
+			}
+		}
+	}
+}
+
+function tidyJLDDB(){
+	// cleanup the jld db
+	$sql = "DELETE from NimbusJobEntry where status=4";
+	dbSet("jobLog", $sql);
+	$sql ="delete from NimbusJobEntry WHERE timestamp <= strftime('%s', datetime('now', '-180 day'));";
+	dbSet("jobLog", $sql);
+	dbSet("jobLog", "VACUUM");
+}
+function tidyNDB(){
+	// cleanup the nimbus db
+	dbSet("nimbus", "delete from job WHERE timeBegin <= strftime('%s', datetime('now', '-180 day'))");
+	dbSet("nimbus", "delete from job_options where jobID not in (select jobID from job)");
+	dbSet("nimbus", "delete from job_VMS where jobID not in (select jobID from job)");
+	dbSet("nimbus", "vacuum");
+}
+
+function doWebPostOld($url, $o){
+        $data = array('data' => $o );
+        $options = array(
+            'http' => array(
+                'header'  => "Content-type: application/x-www-form-urlencoded\r\n",
+                'method'  => 'POST',
+                'content' => http_build_query($data)
+            ),
+		 "ssl" => [ "verify_peer" => false, "verify_peer_name" => false, ]
+        );
+        $context  = stream_context_create($options);
+        $result = @file_get_contents($url, false, $context);
+        if ($result === FALSE) {
+		$res = new stdClass();
+		$res->result = "error";
+		$res->message = "Webservice encountered an error ($url)!";
+                echo "Webservice encountered an error ($url)!\n";
+		return $res;
+        }
+        return $result;
+}
+
+function getAlikeVersion(){
+	$nfoFile = $GLOBALS["AH"] ."/Alike/alike.bld.nfo";
+        $nfo = json_decode(file_get_contents($nfoFile), false);
+        return $nfo->alikeVersion;
+}
+
+function getA3Build(){
+	$nfoFile = $GLOBALS["AH"] ."/Alike/alike.bld.nfo";
+        $nfo = json_decode(file_get_contents($nfoFile), false);
+        return $nfo->alikeBuild;
+}
+
+function getA3Rev(){
+        $bfile = $GLOBALS["AH"] ."/a3.rev";
+        $bld = trim(file_get_contents($bfile));
+        return $bld;
+}
+
+function amRoot(){
+        if( trim(exec("whoami")) =="root"){ return true;}
+        return false;
+}
+function getSvcStatusFile(){
+	return "/tmp/sched_svc_status";
+}
+
+function schedulerState(){
+	$sf = getSvcStatusFile();
+
+        if(!file_exists($sf)){
+                exec("echo 0 > $sf");
+                return false;
+        }
+        $st = trim(file_get_contents($sf));
+        if($st==1){ return true; }
+        return false;
+}
+
+function startScheduler(){
+	$sf = getSvcStatusFile();
+	exec("echo 1 > $sf");
+}
+
+function stopScheduler(){
+	$sf = getSvcStatusFile();
+	exec("echo 0 > $sf");
+}
+function getADSDedup(){
+	$bc = "/tmp/metrics/0.blockCount";
+	$br = "/tmp/metrics/0.refCount";
+	$cnt =0;
+	$ref =0;
+	if (file_exists($bc)){ $cnt = trim(fgets(fopen($bc, 'r'))); }
+	if (file_exists($br)){ $ref = trim(fgets(fopen($br, 'r'))); }
+
+	if($ref ==0){ return 0; }
+	return round(abs( (($cnt / $ref) * 100)-100)) ;
+}
+function getADSFree(){
+        $raw = trim(shell_exec("/bin/df --block-size=1 /mnt/ads | grep -v ads_raw| grep /mnt/ads | expand -i -t 1 | tr -s \" \"| awk {'print $4'}"));
+        return round($raw );
+}
+function getActStored(){
+	$act =0;
+	$bc = "/tmp/metrics/0.blockCount";
+	$bs = getSetting("blockSize"); 
+	$avg = $bs * 1024;
+	$af = "/tmp/metrics/0.avrCompressedBlock";
+	if (file_exists($af)){ $avg = trim( shell_exec("tail -n 1 $af") ); }
+	
+	if (file_exists($bc)){
+		$cnt = trim(fgets(fopen($bc, 'r')));
+		return ($cnt * $avg);
+	}
+        $raw = trim(shell_exec("/bin/df --block-size=1 /mnt/ads | grep -v ads_raw| grep /mnt/ads | expand -i -t 1 | tr -s \" \"| awk {'print $3'}"));
+        $used = round($raw );
+        return $used;
+}
+
+function isADSFound(){
+	$tst = "/mnt/ads/journals";
+	if(is_dir($tst)){ return true; }
+	return false;
+}
+function updateADSStatus(){
+	$res = new stdClass();
+	$res->status =0;
+	$res->freeBytes=0;
+	$res->message = "Unknown";
+	$res->actualStored=0;
+	$tst = "/tmp/ads.status";
+
+	if(isADSMounted() == false){
+		$res->message = "Not Mounted";
+
+	}else{
+		$testFile = $tst . ".tmp";
+		if (  ($fp = @fopen($testFile, "w"))!==false ) {
+			$res->status=1;
+			$res->message = "ADS OK";
+			if(fwrite($fp,"TEST") === FALSE){ 
+				$res->status =0;
+				$res->message = "Failed to write to ADS"; 
+			}else{
+				$res->freeBytes = getADSFree(); // getADSInfo()->free;	// only get this if we're actually ok otherwise
+				$res->actualStored = getActStored();
+			}
+			$res->dedupPercent = getADSDedup();
+			fclose($fp);
+			unlink($testFile);
+		}else{
+			$res->status=0;
+			$err = error_get_last();
+			$res->message = "Unknown ADS I/O error";
+			if(strpos($err["message"], 'Read-only') !== false){
+				$res->message = "ADS is currently read-only!";
+			}else{
+				$res->message = $err["message"];
+			}
+		}
+		if(amRoot()){ exec("chown alike.alike $tst"); }
+	}
+	$out = json_encode($res);
+	file_put_contents($tst, $out);
+
+	return $res;
+}
+
+function getADSStatus(){
+	$tst = "/tmp/ads.status";
+        if(!file_exists($tst)){
+                return updateADSStatus();
+        }
+        return json_decode(trim(file_get_contents($tst)));
+}
+
+
+function isADSMounted(){
+	if (file_exists("/mnt/ads/ads.dat")){ return true; }
+
+	// if (file_exists("/mnt/ads/noDS")){ return false; }
+	return false;
+}
+
+function isODSMounted(){
+        $tst = "/tmp/ods.status";
+        if(!file_exists($tst)){
+                return updateODSStatus();
+        }
+
+        $res = trim(file_get_contents($tst));
+        if($res == 1){ return true; }
+        return false;
+}
+function updateODSStatus(){
+        $tst = "/tmp/ods.status";
+	$res = true;
+         if(isODSMountedReal()){
+                exec("echo 1 > $tst");
+        }else{
+                exec("echo 0 > $tst");
+                $res = false ;
+        }
+	if(amRoot()){ exec("chown alike.alike $tst"); }
+	return $res;
+}
+
+function isODSMountedReal(){
+	if (is_dir("/mnt/ods1/blocks")){
+		return true;
+	}
+	if (file_exists("/mnt/ods1/transact.tx")){
+		return true;
+	}
+	if (file_exists("/mnt/ods1/noDS")){
+		return false;
+	}
+}
+
+function isShareMounted($mnt){
+        if(substr($mnt, -1) == "/") {
+                $mnt = substr($mnt,0,-1);
+        }
+        $ads= array();
+        $ads = shell_exec("grep \"$mnt\" /etc/mtab");
+        if(!empty($ads)){
+                return true;
+        }
+        return false;
+}
+
+
+function testShare($mnt){
+	$tst = $mnt;
+        if(substr($tst, -1) != "/") { $tst .= "/"; }
+
+	if(file_exists($tst)== false){
+		echo "Share not mounted! ($tst)\n";
+		return false;
+	}
+	if(is_file($tst)==true){
+		echo "Path is not a directory! ($tst)\n";
+		return false;
+	}
+
+	$testFile = $tst . "mountTest.tmp";
+
+	if (  ($fp = @fopen($testFile, "w"))!==false ) {
+		if(fwrite($fp,"TEST") === FALSE){ 
+			echo "Couldn't write test file: $testFile\n";
+			return false; 
+		}
+		fclose($fp);
+		if(file_exists($testFile)){
+			@unlink($testFile);
+		}
+	}else{
+		echo "Couldn't open test file: $testFile\n";
+		return false;
+	}
+	return true;
+
+}
+
+function checkRunningSvc(){
+        $on = false;
+        if(schedulerState()){
+                $on=true;
+        }else if(isProcessRunning("java")){
+                $on=true;
+        }
+        if($on==true){
+                echo "Alike services are still running. Shut them down to continue? (y/N) ";
+                $resp = trim(fgets(STDIN));
+                if($resp == "y" || $resp == "Y"){
+                        echo "Stopping Alike Services, please wait...";
+                        exec("sudo /usr/local/sbin/stopAlike");
+                        sleep(1);
+                        echo "Complete.\n";
+                }else{
+                        echo "Not stopping services.  Returning.\n";
+                        exit(0);
+                }
+        }
+}
+
+function getPassword() {
+      ;
+}
+
+
+function updateNimbusADS($user, $pass ){
+	$sql = "REPLACE into settings (name,val) VALUES(?,?)";
+	dbSet("nimbus", $sql, array('dataStoreUser', $user) );
+	dbSet("nimbus", $sql, array('dataStorePass', $pass) );
+}
+
+function setLocalADSCreds($user,$pass){
+	updateNimbusADS($user, $pass);
+        resetSMBPass($user, $pass);
+}
+
+function setABDImage($uuid, $poolID, $srID, $version){
+	$sql = "DELETE from ABDImage where poolID = ?";
+	dbSet("nimbus", $sql, array($poolID) );
+	$sql = "INSERT into ABDImage (poolID,uuid,srid,version) VALUES(?,?, ?, ?)";
+	dbSet("nimbus", $sql, array($poolID, $uuid, $srID, $version) );
+}
+
+// menu stuff
+function getYN(){
+        echo "Continue? (y/N): ";
+        $resp = trim(fgets(STDIN));
+        if (strcasecmp($resp, "y") == 0) { return true; }
+        return false;
+}
+function getChoice(){
+        echo "Your choice: ";
+        $resp = trim(fgets(STDIN));
+        return $resp;
+}
+function opt($txt){
+        echo "\033[1;33m$txt\033[0m)";
+}
+
+function setupSigHandlers(){
+	// remember to add this line to the top of the script:
+	// declare(ticks = 1);
+
+	// setup signal handlers
+	pcntl_signal(SIGTERM, "sig_handler");
+	pcntl_signal(SIGHUP,  "sig_handler");
+	pcntl_signal(SIGUSR1, "sig_handler");
+	pcntl_signal(SIGINT, "sig_handler");
+	pcntl_signal(SIGTSTP, "sig_handler");
+	//pcntl_signal(SIGSTOP, "sig_handler");
+}
+
+function sig_handler($signo) {
+     switch ($signo) {
+         case SIGSTOP:
+             echo "Caught SIGSTOP...\n";
+                if($GLOBALS["breakable"]==1){ exit; }
+             break;
+         case SIGTSTP:
+//		echo "SIGTSTP \n";
+             break;     // ctrl-z
+         case SIGINT:
+//             echo "Caught SIGINT...\n";
+                if($GLOBALS["breakable"]==1){ exit; }
+             break;     // ctrl-c
+         case SIGTERM:
+//             echo "Caught SIGTERM...\n";
+                if($GLOBALS["breakable"]==1){ exit; }
+             break;
+         case SIGHUP:
+//             echo "Caught SIGHUP...\n";
+                if($GLOBALS["breakable"]==1){ exit; }
+             break;
+         case SIGUSR1:
+//             echo "Caught SIGUSR1...\n";
+             break;
+         default:
+     }
+}
+
+
+///////////Misc Utils
+function getViableDisks(){
+
+        $out = shell_exec("/bin/lsblk --bytes --output NAME,FSTYPE,HOTPLUG,STATE,SIZE,TYPE,MOUNTPOINT,MODEL,VENDOR -J 2> /dev/null");
+
+        $obj = json_decode($out);
+        $disks = array();
+        if(count($obj->blockdevices)==0){ return $disks; }
+        foreach($obj->blockdevices as $d){
+                if($d->type != "disk"){ continue; }
+                if($d->fstype == "linux_raid_member"){ continue; }
+                if(!isset($d->mountpoint) && !isset($d->children) ){    // unmounted, unpartitioned disks (may or may not have a fs)
+                        array_push($disks, $d);
+                }else if(isset($d->children)){
+                        foreach($d->children as $c){
+                                if(!isset($c->mountpoint) && $c->size > 1024 * 1024 *1024 *1){
+                                        array_push($disks, $c);
+                                }
+                        }
+                }
+        }
+	$res = trim(shell_exec("cat /proc/mdstat | grep md | awk '{print $1}'"));
+	if($res != ""){
+		$out = shell_exec("/bin/lsblk --bytes --output NAME,FSTYPE,HOTPLUG,STATE,SIZE,TYPE,MOUNTPOINT,MODEL,VENDOR -J /dev/$res 2> /dev/null");
+		$obj = json_decode($out);
+		if(count($obj->blockdevices)==0){ return $disks; }
+		else{
+			foreach($obj->blockdevices as $d){
+				if(strpos($d->type, "raid") !== false ){ 
+					if(!isset($d->mountpoint)  ){    // unmounted, unpartitioned disks (may or may not have a fs)
+						array_push($disks, $d);
+					}
+				}
+			}
+		}
+	}
+
+        return $disks;
+}
+
+function getAllDisks($skipBoot=true){
+
+        $out = shell_exec("/bin/lsblk --bytes --output NAME,FSTYPE,HOTPLUG,STATE,SIZE,TYPE,MOUNTPOINT,MODEL,VENDOR -J 2> /dev/null");
+
+	$boot = trim(shell_exec("df -P / | tail -n 1 | awk '/.*/ { print $1 }'"));
+
+        $obj = json_decode($out);
+        $disks = array();
+        if(count($obj->blockdevices)==0){ return $disks; }
+        foreach($obj->blockdevices as $d){
+                if($d->type != "disk"){ continue; }
+		if($skipBoot){
+			if(strpos($boot, $d->name) !== false){
+				continue;
+			} 
+		}
+		array_push($disks, $d);
+        }
+
+        return $disks;
+}
+
+
+function updateAlikePass($pass){
+	resetLocalPass($pass);
+	resetSMBPass("alike", $pass);
+}
+
+function resetLocalPass($pass){
+	;
+}
+function resetSMBPass($user, $pass){
+	;
+}
+
+function disableAlikeUser(){
+	;
+}
+function enableAlikeUser(){
+	;
+}
+function getLegacyEncPass(){
+        ;
+}
+function getEncPass(){
+        ;
+}
+
+function isEncEnabled(){
+	$bp = getSetting("blockPassword");
+	if($bp != ""){ return true; }
+	return false;
+}
+
+function makeOdsEncStamp(){
+	$bp = getSetting("blockPassword");
+	if($bp == ""){ return; }
+	$stamp = md5($bp);
+	file_put_contents("/mnt/ods1/enc.stamp", $stamp);
+}
+function checkAdsOdsEnc(){
+	$bp = getSetting("blockPassword");
+
+	return checkOdsEncStamp($bp);
+}
+
+function checkOdsEncStamp($pass){
+	;
+}
+
+function checkForBackups(){
+	$tx = "/mnt/ads/transact.tx";
+
+	if(!file_exists($tx)){ return false; }
+
+	if(shell_exec("wc -l $tx") >  3){ return true; }
+
+	return false;
+}
+
+
+function run($cmd){
+	if( ($fp = popen("$cmd", "r")) ) {
+	    while( !feof($fp) ){
+		echo fread($fp, 1024);
+		flush(); // you have to flush buffer
+	    }
+	    fclose($fp);
+	}
+}
+
+function managedRun($cmd){
+	$process = proc_open("$cmd", array(
+                0 => array('pipe', 'r'), // STDIN
+                1 => array('pipe', 'w'), // STDOUT
+                2 => array('pipe', 'w')  // STDERR
+        ), $pipes);
+
+        $res = new stdClass();
+
+        if(is_resource($process)) {
+                fclose($pipes[0]);	// stdin
+                $res->stdOut = stream_get_contents($pipes[1]);
+                fclose($pipes[1]);
+                $res->stdErr = stream_get_contents($pipes[2]);
+                fclose($pipes[2]);
+                $res->code = proc_close($process);
+                return $res;
+        }
+        $res->stdOut ="";
+        $res->stdErr ="Failed to run command";
+        $res->code =2;
+
+        return $res;
+
+}
+
+function obfuscate($str){
+	;
+}
+
+function unobfuscate($str){
+	;
+}
+
+function obfuscateLocal($str){
+	;
+}
+
+function unobfuscateLocal($str){
+	;
+}
+
+function jumbler($text, $key) {
+        ;
+}
+
+// default min size is 1024 x 1024 x 100 == 100MB
+function freeSpaceCheck($min = 100){
+	$min *= 1048576;
+	$use = getDiskUsageLocal();
+	if(is_numeric($use->free) && $use->free <= $min){ 
+		echo "Free space warning! Only $use->free bytes free on our local disk!\n";	
+		return false;
+	}
+	return true;
+	
+}
+function makeGuid(){
+	$data = openssl_random_pseudo_bytes(16);
+	$data[6] = chr(ord($data[6]) & 0x0f | 0x40); // set version to 0100
+	$data[8] = chr(ord($data[8]) & 0x3f | 0x80); // set bits 6-7 to 10
+	return vsprintf('%s%s-%s-%s-%s-%s%s%s', str_split(bin2hex($data), 4));
+
+}
+
+function expandRoot(){
+	// $dev = trim(shell_exec("mount|grep ' / '|cut -d' ' -f 1"));
+	// exec("growpart $dev 1");
+	// exec("resize2fs $dev");
+}
+
+function getNICs(){
+	$defNic = trim(shell_exec('ip route get 8.8.8.8 | awk \'{for(i=1;i<=NF;i++)if($i~/dev/)print $(i+1)}\''));
+	$raw = shell_exec("ip -o link | grep -v \"lo\" | awk '{print $2}' | cut -d':' -f1 | cut -d'@' -f1");
+	//$raw = shell_exec("ip -o link | grep \"state UP\" | awk '{print $2}' | cut -d':' -f1 | cut -d'@' -f1");
+	$nics = explode("\n", trim($raw));
+	$ret = array();
+	foreach($nics as $n){
+		$eth = new stdClass();
+		$eth->routes = [];
+		$tmpFile = "/tmp/$n.tmp";
+		if(file_exists($tmpFile)){
+			$eth = json_decode(file_get_contents($tmpFile));	
+			$eth->pending = true;
+			array_push($ret, $eth);
+			continue;
+		}
+		$eth->pending = false;
+
+		$eth->name = $n;
+		$acto = trim(shell_exec("ip -o link | grep \"state UP\" | grep $n"));
+		$eth->isActive = false;
+		if($acto != ""){ $eth->isActive = true; }
+		$eth->isDefined = false;
+		$def = shell_exec("cat /etc/network/interfaces | grep -a \"$n\"");
+		if($def != ""){ $eth->isDefined = true; }
+
+		$eth->isDefault = false;
+		if($n == $defNic){ $eth->isDefault = true; }
+		$eth->ip = "";
+		$eth->mask = "";
+		$eth->gw = "";
+		$eth->isStatic = false;
+
+		if($eth->isDefined){
+			$stat = shell_exec("cat /etc/network/interfaces | grep -a \"$n inet static\"");
+			if($stat != ""){ $eth->isStatic = true; }
+			$eth->ip = trim(shell_exec("ifconfig $n | grep \"inet addr\"  | tr ':' ' '| awk '{print $3}'") );
+			$eth->mask = trim(shell_exec("/sbin/ifconfig $n | grep inet | tr ':' ' '|awk '{print $7}'") );
+			if($eth->isDefault){
+				$eth->gw = trim(shell_exec("ip route get 8.8.8.8 | awk '{print $3}'"));
+			}
+		}
+
+		array_push($ret, $eth);
+	}
+	return $ret;
+}
+
+function setNIC($eth){
+	$ifile = "/etc/network/interfaces";
+	$tmpFile = "/etc/network/interfaces.bak";
+	$handle = fopen($ifile, "r");
+	$blob ="";
+	$skipping=false;
+	if ($handle) {
+	    while (($line = fgets($handle)) !== false) {
+		if ($skipping==false && strpos($line, $eth->name) !== false){
+			$skipping=true;
+
+		}else if($skipping && strpos($line, "###") !== false) {
+			$skipping=false;
+		}else if(!$skipping){ $blob .= $line; }
+
+	    }
+	    fclose($handle);
+
+	$blob .= "auto $eth->name\n";
+	if($eth->isStatic == false){
+		$blob .= "iface $eth->name inet dhcp\n";
+	}else{
+		$blob .= "iface $eth->name inet static\n";
+		$blob .= " address $eth->ip\n";
+		$blob .= " netmask $eth->mask\n";
+		if($eth->gw != ""){
+			$blob .= " gateway $eth->gw\n";
+		}
+		$blob .= " name $eth->name\n";
+
+		if(!empty($eth->routes)){
+			foreach($eth->routes as $s){
+				$blob .= "       up route add -net $s->net netmask $s->mask  gw $s->gw\n";
+			}
+		}
+	}
+
+	$blob .= "###\n";
+
+	exec("cp $ifile $tmpFile");
+	file_put_contents($ifile, $blob);
+
+	} else {
+	    throw new Exception("Failed to open interfaces file");
+	} 
+	$cFile = "/tmp/$eth->name.tmp";
+	if(file_exists($cFile)){
+		unlink($cFile);
+	}
+
+	$eth->pending=true;
+	file_put_contents($cFile, json_encode($eth));
+	exec("touch /tmp/net_change_file");
+
+//        exec("ifdown $eth->name > /dev/null 2>&1");
+//        exec("ifup $eth->name > /dev/null");
+}
+
+
+function getDNS(){
+	 $nsraw = trim(shell_exec("cat /etc/resolv.conf| grep nameserver | awk '{print $2}'")) ;
+	$ns =preg_split('/\n/', $nsraw, null, PREG_SPLIT_NO_EMPTY);
+	return $ns;
+}
+
+function setDNS($ns){
+	$blob = "";
+	foreach($ns as $n){
+		$blob .= "nameserver $n\n";
+	}
+	file_put_contents("/etc/resolv.conf", $blob);
+	file_put_contents("/home/alike/dns_servers", $blob);
+}
+
+function pendingNetChanges(){
+	$cfile = "/tmp/net_change_file";
+        if(file_exists($cfile)){ return true; }
+	return false;
+}
+
+function removeStaticDNS(){
+	$cfile = "/home/alike/dns_servers";
+        if(file_exists($cfile)){ 
+		unlink($cfile);
+	}
+}
+
+function haveStaticDNS(){
+	$cfile = "/home/alike/dns_servers";
+        if(file_exists($cfile)){ return true; }
+	return false;
+}
+
+
+function get_inet_contents_old($url, $decode=true){
+	$sslOpts=array(
+	    "ssl"=>array(
+		"verify_peer"=>false,
+		"verify_peer_name"=>false,
+	    ),
+	);
+	$res;
+	if($decode == false){
+		$res = file_get_contents($url, false, stream_context_create($sslOpts) );
+	}else{
+		$res = json_decode(file_get_contents($url, false, stream_context_create($sslOpts) ));
+	}
+	return $res;
+}
+
+
+
+function getA3LatestInfo(){
+	;
+}
+
+function addJLEntry($msg, $lvl=0){
+        // lvl: 0=notice, 1=error, 2=warn
+        try{
+		$ts = time();
+                $sql = "INSERT into NimbusJobEntry values(NULL, 0, ?, ?, ?,0,0,0)";
+		dbSet("jobLog", $sql, array($lvl, $ts, $msg) );
+        }catch(Exception $e){
+                echo "Failed to run sql $sql\n";
+                echo "Error: ". $e->getMessage();
+        }
+}
+
+function isADSThere(){
+        try{
+                $s = Share::byID(0);
+                return isADSMounted()==true;
+
+        }catch(Exception $ex){
+                return false;
+        }
+}
+
+
+function updateHostname(){
+	$name = getSetting("a3Hostname");
+	if($name == ""){ $name = "a3"; }
+
+	exec( "sudo /bin/hostname $name");
+	exec( "echo \"127.0.0.1 $name\n\" >> /etc/hosts");
+}
+
+
+///////////////////////////////////
+function getSubInfo($cacheOk=true){
+
+        if($cacheOk && isset($GLOBALS['subInfo'])){
+                return $GLOBALS['subInfo'];
+        }
+
+        $sub = getSubInfoWs();
+        $GLOBALS['subInfo'] = $sub;
+        return $sub;
+}
+// ask the license server for the subInfo
+function getSubInfoWs(){
+      ;
+}
+// ask the license server if we can run this job
+function licenseCheck($vmGuid, $hostGuid, $poolGuid, $action){
+       ;
+}
+
+// this comes from the agent installer directly	via the ws call: "agent-register"
+// we then need to test the agentStatus, and relay the request to the licensing server
+// if all goes well, we return the guid to them.
+// if not, we return the error
+function requestAgentRegister($ip ){
+        $out = new stdClass();
+	$out->result = "error";
+	$out->message = "";
+	$out->guid = "";
+
+        $o = new stdClass();
+        $o->ip = $ip;
+        $o->name = "New Agent";
+        $o->size = 0;	// we'll enumerate this later
+	$st = agentStatus($ip);
+
+	if(empty($st) || !is_object($st)){
+		$out->message = "Failed to contact QS Agent on IP $ip.";	
+		return $out;
+	}
+	$o->authP = json_encode($st);
+
+	$q =  "SELECT DNSHostName, Name from Win32_ComputerSystem";
+        $out= agentWmiCmd($ip, $q );
+        $barf = agentParseWmi($out);
+        $o->name = $barf->Name;
+
+	
+        $resp = managerWsCall($o, "agentRegister");
+	if($resp->result == "success"){ 
+		try{
+			// we need to enum now or it won't show up in the UI for ~30 mins
+			$id = getVmidByGuid($resp->guid);
+			exec("/home/alike/Alike/hooks/gatherPhyMeta $id  > /dev/null &");
+		}catch(Exception $ex){
+			syslog(LOG_WARNING, "Failed to enumerate new Agent: ". $ex->getMessage());
+		}
+	}
+	return $resp;	// mebbe just go for it?
+
+}
+
+
+// for licensing queries by nodes
+function managerWsCall($o, $call){
+       ;
+}
+
+
+function encStr($data, $instID){
+       ;
+}
+
+function getToken(){
+        ;
+}
+
+//      1 = std, 2 = dr, 3 = read only (restore)
+function getEdition(){
+        $l = getSubInfo();
+        return $l->edition;
+}
+
+
+function uploadSettingsBak(){
+	try{
+		$settings = "/mnt/ads/prodDBs/settings.bak";
+		if(!file_exists($settings)){
+			syslog(LOG_WARNING, "No settings backup file found ($settings)");
+			return;
+		}
+		if (filesize($settings) === 0){
+			syslog(LOG_WARNING, "Settings backup file is empty! ($settings)");
+			return;
+		}
+		$cur = md5_file($settings);
+		$last_stamp = "/tmp/settings.md5";
+		if(file_exists($last_stamp)){
+			$last = trim(file_get_contents($last_stamp));
+			if($last == $cur){
+				return;	// no changes
+			}
+		}
+
+		shell_exec("cp -f $settings /tmp/settings.tmp");
+		shell_exec("rm -f /tmp/settings.tmp.gz");
+		shell_exec("gzip /tmp/settings.tmp");
+
+		$dat = file_get_contents("/tmp/settings.tmp.gz");
+
+
+		$o = new stdClass();
+		$o->machineID = getInstallID();
+		$o->settings = $dat;
+
+		$resp = null;
+
+		$out = doWebProxyPost("settings", $o);
+		if($out->result == "error"){ syslog(LOG_WARNING,"Failed to backup settings. QS WS: ".$out->message.".  "); }
+		$resp = $out->data;
+
+		if($resp->result == "error"){
+			syslog(LOG_WARNING, "Failed to backup settings: ". $resp->message);
+			return 1;
+		}else{
+			file_put_contents($last_stamp,$cur);
+		}
+	}catch(Exception $ex){
+		syslog(LOG_WARNING, "Failed to backup settings: ". $ex->getMessage());
+	}
+
+}
+
+function perVmReport($installid){
+        $sql = "select timeBegin from job where timeBegin > 0 order by timeBegin asc limit 1";
+	$tBegin = dbGetColumn("nimbus", $sql);
+
+        $now = time();
+        $begMonth = date("n",$tBegin);
+        $begYear = date("Y",$tBegin);
+        $nowMonth = date("n");
+        $nowYear = date("Y");
+        $totalMonths = (($nowYear)+$nowMonth) - (($begYear)+$begMonth);
+        $out = [];
+        for($i=0; $i<=$totalMonths; $i++){
+                $time1 = strtotime("01-".$begMonth."-$begYear");
+                $endMonth = $begMonth+1;
+                $endYear = $begYear;
+                if($endMonth >12){
+                        $endMonth=1;
+                        $endYear++;
+                }
+                $time2 = strtotime("01-". ($endMonth) ."-$endYear");
+                //echo "$begMonth/$begYear - $endMonth/$endYear\n";
+                $sql = "select distinct v.vmname as name, v.vmid as id, v.UUID as uuid, v.poolID as pool
+                                from vm v, job j, job_vms jv
+                                where j.timeBegin > ?
+                                and j.timeBegin < ?
+                                and j.jobid = jv.jobid
+                                and v.vmid = jv.vmid
+                                and j.status !=7";
+		$barf = dbGet("nimbus", $sql, array($time1, $time2) );
+		foreach($barf as $post){
+                        $tmp = new stdClass();
+                        $tmp->uuid = $post->uuid;
+                        $tmp->poolid = $post->pool;
+                        $tmp->name = $post->name;
+                        $tmp->installid = $installid;
+                        $tmp->installid = $installid;
+                        array_push($vms, $tmp);
+                        $cnt++;
+                }
+
+                $out["$begMonth-$begYear"] = $vms;
+
+                $begMonth++;
+                if($begMonth==13){
+                        $begMonth=1;
+                        $begYear++;
+                }
+
+        }
+        $webout = json_encode($out);
+        $zip = gzdeflate($webout);
+        return $zip;
+}
+
+
+function getTypeStr($t){
+        switch($t){
+                case 0:
+                        return "Commercial";
+                case 1:
+                        return "Trial";
+                case 2:
+                        return "NFR";
+                case 3:
+                        return "Tester";
+                case 5:
+                        return "Per-VM";
+                default:
+                        return "Unknown";
+        }
+}
+function getEditionStr($t){
+        switch($t){
+                case 0:
+                        return "Alike Free";
+                case 1:
+                        return "Alike Standard";
+                case 2:
+                        return "Alike DR";
+                case 3:
+                        return "Alike Read-only";
+        }
+}
+
+function getJobStatusStr($t){
+        switch($t){
+                case 0:
+                        return "Pending";
+                case 1:
+                        return "Paused";
+                case 2:
+			return "Running";
+                case 3:
+			return "Running (with errors)";
+                case 4:
+			return "Errored";
+                case 5:
+			return "Cancelled";
+                case 6:
+			return "Complete";
+                case 7:
+			return "Failed";
+	}
+	return "Unknown";
+}
+function getJobTypeStr($t){
+        switch($t){
+                case 0:
+                        return "Backup";
+                case 1:
+                        return "Restore";
+                case 5:
+                        return "Replication";
+                case 8:
+                        return "Vault";
+                case 10:
+                        return "System";
+        }
+	return "Unknown";
+}
+
+function getJobLogStatusStr($t){
+        switch($t){
+                case 0:
+                        return "OK";
+                case 1:
+                        return "Error";
+                case 2:
+                        return "Warn";
+                case 3:
+                        return "Active";
+                case 4:
+                        return "Trace";
+        }
+        return "Unknown";
+}
+
+function getRecentJobList($num = 5){
+        $sql = "SELECT s.name, s.jobType as type, j.jobID, j.timeBegin, j.timeEnd, j.status, j.originalSize, j.sizeOnDisk, j.sizeSent, j.password from job j, schedule s where j.scheduleID = s.scheduleID order by jobID desc limit ?";
+
+	$out = dbGet("nimbus", $sql, array($num) );
+	$sql2 = "select count(*) from job_vms where jobID =?";
+	foreach($out as $st){
+		$st->vms = dbGetColumn("nimbus", $sql2, array($st->jobID) );
+	}
+	return $out;
+}
+function getActiveJobList(){
+        $sql = "SELECT s.name, s.jobType as type, j.jobID, j.timeBegin, j.timeEnd, j.status, j.originalSize, j.sizeOnDisk, j.sizeSent, j.password from job j, schedule s where (j.status = 0 or j.status = 2 or j.status =3)  and j.scheduleID = s.scheduleID order by jobID desc";
+
+	$out = dbGet("nimbus", $sql );
+	$sql2 = "select count(*) from job_vms where jobID =?";
+	foreach($out as $st){
+		$st->vms = dbGetColumn("nimbus", $sql2, array($st->jobID) );
+	}
+	return $out;
+}
+
+function getJobLog($id){
+	// entryID|jobID|status|timestamp|description|messageID|acknowledged|vmid
+        $sql = "SELECT * from NimbusJobEntry where jobID =?";
+	return dbGet("jobLog", $sql, array($id) );
+}
+
+function getSchedules(){
+        $out = dbGet("nimbus", "SELECT * from Schedule WHERE deleteFlag IS null order by jobType, name ");
+	foreach($out as $j){
+                $j->id = $j->scheduleID;
+                $j->state = $j->isActive;
+	}
+	return $out;
+}
+
+function getPoolInfo($poolID){
+        return dbGetOne("nimbus", "SELECT * from tm_pool where uuid=?", array($poolID) );
+}
+
+function getDockerHostIP(){
+	$cmd = "/sbin/ip route|awk '/default/ { print $3 }'";
+	return trim(shell_exec($cmd));
+}
+
+function qflock($lockFile, $waitSec=0){
+        $fp = @fopen($lockFile, "w");
+
+	$count = 0;
+	$got_lock = true;
+	while (!flock($fp, LOCK_EX | LOCK_NB, $wouldblock)) {
+		if ($wouldblock && $count++ < $waitSec) {
+			sleep(1);
+		} else {
+			$got_lock = false;
+			break;
+		}
+	}
+	if ($got_lock == false) {
+		throw new Exception("Failed to get lock file: $lockFile after $waitSec");
+	}
+	return $fp;
+}
+
+function qunflock($fp){
+	if($fp == null){ return; }
+	flock($fp, LOCK_UN);
+	fclose($fp); 
+}
+
+function incrementFileLocked($fn, $val, $waitSec =1){
+        $locker = $fn.".lck";
+        $lk = null;
+        try{
+                $lk = qflock($locker, $waitSec);
+                $guy = $val;
+                if(file_exists($fn)){
+			$guy += file_get_contents($fn);
+		}
+                file_put_contents($fn, $guy);
+        }catch(Exception $ex){
+                $msg = "incrementFileLocked got error: ". $ex->getMessage();
+                gen_log(LOG_DEBUG, $msg );
+        }finally{
+                if($lk != null){ qunflock($lk); }
+        }
+
+}
+
+////////////////////////// gen_log stuff ////////////////////////////////
+define("LOG_ERR_NOFAIL",16);
+define("LOG_WARN",5);
+function doJobLog($jobId, $lvl, $msg, $vmid=0) {
+        if($lvl == LOG_ERR_NOFAIL) {
+                addJobLog($msg, 1, $jobId, $vmid);
+        }else if($lvl <= LOG_ERR) {
+                addJobLog($msg, 1, $jobId, $vmid);
+                // Fail the job
+                $sql = "UPDATE job set status =? where jobID = ?";
+                dbSet("nimbus", $sql, array(7, $jobId));
+        } else if($lvl <= LOG_WARNING) {
+		$GLOBALS["hasWarnings"] =1;
+                addJobLog($msg, 2, $jobId, $vmid);
+        } else if($lvl <= LOG_INFO) {
+                addJobLog($msg, 0, $jobId, $vmid);
+        } else {
+                addJobLog($msg, 4, $jobId, $vmid);
+        }
+}
+
+function gen_log($lvl, $msg) {
+        $disableConsole = false;
+        if(empty($GLOBALS["__disable_console_out"]) == false) {
+                $disableConsole = $GLOBALS["__disable_console_out"];
+                if($disableConsole === true) {
+                        $disableConsole = true;
+                }
+        }
+        if(empty($GLOBALS["__insta_job_id"]) == false) {
+                $vmid=0;
+                if(empty($GLOBALS["__insta_vm_id"]) == false) { $vmid = $GLOBALS["__insta_vm_id"]; }
+
+                doJobLog($GLOBALS["__insta_job_id"], $lvl, $msg, $vmid);
+                $disableConsole = true;
+        }
+
+        if(!isset($GLOBALS['debugLevel'])){
+                $GLOBALS['debugLevel'] = getSetting("debugLevel");  // be kind to our db only only hit this once per execution
+        }
+        if ($lvl > $GLOBALS['debugLevel']){  return; }
+
+        syslog($lvl, $msg);
+        if(amIConsole() && $disableConsole == false) {
+                console_log_impl($lvl, $msg);
+        }
+}
+function amIConsole() {
+        if( empty($_SERVER['REMOTE_ADDR']) and !isset($_SERVER['HTTP_USER_AGENT']) and count($_SERVER['argv']) > 0) {
+                return true;
+        }
+        return false;
+}
+
+function console_log_impl($lvl, $msg) {
+        $red = "\033[31m";
+        $purp = "\033[35m";
+        $nc = "\033[39m";
+        $grn = "\033[32m";
+        $blu = "\033[34m";
+        $color = $nc;
+        $pre = "";
+        switch($lvl) {
+                case LOG_EMERG:
+                case LOG_ALERT:
+                case LOG_ERR:
+                        $color = $red;
+                        $pre = "ERROR: ";
+                        break;
+                case LOG_WARNING:
+                        $color = $purp;
+                        $pre = "WARNING: ";
+                        break;
+                case LOG_INFO:
+                case LOG_NOTICE:
+                        $color = $blu;
+                        break;
+                case LOG_DEBUG:
+                        $color = $grn;
+                        break;
+        }
+        echo "$color$pre$msg$nc\n";
+}
+
+
+function getJobVMTarget($jobId, $vmId){
+	$sql = "SELECT option, val from  Job_Options WHERE jobID=?";
+	$guys = dbGet("nimbus", $sql, array($jobId) );
+
+	$out = new stdClass();
+	$out->vmid = $vmId;
+	foreach($guys as $r){
+		if($r->option == "vmHost" ){
+			$bit = explode("|", $r->val);
+			if($bit[0] == $vmId){
+				$out->hostID = $bit[1];
+			}
+		}else if ($r->option == "vmHostSR"){
+			$bit = explode("|", $r->val);
+			if($bit[0] == $vmId){
+				$out->SRID = $bit[1];
+			}
+		}
+	}
+	return $out;
+}
+
+function getBlankBlock($bs=null){
+	if($bs == null){ $bs = getSetting("blockSize"); }
+
+	if($bs == "512"){ return "59071590099d21dd439896592338bf95"; }
+	else if($bs == "1024"){ return "b6d81b360a5672d80c27430f39153e2c"; }
+	else if($bs == "2048"){ return "b2d1236c286a3c0704224fe4105eca49"; }
+	else if($bs == "4096"){ return "b5cfa9d6c8febd618f91ac2843d50a1c"; }
+	else if($bs == "6144"){ return "da6a0d097e307ac52ed9b4ad551801fc"; }
+	else if($bs == "8192"){ return "96995b58d4cbf6aaa9041b4f00c7f6ae"; }
+
+}
+
+// used by repTool and restoreTool
+function getRestorePathName($uuid, $site =0){
+	if(!file_exists("/mnt/restore/$site/uuid.list")){ return ""; }
+
+        $mangled = str_replace("-","",$uuid);
+        $cmd = "cat /mnt/restore/$site/uuid.list | grep -i $mangled";
+        $res = explode("=",trim(shell_exec($cmd)));
+        if(isset($res[1])){
+                return "/mnt/restore/$site/".$res[1];
+        }
+        return "";
+}
+
+
+function testXenAuth($ip, $user, $pass){
+	$h = new stdClass();
+	$h->name = $ip;
+	$h->username = $user;
+	$h->password = $pass;
+	$GLOBALS["host"]=$h;
+	set_xen_env();
+	try{
+	$res = xen_call("host-list");
+	}catch(Exception $ex){
+		if(strpos($ex->getMessage(), "Authentication failed") !== false){
+			return "Authentication Failed";
+		}else{
+			return $ex->getMessage();
+		}
+	}
+	return true;
+}
+
+/////////////////////////////////////
+function getVMMetaTemplate($uuid, $name){
+        $memory = 1024 * 1024;
+        $meta = new stdClass();
+        $meta->numCPUs =1;
+        $meta->memory =$memory;
+        $meta->memoryStaticMax = $memory;
+        $meta->memoryStaticMin = $memory;
+        $meta->memoryDynamicMax = $memory;
+        $meta->memoryDynamicMin = $memory;
+        $meta->memoryTarget = $memory;
+        $meta->name = "$name";        // nativeName?
+        $meta->description = "";
+        $meta->hVMBootPolicy = "BIOS order";
+        $meta->hVMShadowMultiplier =1;          //
+        $meta->pVArgs ="";                      //
+        $meta->pVBootloader="";                 //
+        $meta->pVBootloaderArgs="";             //
+        $meta->pVKernel="";                     //
+        $meta->uuid = $uuid;
+        $meta->VBDS = array();
+        $meta->VIFS = array();
+        $meta->hVMBootParams = array();
+        $meta->hVMBootParams["boot"] = "dc";
+
+        $meta->platform = array();
+        $meta->platform["nx"] = "true";
+        $meta->platform["pae"] = "true";
+        $meta->platform["acpi"] = "true";
+        $meta->platform["viridian"] = "true";
+        $meta->platform["apic"] = "true";
+	return $meta;
+}
+
+///////////////// 		QSB Agent wrappers 
+function getAgentPort() {
+        $porto = getSetting("winAgentPort");
+        if(empty($porto)) { $porto = 8789; }
+        return $porto;
+}
+
+function agentStatus($ip){
+	$port = getAgentPort();
+	$cmd = "/usr/bin/mono /usr/local/sbin/winexeclient.exe $ip $port 3 \"status\" 2>/dev/null";
+	$res = trim(executeWithTimeout($cmd, 10));
+	//$res = trim(shell_exec($cmd));
+	if(empty($res)){ return null; }
+	$out= json_decode($res, false);
+	$out->ip = $ip;
+	$out->lastCheck = time();
+	return $out;
+}
+function recordAgent($id, $st, $isHost=false){
+	if($st == null){ return; }
+	else if(is_object($st)){ $st = json_encode($st); }
+
+        $sql = "UPDATE VM set authProfile=? where vmid=?";
+	if($isHost){ $sql = "UPDATE HOST set username=? where hostid=?"; }
+	dbSet("nimbus", $sql, array($st, $id) );
+}
+
+function agentUploadFileWin($ip, $local, $remote, $eid){
+	if(empty($ip)){ throw new Exception("Unable to connect to Agent: no IP given!"); }
+	$remote = preg_replace('/\\\\/', '\\', $remote);
+	$remote = str_replace('\\', '/', $remote);
+	$remote = rawurlencode($remote);
+	return shell_exec("/usr/local/sbin/winupload $local $ip \"$remote\" $eid");
+}
+function agentUploadFile($ip, $local, $remote){
+	if(empty($ip)){ throw new Exception("Unable to connect to Agent: no IP given!"); }
+	// the agent remote path wants linux style / NOT windows \
+	$remote = preg_replace('/\\\\/', '\\', $remote);
+	$remote = str_replace('\\', '/', $remote);
+	return shell_exec("/usr/local/sbin/wintransfer up $ip $local \"$remote\"");
+}
+function agentDownloadFile($ip, $remote, $local){
+	if(empty($ip)){ throw new Exception("Unable to connect to Agent: no IP given!"); }
+	// the agent remote path wants linux style / NOT windows 
+	$remote = preg_replace('/\\\\/', '\\', $remote);
+	$remote = str_replace('\\', '/', $remote);
+	if(file_exists($local)){ unlink($local); }
+
+	$cmd = "/usr/local/sbin/wintransfer down $ip $remote $local";
+	//echo "--------------- Downloader\n Remote: $remote\nlocal: $local\nCmd: $cmd\n";
+	return shell_exec($cmd);
+}
+function agentRunCmd($ip, $cmd, $raw=false){
+	if(empty($ip)){ throw new Exception("Unable to connect to Agent: no IP given!"); }
+
+        if($raw == false){ $cmd = rawurlencode($cmd); }	// why not always encode
+	$fullCmd = "/usr/local/sbin/winexewrapper --encoded //$ip \"$cmd\"";
+
+	$outly = null;
+	$retVal = null;
+	exec($fullCmd . " 2>&1", $outly, $retVal);
+	$rez = implode($outly, "\n");
+	if($retVal != 0) {
+		throw new Exception($rez);
+	}
+	return $rez;
+}
+function agentRunCmdWithRetry($ip, $cmd, $raw=false) {
+	if(empty($ip)){ throw new Exception("Unable to connect to Agent: no IP given!"); }
+	$set =getSetting("agentRetrySecs");
+	$timeout = intval($set);
+	if($timeout <= 0) {
+		$timeout = 20;
+	}
+	$startTime = time();
+
+        if($raw == false){ $cmd = rawurlencode($cmd); }	// why not always encode
+	$fullCmd = "/usr/local/sbin/winexewrapper --encoded //$ip \"$cmd\"";
+	while(true) {
+		$curTime = time();
+		if($curTime - $startTime > $timeout) {
+			throw new Exception("Command $fullCmd failed to agent after $timeout seconds of retries");
+		}
+	        $outly = null;
+        	$retVal = null;
+	        exec($fullCmd . " 2>&1", $outly, $retVal);
+        	$rez = implode($outly, "\n");
+	        if($retVal != 0) {
+			gen_LOG(LOG_DEBUG, "Retrying agent command $fullCmd to ip $ip due to $rez");
+        	        sleep(1);
+			continue;
+	        }
+        	return $rez;
+
+	}
+}
+	
+
+//function agentRunCmdErr($ip, $cmd, $raw=false){
+//        if(empty($ip)){ throw new Exception("Unable to connect to Agent: no IP given!"); }
+//	$fullCmd = "/usr/local/sbin/winexewrapper --encodedErr //$ip \"$cmd\"";
+//        $res = shell_exec($fullCmd );
+//        return $res;
+//}
+
+
+function agentRunPreship($ip, $cmd, $bg=false ){
+        if(empty($ip)){ throw new Exception("Unable to connect to Agent: no IP given!"); }
+        $fullCmd = "/usr/local/sbin/winexewrapper --preship //$ip \"$cmd\"";
+        if($bg){
+                $fullCmd = "/usr/local/sbin/winexewrapper --background //$ip \"$cmd\"";
+        }
+        //$res = shell_exec($fullCmd);
+	$outly = null;
+        $retVal = null;
+        exec($fullCmd, $outly, $retVal);
+	$rez = implode($outly, "\n");
+        if($retVal != 0) {
+                throw new Exception($rez);
+        }
+        return $rez;
+
+}
+
+function agentListFiles($ip, $path){
+	$cmd = "cmd /c dir /b /a-d $path";
+	$res = agentRunCmd($ip, $cmd);
+	$raw = array_filter( explode(PHP_EOL,$res));	// clean out blanks
+
+	$out = array();
+	foreach($raw as $o){ array_push($out, str_replace("\r", '', $o) ); }	// remove EVIL carrage return from WINDOWS SHITE
+	return $out;
+}
+
+//
+function agentFileBinExists($ip, $bin) {
+        $cmd = "cmd /c if exist $bin (echo true) else (echo false)";
+        $res = trim(agentRunCmd($ip, $cmd));
+        if($res == "true"){ return true; }
+        return false;
+}
+
+function agentFileExists($ip, $file){
+	$cmd = "cmd /c if exist chroot\\$file (echo true) else (echo false)";
+	$res = trim(agentRunCmd($ip, $cmd));
+	if($res == "true"){ return true; }
+	return false;
+}
+function agentFileGetContents($ip, $file){
+	$cmd = "cmd /c type chroot\\$file";
+	return trim(agentRunCmd($ip, $cmd));
+}
+function agentFilePutContents($ip, $file, $contents=""){
+	$cmd = "cmd /c echo \"$contents\" > \"chroot\\\\$file\"";
+	return trim(agentRunCmd($ip, $cmd));
+}
+function agentFileTouch($ip, $file, $contents=""){
+	return agentFilePutContents($ip, $file, $contents);
+}
+function agentMakeFolder($ip, $folder, $jailBreak = false){
+	$cmd = "cmd /c mkdir chroot\\$folder";
+	if($jailBreak){
+		$cmd = "cmd /c mkdir $folder";
+	}
+	return trim(agentRunCmd($ip, $cmd));
+}
+function agentDeleteFolder($ip, $folder){
+	$cmd = "cmd /c rmdir chroot\\$folder /s /q";
+	return trim(agentRunCmd($ip, $cmd));
+}
+function agentDeleteFile($ip, $file){
+	$cmd = "cmd /c del chroot\\$file";
+	return trim(agentRunCmd($ip, $cmd));
+}
+function agentWmiCmd($ip, $cmd, $hv=false){
+	$space = null;
+	if($hv){ $space = "root\\\\virtualization\\\\v2"; }
+	if(empty($ip)){ throw new Exception("Unable to connect to Agent: no IP given!"); }
+        $fullCmd = "/usr/local/sbin/wmicwrapper //$ip \"$cmd\"";
+	if(!empty($space)){
+		$fullCmd = "/usr/local/sbin/wmicwrapper --namespace=$space //$ip \"$cmd\"";
+	}
+        $res = shell_exec($fullCmd);
+//echo "Full cmd: $fullCmd\nCmd: $cmd\nres: $res\n";
+	$res = array_filter(explode(PHP_EOL,$res));
+	return $res;
+}
+function agentParseWmi($res){
+	if(empty($res)){ return null; }
+	// Some varients of WMI return an array w/ the first element describing the class type, ie.  "CLASS: Win32_OperatingSystem"
+	// strip it if we find it
+	if(strpos($res[0], "CLASS: ") !== false){
+		array_shift($res);
+	}
+	$heads = explode("|", $res[0]);
+	$out = array();
+	for($x=1; $x<count($res); $x++){
+		$guy = array();
+		$keys = explode("|", $res[$x]);
+		for($i=0; $i<count($heads); $i++){
+			$guy[$heads[$i]] = $keys[$i];
+		}
+		array_push($out, (object)$guy);
+	}
+	if(count($out) ==1){ return $out[0]; }
+	return $out;
+}
+
+///////////////// ProcessVM functions ///////////////////////
+
+function doBackupVM($j, $vmid){
+
+        $edition = getEdition();
+        if($edition ==3){
+                gen_log(LOG_ERR,"Skipping backup job.  A3 is in a read-only subscription.");
+                return;
+        }
+
+        $uuid = getVMUuid($vmid);
+        $vm = getVM($uuid);
+
+	gen_log(LOG_DEBUG, "--------- Launching backupTool -v $vmid -j $j->jobID");
+	$res =managedRun("/usr/local/sbin/backupTool -v $vmid -j $j->jobID");
+	if($res->code !=0){ updateJobStatus($j->jobID, 3); }
+	else{
+		updateJobStatus($j->jobID, 2);
+		kickoffVault($vmid, $j->jobID, $j->scheduleID); // only runs if it needs to
+	}
+	return;
+}
+function doReplicateVM($j, $vmid){
+        $edition = getEdition();
+        if($edition !=2){
+                gen_log(LOG_ERR,"Skipping replicaion job.  Alike DR Edition is required but not present (Edition: $edition).");
+                return;
+        }
+
+        $isQHB=false;
+        if(array_key_exists("QHB", $j->Options) && $j->Options["QHB"] ==1 ){ $isQHB=true; }
+        $isCBT=false;
+        if(array_key_exists("doCBT", $j->Options) && $j->Options["doCBT"] ==1 ){ $isCBT=true; }
+
+
+        // non-cbt replication jobs are based on backups, so do that first.
+        if($isCBT == false ){ 
+		gen_log(LOG_DEBUG, "--------- Running backupTool -v $vmid -j $j->jobID");
+                $res =managedRun("/usr/local/sbin/backupTool -v $vmid -j $j->jobID");
+		$barf = print_r($res, true);
+		gen_log(LOG_DEBUG, "backupTool result: $barf");
+                if($res->code !=0){ 
+                        updateJobStatus($j->jobID, 3); 
+                        return; 
+                }
+        }
+	gen_log(LOG_DEBUG, "--------- Running repTool -v $vmid -j $j->jobID");
+        $res =managedRun("/usr/local/sbin/repTool -v $vmid -j $j->jobID");
+        if($res->code !=0){ updateJobStatus($j->jobID, 3); }
+        else{   
+                // we need to delete the backup if they don't elect to keep it
+                updateJobStatus($j->jobID, 2); 
+                kickoffVault($vmid, $j->jobID, $j->scheduleID); // only runs if it needs to
+        }
+}
+function doRestoreVM($j, $vmid){
+        
+        $opt = getVmOptsFromSchedule($j->scheduleID, $vmid);
+        $h = getHost($opt->hostID);
+        
+        // There are only 2 types of restore jobs here
+        //      1. full (Xen or HV)
+        //      2. Instabooters
+        gen_log(LOG_DEBUG, "--------- Redirecting to new restoreTool");
+        $res =managedRun("/usr/local/sbin/restoreTool -v $vmid -j $j->jobID");
+        if($res->code !=0){ updateJobStatus($j->jobID, 3); }
+        else{ updateJobStatus($j->jobID, 2); }
+}
+
+function doVaultVM($j, $vmid, $manualVault){
+        if(checkForCancel($j->jobID)){ return false; }
+        $uuid = getVMUuid($vmid);
+        $vm = getVMForVault($vmid, $j->jobID);
+        if(!is_object($vm)){ throw new Exception("Failed to find VM information for $vmid in Job $j->jobID"); }
+
+        $vmName = $vm->VMName;
+        $ts = $vm->timestamp;
+        if($ts == "" || $ts==0){ throw new Exception("Could not find requested backup version for VM to vault!"); }
+        $source = $j->Options["siteId"];
+        $siteID= 0;
+        if($source == 0) { $siteID=1; }
+
+        $vmsg = "Vaulting: $vmName (ID $vmid): ";
+        $veid = addJobLog($vmsg.", ",3, $j->jobID, $vmid, 17100222);
+        $cmd = array();
+        $cmd["command"] = "vault";
+        $cmd["site"] = "$siteID";
+        $cmd["source"] = $source;
+        $cmd["version"] = "$ts";
+        $cmd["uuid"] = "$uuid";
+        $cmd["vm"] = "$vmid";
+        $cmd["job"] = "$j->jobID";
+
+        try{
+                $sid = $j->target;
+                if($manualVault){ $sid = "none"; }
+//              addJobLog("Running vault of VM $vmid, version $ts, source: $source, siteID: $siteID schedID: $sid",4, $j->jobID, $vmid);
+                $barf = issueJavaCmd($cmd, $j->jobID, $vmid, $veid);
+                doPurgeVM($j->jobID, $vmid, $sid, $siteID);     // needs special vaulting mods ?
+                $msg = "$vmsg}<}100";
+                updateJobLog($msg, 0, $veid);
+                addJobLog("Vault is complete for $vmName", 0, $j->jobID, $vmid);
+                return true;
+        }catch(Exception $ex){
+                updateJobLogStatus(1,$veid);
+                $msg = "Failed to transfer data offsite: ".$ex->getMessage();
+                addJobLog($msg, 1, $j->jobID, $vmid);
+                $msg = "Vaulting: $vmName (ID $vmid): Failed";
+                throw new Exception($msg);
+        }
+}
+
+
+function doPurgeVM($jobid, $vmid, $schedID, $siteID=0){
+        $fn = "/tmp/wal-lockergfs.db";
+        $fp = @fopen($fn, "w");
+        if(! $fp) { gen_log(LOG_WARNING, "doPurge Failed to open lock file: $fn");}
+        else if(flock($fp, LOCK_EX) == false) { gen_log(LOG_WARNING,"doPurge Unable to flock $fn"); }
+        $fn2 = "/tmp/wal-lockernimbusdb.db";
+        $fp2 = @fopen($fn2, "w");
+        if(! $fp2) {
+                $msg = "doPurge Failed to open lock file: $fn2";
+                syslog(LOG_WARNING, $msg);
+        } else if(flock($fp2, LOCK_EX) == false) {
+                syslog(LOG_WARNING,"doPurge Unable to flock $fn2");
+        }
+        try {
+                $bks = $GLOBALS["settings"]->alikeRoot."/BackupScheduler.exe";
+                $cmd = "/usr/local/bin/wine $bks -p $jobid $vmid $schedID $siteID";
+                $res=-1;
+                $out = array();
+                exec($cmd,$out,$res);
+                $purgy = trim(implode($out));
+                // Be sure to unlock immediately to prevent carnage
+                flock($fp, LOCK_UN);
+                flock($fp2, LOCK_UN);
+                if($res !=0){
+                        addJobLog($purgy, 1, $jobid, $vmid);
+                }else{
+                        $msg = $purgy;
+                        if($msg == ""){ $msg = "No backups require purging"; }
+                        addJobLog($msg, 0, $jobid, $vmid);
+                        fclose($fp);
+                        fclose($fp2);
+                        syncDBs(true);
+                }
+        } finally {
+                // Make shure we close immediately
+                fclose($fp);
+                fclose($fp2);
+        }
+}
+/////////////////////////////////////////////////// End ProcessVM /////////////////////////////////////////////
+
+/////////////////////////////////////////////////// Start xTool common /////////////////////////////////////////////
+function updateProgTmpFile($jobID, $vmID, $devNum, $prog, $size){
+        $base = "/tmp/job_ctl/jrb_prog.$jobID";
+        $locker = $base.".lck";
+        $meat = $base.".dat";
+        $lk = null;
+        try{
+                $lk = qflock($locker, $waitSec=1);
+                $guy = null;
+                if(!file_exists($meat)){
+                        $guy = array();
+                }else{
+                        $guy = unserialize(file_get_contents($meat));
+                }
+                $me = null;
+                if(array_key_exists($vmID, $guy)){
+                        $me = $guy[$vmID];
+                }else{
+                        $me = new stdClass();
+                        $me->disks = array();
+                        $me->status =0;
+                }
+                $theDisk = null;
+                if(array_key_exists($devNum, $me->disks)){
+                        $theDisk = $me->disks[$devNum];
+                }else{
+                        $theDisk = new stdClass();
+                }
+                $theDisk->size = $size;
+                $theDisk->prog = $prog;
+                $me->disks[$devNum] = $theDisk;
+                $guy[$vmID]= $me;
+
+                file_put_contents($meat, serialize($guy));
+        }catch(Exception $ex){
+                $msg = "updateProgTmp got error: ". $ex->getMessage();
+                gen_log(LOG_WARNING, $msg );
+        }finally{
+                if($lk != null){ qunflock($lk); }
+        }
+}
+
+/////////////////////////////////////////////////// End xTool common /////////////////////////////////////////////
+
+
+function getHostIP(){
+        $sql = "SELECT val from settings where name='hostIP'";
+	return dbGetColumn("nimbus", $sql);
+}
+
+
+// function expects to be connected to a xen host.  call once per pool
+function checkOrphanSrs(){
+        global $reservedSrId;
+        $ip = getHostIP();      // this is our IP
+        $rez = json_decode(parse_xen_result(xen_call("sr-list shared=true type=nfs")),true);
+	foreach($rez as $sr){
+                $uuid = $sr["uuid"];
+                if($uuid == $reservedSrId){ continue; }	// skip our own (known) SR uuid
+
+		$sr = json_decode(parse_xen_result(xen_call("pbd-list sr-uuid=$uuid")),true);
+		foreach($sr as $s){
+			$serv = $s["device-config"]["server"];
+			if($serv == $ip){					// only worry about SRs that have PBDs that point to our IP
+				if($s["sr-uuid"] != $reservedSrId){
+					// Xen believes there is an SR pointing to our A3 that doesn't exist.
+					$srid = $s["sr-uuid"];
+					$msg = "Detected an SR on hostID $hostId that points to our IP, but isn't ours!";
+					gen_log(LOG_WARNING,$msg);
+					echo "$msg\n";
+					addAlarm($msg, 1);              // add alarm bell
+					$path = "/mnt/instaboot/sr/xen/$srid";  // add folder for uuid
+					if(!is_dir($path)){
+					      mkdir($path);
+						gen_log(LOG_WARNING,"Created folder for orphan SR ($srid)");
+					}else{ echo "Folder exists: $path\n"; }
+
+					// rename SR to something noticable
+					$nm = trim(xen_call("sr-param-get param-name=name-label uuid=$srid"));
+					$suf = "_archived";
+					if (substr($nm, -1 * strlen($suf)) === $suf) {
+						$nm = $nm."$suf";
+	                                        xen_call("sr-param-set uuid=$srid name-label=\"$nm\"");
+						$msg = "Renamed SR to: $nm";
+						gen_log(LOG_WARNING,$msg);
+						echo "$msg\n";
+					}
+					$subject = "A3 ($ip) detected orphaned SR";
+					$body = "WARNING!\n\n  Your A3: \n$ip \nSR Guid: $reservedSrId\n\nDetected another (orphaned) Alike SR on host $hostUuid \nSR Name: $nm\n";
+					$body .= "\nAttempting to forget orphaned SR ($nm) to prevent stability issues. \n";
+					$body .= "For assistance, please contact Quadric Support.";
+					priorityMail($subject, $body);
+
+	                                $resp = trim(xen_call("sr-forget uuid=$srid"));
+					$msg = "Attempted to forget SR $srid ($resp)";
+					gen_log(LOG_WARNING,$msg);
+					echo "$msg\n";
+				}
+			}
+		}
+	}
+}
+
+function updateMungeConf($ip){
+	$mc  = "/home/alike/Alike/agentShare/munge.conf";
+	exec("sudo chown alike.alike $mc");
+	$old = trim(file_get_contents($mc));
+	$parts = explode(",", $old);
+	$parts[0] = $ip;
+	$cont = implode(",", $parts);
+	file_put_contents($mc,$cont);
+}
+
+function useProxy(){
+	$mf = "/home/alike/configs/node_mode";
+	if(!file_exists($mf)){ return false; }	// we're a legacy full stack
+	else{
+		$mode = trim(file_get_contents($mf));
+		if($mode == 2){ return false; }	// a full stack guy
+		else if($mode == 1){  return true; }  // we're headless and need to ask
+		else{
+			return false;	// we're a manager, so no need to proxy to ourself
+		}
+	}
+	return false;
+}
+
+function getManagerIP(){
+	$managerIP = "127.0.0.1";
+	$set =getSetting("managerIP");
+	if(!empty($set)){ $managerIP = $set; }
+	return $managerIP;
+}
+
+function doWebProxyPost($call, $o, $doJson=true){
+
+	$managerIP = getManagerIP();
+	$url = "https://$managerIP";
+	if($call == "licenses"){ $url .= "/ws/subproxy/licenses"; }
+	else if($call == "usage"){ $url .= "/ws/subproxy/usage"; }
+	else if($call == "settings"){ $url .= "/ws/subproxy/settings"; }
+	else if($call == "email"){ $url .= "/ws/subproxy/email"; }
+	else{
+		$out = new stdClass();
+		$out->result = "error";
+		$out->message = "Licensing call ($call) not known";
+		return $out;
+	}
+
+        $barf= base64_encode(serialize($o) );
+	$timeoutSec = 10;
+	$cont = $o;
+	if($doJson){
+		$cont = json_encode($o);
+	}
+	$data = http_build_query(['data' => $cont]);
+	$options = [
+	    'http' => [
+		'method' => 'POST',
+		'header' => 'Accept-Encoding: gzip, deflate',
+		'content' => $data,
+		'timeout' => $timeoutSec,
+		'header' => "Content-Type: application/x-www-form-urlencoded; charset=UTF-8"
+	    ],
+	    'ssl' => [
+		'verify_peer' => false,
+		'verify_peer_name' => false,
+	    ],
+	];
+	$context = stream_context_create($options);
+	$raw = file_get_contents($url, false, $context);
+
+	$out = json_decode(gzdecode($raw));
+	return $out;	// out will be an object w/ "result", "message" and "data"
+}
+
+function doWebProxyGet($call){
+
+	$managerIP = getManagerIP();
+
+        $url = "http://$managerIP";
+        if($call == "update_check"){ $url .= "/ws/subproxy/update_check"; }
+        else{
+                $out = new stdClass();
+                $out->result = "error";
+                $out->message = "License Server: ($call) not known";
+                return $out;
+        }
+        $timeoutSec = 10;
+
+        $context = stream_context_create([ 'http' => [ 'header' => 'Accept-Encoding: gzip, deflate', 'timeout' => $timeoutSec]  ]);
+        $result = @file_get_contents($url, false, $context);
+        // just in case
+        $err = new stdClass();
+        $err->result  = "error";
+        if(empty($result)){
+                $err->message = "Network failure reaching remote server ($url).";
+                return $err;
+        }
+        $result = @gzdecode($result);
+        if($result === false){
+                $err->message = "Failed to decode WS response (invalid compression)";
+                return $err;
+        }
+        $out = @json_decode($result);
+        if($out == null){
+                $err->message = "Failed to decode WS response (invalid format)";
+                return $err;
+        }
+        return $out;
+}
+
+
+// 0 = manager only, 1= headleass node, 2= full stack
+function getNodeMode(){
+	$mode = 2;
+        $fn = "/home/alike/configs/node_mode";
+        if(!file_exists($fn)){ return $mode;}
+
+        $barf = trim(file_get_contents($fn));
+	if(is_numeric($barf) && $barf <3 && $barf >= 0){
+		$mode = $barf;
+	} 
+        return $mode;
+}
+
+
+function addAlarm($msg, $status, $ts=0){
+	if($ts==0){ $ts = time(); }
+        $sql = "INSERT into NimbusJobEntry (timestamp, acknowledged, messageID, status, jobID, vmID, description) values( ?,0,0,?,0,0,?)";
+        dbSet("jobLog", $sql, array($ts, $status, $msg ));
+}
+
+function getA3Token($a3){
+	;
+}
+function getA3TokenImp($pass, $guid){
+	;
+}
+
+function slurpDmesg(){
+        $last = getSetting("lastDmesg");
+        exec('sudo dmesg -l emerg,crit', $output);
+
+        $uptime = explode(" ", file_get_contents('/proc/uptime'));
+        $bootTime = time() - (int)$uptime[0]; // Calculate boot time
+
+        foreach ($output as $line) {
+            if (preg_match('/^\[(\d+\.\d+)\]/', $line, $matches)) {
+                $rel = (float)$matches[1]; // Relative time from boot in seconds
+                $ts = $bootTime + (int)$rel;
+                $clean = preg_replace('/^\[\d+\.\d+\]\s+/', '', $line);
+                if($ts > $last){
+                        addAlarm($clean,1, $ts);
+                        echo "$ts,  $clean\n";
+                }
+            }
+        }
+        setSetting("lastDmesg", time());
+}
+function slurpEngineLog(){
+        $last  =getSetting("lastEngineLog");
+        exec("cat /home/alike/logs/engine.log | grep '^3'", $output);
+        foreach ($output as $line) {
+                $line = substr($line, 2);
+                if (preg_match('/^([A-Za-z]+\s+\d+\s+\d+:\d+:\d+)(.*)/', $line, $matches)) {
+			$dateString = $matches[1];
+			$msg = trim($matches[2]);
+			$ts = strtotime($dateString);
+			if($ts > $last){
+				addAlarm($msg,1, $ts);
+			}
+                }
+        }
+        setSetting("lastEngineLog", time());
+}
+
+function executeWithTimeout($command, $timeoutInSeconds) {
+    // Start the process
+    $descriptorspec = [
+        0 => ['pipe', 'r'],
+        1 => ['pipe', 'w'],
+        2 => ['pipe', 'w']
+    ];
+
+    $process = proc_open($command, $descriptorspec, $pipes);
+
+    if (!is_resource($process)) {
+        return false; // Unable to start the process
+    }
+
+    
+	// Set the pipes to non-blocking mode
+    stream_set_blocking($pipes[1], 0);
+    stream_set_blocking($pipes[2], 0);
+
+    $stdout = '';
+    $startTime = time();
+    $timeoutReached = false;
+
+    do {
+        // Check if the process has terminated
+        $status = proc_get_status($process);
+
+        if (!$status['running']) {
+            break; // Process has finished
+        }
+
+        // Check if timeout has been reached
+        $currentTime = time();
+        if (($currentTime - $startTime) >= $timeoutInSeconds) {
+            $timeoutReached = true;
+            break;
+        }
+
+        // Read from stdout
+        $stdout .= stream_get_contents($pipes[1]);
+
+        // Sleep for a short interval
+        usleep(100000); // 100,000 microseconds = 0.1 seconds
+
+    } while (true);
+	
+
+    // Close pipes
+    fclose($pipes[0]);
+    //fclose($pipes[1]);
+    fclose($pipes[2]);
+
+
+ // Check if timeout was reached and kill the process if needed
+    if ($timeoutReached) {
+	gen_log(LOG_DEBUG, "Timeout was reached already after $currentTime vs $startTime vs their desired $timeoutInSeconds");
+        proc_terminate($process); // Kill the process
+        return false; // Execution timed out
+    } else {
+        // Capture the remaining contents of stdout
+        $stdout .= stream_get_contents($pipes[1]);
+	fclose($pipes[1]);
+        proc_close($process);
+        return $stdout; // Return the complete contents of stdout
+    }
+}
+
+
+
+
+
+
+?>

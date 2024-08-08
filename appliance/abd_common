@@ -1,0 +1,1317 @@
+<?php
+include_once("/usr/local/sbin/common_lib");
+include_once("/usr/local/sbin/shared_lib");
+include_once("xen_common");
+include_once("insta_common");
+
+
+// Moved to xen_common
+//function connectXapiByPool($poolID){
+//	$guy = getPoolMasters($poolID);
+//	$hid = $guy[0];
+//	//echo "Master for pool $p is hostid: $hid\n";
+//	xen_connect($hid);
+//}
+function showABDReport(){
+	echo "ABD Report\n";
+	$pools = getAllPools();
+	$abds = getABDsFromDB();
+	$nets = getABDNets();
+
+	echo "Found ". count($pools) ." Xen Pools.\n";
+	foreach($pools as $p){
+		$inf = getPoolInfo($p);
+		echo "===========================================================\n";
+		echo "Pool: $inf->name [$p]\n";
+		$guy = getPoolMasters($p);
+		$h = getHost($guy[0]);
+		echo "\tMaster Host: ". $h->nativeName . " [id: $h->hostID]  ($h->name)\n";
+		connectXapiByPool($p);
+		$res = checkForExistingTemplate();
+                if(empty($res)){
+                        echo "\t****************** \t  ABD Template Missing for pool\t******************\n";
+                }else{
+                        $valid = "Validated";
+                        try{
+                                validateTemplate($res[0]->uuid);
+                        }catch(Exception $ex){
+                                $valid = "DAMAGED:". $ex->getMessage();
+                        }
+                        echo "\tABD Template: ". $res[0]->name." [". $res[0]->uuid ."] ($valid)\n";
+                }
+
+		echo "\tProvisioned ABDs:\n";
+		$hasABDs=false;
+		foreach($abds as $a){
+			if ($a->poolID == $p){
+				$st = getVmPowerStateXen($a->uuid);
+				echo "\t\t$a->name [$a->uuid] $a->ip ";
+				if(intval($a->vmOwner) != 0){
+					echo "[$st] Assigned VMID: $a->vmOwner\n";
+				}else{
+					echo "[$st] (available)\n";
+				}
+				$hasABDs=true;
+			}
+		}
+		if (!$hasABDs){
+			echo "\t\tNO ABDs Provisioned!\n";
+		}
+		echo "\n";
+		$isDHCP =true;
+		foreach($nets as $n){
+			if ($n->poolID == $p && $n->ip != "0.0.0.0"){
+				$isDHCP = false;
+				$state = "Available";
+				if($n->checkedOut ==1){ $state = "Assigned"; }
+				echo "\tStatic IP: $n->ip / $n->netmask ($state)\n";
+			}
+
+		}
+		if($isDHCP){
+			echo "\t*Pool uses DHCP for ABDs*\n";
+		}
+	}
+}
+
+function scrubOrphanABDs(){
+	gen_log(LOG_INFO, "Scrubbing all orphan ABDs from our DB.");
+		$pools = getAllPools();
+		foreach($pools as $p){
+			connectXapiByPool($p);
+
+			$sql = "SELECT * from Appliance where poolID = ?";
+			$all = dbGet("nimbus", $sql, array($p) );
+			foreach($all as $a){
+				$guy = xen_call("vm-list", "uuid=\"$a->uuid\"");
+				$guy = json_decode(parse_xen_result($guy), true);
+				if(empty($guy)){
+					gen_log(LOG_INFO, "Found orphan DB entry for ABD ($a->ID). Cleaning entry.");
+					forgetABD($a->ID);
+				}else{
+					gen_log(LOG_DEBUG, "Found ABD (ID: $a->ID, UUID: $a->uuid) is valid.");
+				}
+			}
+		}
+
+	gen_log(LOG_INFO, "Complete.");
+}
+
+function runABDDiag($poolID){
+	if (empty($poolID)){ throw new Exception("No pool given for ABD Provision"); }
+	connectXapiByPool($poolID);
+	$plate = checkForExistingTemplate();
+	if ($plate === false){ 
+                $guy = getPoolMasters($poolID);
+                $hid = $guy[0];
+                doPoolImport($hid);
+		$plate = checkForExistingTemplate();
+	}
+	if ($plate === false){ throw new Exception("No ABD template could be found for pool $poolID"); }
+	try{
+		validateTemplate($plate[0]->uuid);
+	}catch(Exception $ex){
+		$msg = $ex->getMessage();
+                if(strpos($msg, "has no VDI") === false && strpos($msg, "has no ABD template") === false){
+			throw new Exception($ex->getMessage());
+		}
+                $guy = getPoolMasters($poolID);
+                $hid = $guy[0];
+                doPoolImport($hid);
+	}
+	$abd = getABDsFromDB(null);
+	foreach ($abd as $a){
+		if($a->poolID == $poolID && $a->vmOwner ==0){
+			return doDiag($a);
+		}
+	}
+	gen_log(LOG_INFO, "No available ABDs found in Pool, attempting to start one for the job.");
+	$abdID = provisionABD($poolID);
+	$abd = getABDsFromDB($abdID);
+	return doDiag($abd);
+
+	//gen_log(LOG_ERR_NOFAIL, "No available ABDs found in Pool to run a diagnostic job. Please ensure at least 1 ABD is running/available and try again.");
+}
+
+function runAbdCmd($ip, $cmd){
+	if(empty($cmd)){ throw new Exception("Blank command sent to abd $ip"); }
+	$con = "sudo -u alike ssh -q -o ConnectTimeout=15 -o ConnectionAttempts=4 -o StrictHostKeyChecking=no -o ServerAliveInterval=10 -o ServerAliveCountMax=1500 root@$ip";
+	$cmd = "$con $cmd";
+	$res = managedRun("$cmd");
+
+//	if($res->code != 0){
+//		gen_log(LOG_DEBUG,"ssh ($cmd) result code: ". $res->code);
+//	}
+
+	return trim($res->stdOut);
+}
+
+function initProgress($ip, $fn){
+	$cmd = "\"[[ -f $fn ]] && cat $fn || echo 0 > $fn;\"";
+	runAbdCmd($ip, $cmd);
+}
+
+function doDiag($a){
+	assignABD($a->ID, -1);
+	try{
+		connectXapiByPool($a->poolID);
+		$state = getVmPowerStateXen($a->uuid);
+		if($state  != "running"){
+			gen_log(LOG_INFO, "ABD $a->ID is not running.  Powering on now");
+			startVmXen($a->uuid);
+		}
+		validateABD($a);
+		gen_log(LOG_INFO, "Validated ABD $a->ID ($a->uuid) ");
+		gen_log(LOG_INFO, "Running diagnostic job on ABD $a->ID ($a->ip) ");
+		$cmd = "/usr/bin/xenstore-read vm";
+		$raw = runAbdCmd($a->ip, $cmd);
+		if(empty($raw)){
+			throw new Exception("Failed to connect to ABD $a->ID ($a->ip)");
+		}else{
+			$got = trim(substr($raw, 4));
+			if($got!= $a->uuid){
+				throw new Exception("Connected to the wrong ABD! Expected $a->uuid got $got");
+			}
+			gen_log(LOG_DEBUG, "Got correct uuid for ABD $a->ID ($got) ");
+		}
+		gen_log(LOG_INFO, "Encrypted connection established to ABD $a->ID ($a->ip) ");
+
+		abdMountADS($a->ip);
+
+		$raw = explode(',',runAbdCmd($a->ip, "cat /mnt/ADS/munge.conf"));
+		$res = runAbdCmd($a->ip, "nc -z $raw[0] $raw[1]; echo $?");
+		if($res != 0){
+			throw new Exception("ABD failed to connect to backup data port (TCP $raw[0]:$raw[1])");
+		}
+		gen_log(LOG_INFO, "Successfully connected to backup data port (TCP $raw[0]:$raw[1])");
+
+		$cmd = "time dd if=/dev/xvda of=/dev/null bs=512 count=390625 iflag=direct 2>&1  | grep real";
+		$out = explode(' ',runAbdCmd($a->ip, $cmd));
+		$read = round(200 / substr($out[1],0,-1));
+		gen_log(LOG_INFO, "Unbuffered SR read: $read MB/s");
+
+		// we need to mount ADS, attach a disk, do the nc to the java port, then 
+			// go = "dd if=/dev/zero of=/dev/xvdc bs=512 count=390625 oflag=direct";  // write speed
+			// execute(go).Trim();
+			// int wspeed = 200 / sw.Elapsed.Seconds;
+			// int about = sw.Elapsed.Seconds;	
+		gen_log(LOG_INFO, "ABD diagnostic job completed successfully");
+	}finally{
+		unassignABD($a->ID);
+	}
+}
+
+function checkAbdHealth($a){
+        $res = runAbdCmd($a->ip, "touch /tmp/testFile; echo $?");
+        gen_log(LOG_DEBUG, "Checking ABD's health: $res" );
+        if($res == "1"){
+                gen_log(LOG_DEBUG, "ABD was read-only.  Attempting reboot to fix.");
+                xen_call("vm-shutdown uuid=\"$a->uuid\" force=true");
+                xen_call("vm-start uuid=\"$a->uuid\"");
+                sleep(10);
+	}
+	// make the ABD's /tmp memory backed tmpfs
+	$cmd = "umount /tmp";
+	$res = runAbdCmd($a->ip, $cmd);	// clean out anything from before
+
+	$cmd = "mount \| grep /tmp \|\| mount -t tmpfs tmpfs /tmp";
+	$res = runAbdCmd($a->ip, $cmd);
+	gen_log(LOG_DEBUG, "Mounted /tmp to ram: $cmd" );
+	return;
+	
+
+        $res = runAbdCmd($a->ip, "touch /tmp/testFile; echo $?");
+        if($res == "1"){
+                $msg = "Xen has put ABD $a->ID in read-only mode (Res: $res).  This can be caused by networking or storage (SR) problems.  Please refer to your Xen dom0 log files for more details.  This ABD must be deleted and re-deployed.";
+                gen_log(LOG_ERR, $msg);
+                throw new Exception("ABD is read-only");
+        }
+
+}
+
+function abdMountADS($ip){
+	$cmd = "mount | grep ADS";
+	$res = runAbdCmd($ip, $cmd);
+	if(empty($res)){
+		$hip = getHostIP();
+//		$share = substr(getSetting("dataStoreShare"), 0, -1);
+		$share = "//$hip/ADS";
+		$adsPass = getSetting("dataStorePass");
+		$adsUser = getSetting("dataStoreUser");
+		$cmd = "/bin/mount -t cifs $share /mnt/ADS -o vers=3.0,username=$adsUser,password=$adsPass,cache=none";
+		$res = runAbdCmd($ip, $cmd);
+	}
+	$cmd = "[ -e /mnt/ADS/seed ] && echo 1 || echo 0";
+	$res = runAbdCmd($ip, $cmd);
+	if($res != 1){
+		throw new Exception("ABD has error with mounted ADS (seed missing $res)");
+	}
+}
+function abdMountRestore($ip){
+	$cmd = "mount | grep restore";
+	$res = runAbdCmd($ip, $cmd);
+	if(empty($res)){
+		$res = runAbdCmd($ip, "mkdir /mnt/restore");
+		$share = substr(getSetting("dataStoreShare"), 0, -4). "restore";
+		$adsPass = getSetting("dataStorePass");
+		$adsUser = getSetting("dataStoreUser");
+		$cmd = "/bin/mount -t cifs $share /mnt/restore -o vers=3.0,username=$adsUser,password=$adsPass,cache=none";
+		$res = runAbdCmd($ip, $cmd);
+	}
+}
+
+// hostID can be null.  If provided, we will pin to that host?
+function provisionABD($poolID, $netID=null){
+
+	if (empty($poolID)){ throw new Exception("No pool given for ABD Provision"); }
+	connectXapiByPool($poolID);
+        $temps = checkForExistingTemplate();
+        if(empty($temps)){
+                $guy = getPoolMasters($poolID);
+                $hid = $guy[0];
+                doPoolImport($hid);
+        }
+
+
+	// check nimbus for IPs
+	$abds = getABDsFromDB();
+	$nets = getABDNets($poolID);
+	$isDHCP=false;
+	$ourNet = null;
+	if($nets){
+		foreach($nets as $n){
+			if($netID != null){
+				if($n->ID == $netID){
+					if($n->checkedOut == 1){ throw new Exception("Requested IP ($n->ip) is already in use by another ABD."); }
+					$ourNet = $n;
+					gen_log(LOG_DEBUG, "Found requested IP: $n->ip");
+					break;
+				}
+			}else if($n->ip == "0.0.0.0"){
+                                $ourNet = $n;
+                                gen_log(LOG_DEBUG, "Using DHCP for ABD");
+                                break;
+                        }else if(empty($n->checkedOut) && $n->poolID == $poolID){
+                                $ourNet = $n;
+                                gen_log(LOG_DEBUG, "Found available IP: $n->ip");
+                                break;
+                        }
+		}
+		if($ourNet == null){ throw new Exception("No available IP for new ABD. Please add more."); }
+	}else{
+		gen_log(LOG_DEBUG, "Using DHCP for new ABD");
+		$isDHCP=true;
+	}
+	gen_log(LOG_INFO, "Connecting to xen to provision new ABD");
+	connectXapiByPool($poolID);
+	$newAbdUUID = cloneVMfromTemplate("New ABD (provisioning)");	// rename this when we get and abdID
+
+	$res =preg_match("/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/", $newAbdUUID);
+	if($res !== 1){
+		throw new Exception("Failed to provision new ABD.  Please check that your Alike SR is plugged in and healthly.  Xen Error:  $newAbdUUID");
+	}
+
+
+	hideVmXen($newAbdUUID);
+	addTagToVmXen($newAbdUUID, "AlikeIgnore");
+
+	$wip = "?";
+	if ($ourNet){
+		setVif($newAbdUUID, $ourNet);
+		$wip = $ourNet->ip;
+	}
+
+	if($isDHCP){
+		// do we need to do this?  Only b/c addABD needs to insert stuff into the Appliance table
+		// this will be overwritten when the DHCP ABD boots and learns the real info
+		$ourNet = new stdClass();
+		$ourNet->ip = "0.0.0.0";
+		$ourNet->MAC = "";
+		$ourNet->netID = 0;
+		$wip = "DHCP";
+	}
+
+	$abdID = addABD($newAbdUUID, $poolID, $ourNet);
+	gen_log(LOG_DEBUG, "New ABD provisioned: ABD $abdID ($newAbdUUID).  Will use $wip");
+
+	// now we need to set the KVP for DHCP or a static IP
+	setABDNetInfo($abdID, $newAbdUUID, $ourNet);
+	if (!$isDHCP){
+		setIPCheckout($ourNet->ip, $newAbdUUID, true);
+	}
+	bootABD($abdID);
+	return $abdID;
+}
+
+function deleteABD($id){
+	$a= getABDsFromDB($id);
+	if($a->vmOwner != 0){ 
+		gen_log(LOG_WARNING, "ABD $id is currently checked out ($a->vmOwner)!");
+		return false; 
+	}
+	$res = haltABD($id, false);
+	if(empty($a)){
+		return true;
+	}
+	gen_log(LOG_INFO, "Checking ABD IP ($a->ip) back in for use");
+	setIPCheckout($a->ip, $a->uuid, false);
+	deleteABDfromXen($id);
+
+	deleteABDfromDB($id);
+	return true;
+}
+
+// forget you ever knew this guy
+function forgetABD($id){
+        $abd= getABDsFromDB($id);
+        if(empty($abd)){
+                gen_log(LOG_ERR_NOFAIL, "Could not find ABD $id to forget!");
+                return false;
+        }
+        gen_log(LOG_INFO, "Forgetting ABD ID $id");
+	setIPCheckout($abd->ip, $abd->uuid, false);	// check the IP back in, if needed
+	deleteABDfromDB($id);				// fugetaboutit
+        gen_log(LOG_INFO, "ABD ID $id has been forgotten.");
+}
+
+// reaches out to xen and deletes the ABD vm
+function deleteABDFromXen($id){
+	$abd= getABDsFromDB($id);
+	if(empty($abd)){
+		gen_log(LOG_ERR_NOFAIL, "Could not find ABD $id to delete");
+		return false;
+	}
+	connectXapiByPool($abd->poolID);
+	$res = trim(xen_call("vm-param-get param-name=\"power-state\" uuid=\"$abd->uuid\""));
+	if($res != "halted"){
+		echo "ABD $id is '$res', cannot delete unless 'halted'\n";
+		return false;
+	}
+	gen_log(LOG_INFO, "Deleting ABD ID $id");
+	$res = trim(xen_call("vm-destroy uuid=\"$abd->uuid\""));
+}
+
+function haltABD($id, $purge=false){
+	$abd= getABDsFromDB($id);
+	if(empty($abd)){
+		gen_log(LOG_ERR_NOFAIL, "Could not find ABD ID $id in DB");
+		return false;
+	}
+	connectXapiByPool($abd->poolID);
+	
+	$res = trim(xen_call("vm-param-get param-name=\"power-state\" uuid=\"$abd->uuid\""));
+	if($res != "running"){
+		gen_log(LOG_ERR_NOFAIL, "ABD $id is '$res', cannot halt unless 'running'");
+		return false;
+	}
+	gen_log(LOG_INFO, "Halting ABD ID $id");
+	$res = trim(xen_call("vm-shutdown uuid=\"$abd->uuid\" force=true"));
+	echo " complete.\n";
+
+	if($purge == false){
+		return true;
+	}
+
+	echo "Deleting ABD...";
+	$res = trim(xen_call("vm-destroy uuid=\"$abd->uuid\""));
+	print_r($res);
+	echo "complete\n";
+
+}
+function putAwayWet($abd){
+	runAbdCmd($abd->ip, "pkill munger");
+	runAbdCmd($abd->ip, "rm -f /tmp/logs");
+	runAbdCmd($abd->ip, "rm -f /tmp/result*");
+	runAbdCmd($abd->ip, "rm -f /tmp/restore*");
+	runAbdCmd($abd->ip, "rm -f /tmp/job*");
+	runAbdCmd($abd->ip, "rm -f /tmp/rem*");
+}
+function scrubABD($id){
+        // we need to detach all disks and clean out any temp stuff
+	$abd= getABDsFromDB($id);
+	if(empty($abd)){ throw new Exception("Failed to find ABD $id"); }
+
+	putAwayWet($abd);
+
+	connectXapiByPool($abd->poolID);	// connects to our xen host
+
+//	$res = trim(xen_call("vm-disk-list  uuid=\"$abd->uuid\""));
+//	$res = json_decode(parse_xen_result($res), true);
+	$disks = getDisksXen($abd->uuid,true);
+
+	foreach($disks as $d){
+		if($d->userdevice ==0){ continue; }
+		unplugVBD($d->vbd_uuid);
+		deleteVBD($d->vbd_uuid);
+		deleteVDI($d->vdi_uuid);
+	}
+	// scrub user-device > 0
+	// vdi == VHD
+	// vbd is the link from vm -> vdi
+}
+
+
+
+function bootABD($id){
+	if(empty($id) || $id <= 0){
+		throw new Exception("Could not find ABD (id: $id) to boot.");
+	}
+
+	$abd= getABDsFromDB($id);
+	if(empty($abd)){
+		gen_log(LOG_ERR_NOFAIL, "Could not find ABD with id $id");
+		return;
+	}
+	connectXapiByPool($abd->poolID);
+
+	if(empty($abd)){
+		echo "Could not find your abd $id\n";
+		return;
+	}
+	
+	$res = trim(xen_call("vm-param-get param-name=\"power-state\" uuid=\"$abd->uuid\""));
+	if($res != "halted"){
+		gen_log(LOG_ERR_NOFAIL, "ABD $id is '$res', cannot boot unless 'halted'");
+		return;
+	}
+	$ip = "";
+	$msg = "Booting ABD $id ";
+	if(empty($abd->ip) || $abd->ip == "0.0.0.0"){
+		$msg .= "with DHCP";
+	}else{
+		$msg .= "with IP $abd->ip";
+		$ip = $abd->ip;
+	}
+	gen_log(LOG_DEBUG, $msg);
+	$res = trim(xen_call("vm-start uuid=\"$abd->uuid\""));
+
+	if(empty($abd->ip) || $abd->ip == "0.0.0.0"){
+		// we need to get it's IP from DHCP
+
+		$retries = 10;
+		while(true){
+			if($retries ==0){
+				unassignABD($id);
+				deleteABD($id);
+				throw new Exception("Failed to acquire ABD IP (DHCP) for ABD $id");
+			}
+			sleep(2);
+			$res = trim(xen_call("vm-param-get param-name=xenstore-data uuid=\"$abd->uuid\""));
+			if(strpos($res, "assigned-ip") !== false){
+				preg_match('/vm-data\/assigned-ip: (\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/', $res, $matches);
+                                $ip = $matches[1];
+				gen_log(LOG_INFO,"ABD $id booted.  Detected IP: $ip");
+				break;
+			}
+			$retries--;
+		}
+		// update our Appliance w/ our IP
+		updateABDIP($ip, $abd->uuid);
+	}
+	gen_log(LOG_INFO, "ABD booted with ip: $ip");
+}
+
+function deleteABDfromDB($id){
+	gen_log(LOG_INFO, "Removing DB record for ABD $id");
+	$sql = "delete from appliance where id = ?";
+	dbSet("nimbus", $sql, array($id));
+}
+
+function setIPCheckout($ip, $abdID, $state){
+	$chk = 0;
+	if($state == true){ $chk = 1; }
+        $id=0;
+	$sql = "UPDATE ABDNet set checkedOut=? where ip = ?";
+	dbSet("nimbus", $sql, array($chk, $ip));
+	// if we're checking it out, give it to the ABD.  Checking in means the ABD is dead
+//echo "setting $ip for abd $abdID\n";
+	if($state){
+		updateABDIP($ip, $abdID);
+	}
+}
+
+function updateABDIP($ip, $uuid){
+	$sql = "UPDATE Appliance set ip=? where uuid = ?";
+	dbSet("nimbus", $sql, array($ip, $uuid));
+}
+function getFreeABD($poolID){
+        $abds= getABDsFromDB();
+	foreach($abds as $a){
+		if($a->vmOwner != 0){ continue; }
+		else if($a->poolID != $poolID){ continue; }
+		else if(!vmExistsXen($a->uuid)){
+			deleteABDfromDB($a->ID);	// this ABD doesn't exist!  don't hand it out again.
+			continue;
+		}
+		return $a;
+	}
+	$id = provisionABD($poolID);
+	return getABDsFromDB($id);
+}
+
+function assignABDbyPool($poolID, $vmid){
+        $flock = qflock("/tmp/abd_fl_$poolID", 60);     // wait 1 minute for flock?
+        try{
+		$chk = getAbdByVm($vmid);
+		if(!empty($chk)){ throw new Exception("VM (ID: $vmid) is already assigned to ABD $chk->ID.  Is this VM in another active job?"); }
+		connectXapiByPool($poolID);
+		$abd = getFreeABD($poolID);
+		if(!is_numeric($abd->ID) || $abd->ID <= 0){
+			if (strstr($abdID, "No available IP") !== false || $abdID == -1){ $abdID = "No available IPs to provision a new ABD. Please add more"; }
+			throw new Exception("Failed to assign ABD for VM.  Error: $abd->ID");
+		}
+		abdAssign($abd->ID, $vmid);
+        }finally{ qunflock($flock);}
+        echo $abd->ID;
+        return $abd->ID;
+}
+
+function assignABD($id, $vmid){
+	$abd= getABDsFromDB($id);
+	if(empty($abd)){
+		gen_log(LOG_ERR_NOFAIL, "Could not find ABD with id $id");
+		return;
+	}else if($abd->vmOwner > 0){
+		if ($abd->vmOwner == $vmid){ 
+			gen_log(LOG_DEBUG, "No-op: ABD $id already assigned to VM $vmid");
+			return; 
+		}
+		throw new Exception("ABD $id is already assigned to VMID: $abd->vmOwner");
+	}
+	abdAssign($id, $vmid);
+	gen_log(LOG_DEBUG, "ABD $id assigned to VM $vmid");
+	echo $abd->ID;
+}
+function unassignABD($id){
+	if($id == 0){ return; }
+
+	$abd= getABDsFromDB($id);
+	if(empty($abd)){
+		gen_log(LOG_ERR_NOFAIL, "Could not find ABD with id $id");
+		return;
+	}
+	abdAssign($id, 0);
+	gen_log(LOG_DEBUG, "ABD $id free for use");
+}
+function unassignABDbyVM($vmid){
+	$abds= getABDsFromDB();
+	foreach($abds as $a){
+		if($a->vmOwner == $vmid){
+			abdAssign($a->ID, 0);
+			gen_log(LOG_DEBUG, "ABD $a->ID free for use");
+			return;
+		}
+	}
+}
+function abdAssign($id, $vmid){
+	$sql = "UPDATE Appliance set vmOwner=? where id = ?";
+	dbSet("nimbus", $sql, array($vmid, $id));
+}
+
+function setABDNetInfo($abdID, $newAbdUUID, $ourNet){
+	if(empty($ourNet) || $ourNet->ip == "0.0.0.0"){
+		$rez = xen_call("vm-param-set xenstore-data:\"vm-data/dhcp=true\" uuid=\"$newAbdUUID\"");
+	}else{
+		xen_call("vm-param-set xenstore-data:\"vm-data/ip=$ourNet->ip\" uuid=\"$newAbdUUID\"");
+		xen_call("vm-param-set xenstore-data:\"vm-data/nm=$ourNet->netmask\" uuid=\"$newAbdUUID\"");
+		xen_call("vm-param-set xenstore-data:\"vm-data/gw=$ourNet->gateway\" uuid=\"$newAbdUUID\"");
+		xen_call("vm-param-set xenstore-data:\"vm-data/dns=$ourNet->dns\" uuid=\"$newAbdUUID\"");
+		xen_call("vm-param-set xenstore-data:\"vm-data/hostname=abd\" uuid=\"$newAbdUUID\"");
+		xen_call("vm-param-set xenstore-data:\"vm-data/domain=alikebackup.com\" uuid=\"$newAbdUUID\"");
+	}
+}
+
+function addABD($guy, $poolID, $ourNet){
+	$id=0;
+		$vers = 24;
+		$name = "New ABD";
+		global $reservedSrId;
+		// ID|name|uuid|poolID|version|ip|netmask|gateway|dns|netID|SRuuid|parentUuid|motion|vmOwner|publicIP|MAC
+		$sql = "INSERT into Appliance (name, uuid, poolID, version,netID,SRuuid,motion,MAC,vmOwner )  values(?,?,?,?,?,?,1,?,-2)";
+		$id = dbSet("nimbus", $sql, array($name, $guy,$poolID, $vers, $ourNet->netID, $reservedSrId,$ourNet->MAC));
+		$sql = "UPDATE Appliance  set name=? where id=?";
+		$name = "ABD $id";
+		dbSet("nimbus", $sql, array($name, $id));
+
+		$rez = xen_call("vm-param-set name-label=\"$name\" uuid=\"$guy\"");
+
+        return $id;
+}
+
+function setVif($uuid, $net){
+	// $net has poolID, netID, and maybe MAC
+	$vif = xen_call("vm-vif-list", "uuid=\"$uuid\"");
+	$vif = json_decode(parse_xen_result($vif), true);
+	$vif = $vif[0];
+	// we need to delete the vif and make a new one ( b/c MAC is read-only)
+	$vid = $vif["uuid"];
+	if(!empty($vid)){
+		$rez = xen_call("vif-destroy", "uuid=\"$vid\"");
+	}
+	$rez = xen_call("vif-create", "network-uuid=\"$net->netID\"", "MAC=\"$net->MAC\"", "device=0", "vm-uuid=\"$uuid\"");
+}
+
+function cloneVMfromTemplate($abdName){
+	global $reservedSrId;
+	$template = getAbdTemplateName();
+	$rez = xen_call("vm-install", "new-name-label=\"$abdName\"", "template=\"$template\"");
+        $uuid = trim($rez);
+	return $uuid;
+}
+
+// blank for pool means DHCP, otherwise check the "checkedOut" field
+function getABDNets($poolID=null){
+	$sql = "SELECT * from ABDNet order by poolid";
+	if($poolID != null){
+		$sql = "SELECT * from ABDNet where poolid = ?";
+	}
+	if($poolID== null){
+		return dbGet("nimbus", $sql);
+	}else{
+		return dbGet("nimbus", $sql, array($poolID) );
+	}
+}
+
+function getABDNetFromDB($id){
+	$sql = "SELECT * from ABDNet where ID=?";
+	return dbGet("nimbus", $sql, array($id));
+}
+
+function getAbdByVm($vmid){
+	$sql = "SELECT * from appliance where vmOwner=?";
+	return dbGet("nimbus", $sql, array($vmid));
+}
+
+function getABDsFromDB($id=null){
+	if($id != null){
+		$sql = "SELECT * from appliance where ID=?";
+		return dbGetOne("nimbus", $sql, array($id));
+	}
+	$sql = "SELECT * from appliance order by poolid";
+	return dbGet("nimbus", $sql);
+}
+
+// Find all deployed ABDs and clean them out
+function cullABDs($hostId){
+	global $reservedSrId;
+        global $nfsBase;
+
+	$abdBase = getABDVhdUuid();
+	
+	echo "Cleaning out Xen and local DB...\n";
+	dropABDs();	// deletes all and checks in IPs
+
+	echo "Cleaning out local SR...\n";
+	// this is the dangerous part
+
+	$sr = "$nfsBase/base/xen/$reservedSrId";
+	echo "Scanning $sr\n";
+
+	$baseFile = "$sr/$abdBase.vhd";
+	if(!file_exists($baseFile)){
+		echo "ABD VHD not found! Expecting:\n";
+		echo "$baseFile\n";
+		return;
+	}
+	$inf = xen_vdiMeta($baseFile);
+	if($inf["type"] == 3){
+		gen_log(LOG_INFO, "No SR cleanup needed.  No avhds have been made from base vhd.");
+		return;
+	}
+
+	// Now we know we have avhds to descent
+	$actualBase = basename($inf["pPath"], ".vhd");
+	echo "Actual Base file: $actualBase \n";
+	echo "Orig Base file: $abdBase \n\n";
+	
+	$vdis = array();	// this will hold all the ABD related vhds
+
+	$files = glob("$sr/*.vhd", GLOB_BRACE);
+	echo "Looping through all VHDs in SR...\n";
+	foreach($files as $file) {
+		$vdi =  basename($file, ".vhd");
+		if($vdi == $abdBase){
+			echo "We found the original base! $abdBase\n";
+			array_push($vdis, $vdi);
+		}else if($vdi == $actualBase){
+			echo "We found the actual base! $actualBase\n";
+			array_push($vdis, $vdi);
+		}else{
+			try{
+				$meta = xen_vdiMeta($file);
+				if($meta["type"] != 3){
+					$par = basename($meta["pPath"], ".vhd");
+					if($par == $actualBase || $par == $abdBase){
+						echo "ABD File: $file $vdi\n";
+						array_push($vdis, $vdi);
+					}
+				}
+			}catch(Exception $ex){
+				gen_log(LOG_ERR_NOFAIL,"Xen error: ". $ex->getMessage() );
+			}
+		}
+	}
+
+	$out = findVMsFromVdis($vdis);
+
+	// this will delete the ABDs and templates
+	
+	// now go to xen and find/kill anyone using our ABD VHDs
+	foreach($out as $h){
+		xen_connect($h["host"]);	
+		foreach($h["vms"] as $vm){
+			echo "Destroying: ". $vm["name"] ."\n";
+			$res = xen_call("vm-destroy uuid=".$vm["vm"]);
+			print_r($res);
+		}
+	}
+
+	foreach($vdis as $v){
+		$testo = "$sr/$v.vhd";
+		if(file_exists($testo)){
+			exec("rm $testo");
+		}
+	}
+	// to recover from this, we will need to re-import from abdAdmin to get the ABD VHD back in the SR
+}
+
+function findVMsFromVdisOnHost($vdis, $h){
+	$top['host'] = $h->name;
+	$top['vms'] = array();
+	xen_connect($h->hostID);
+
+	try{
+		if(hasInstaSr() == false) { return null; }
+	}catch(Exception $ex){
+		gen_log(LOG_ERR_NOFAIL,"Unable to clean ABDs: Xen has errors with our SR: ". $ex->getMessage() );
+		exit(1);
+	}
+
+
+	$rez = parse_xen_result(xen_call("vbd-list", "params=vdi-uuid,vm-uuid,vm-name-label"));
+	$rez = json_decode($rez, true);
+	foreach($rez as $e) {
+		$vm = $e['vm-uuid'];
+		$name = $e['vm-name-label'];
+		$vdi = $e['vdi-uuid'];
+		if(in_array($vdi, $vdis)) {
+			$foo = array();
+			$foo['vm'] = $vm;
+			$foo['name'] = $name;
+			array_push($top["vms"],$foo);
+			$hostName = $h->name;
+			gen_log(LOG_DEBUG, "Found $name ($vm) on our SR (on host $hostName) ");
+		}
+	}
+	return $top;
+}
+
+function findVMsFromVdis($vdis){
+        global $reservedSrId;
+        global $nfsBase;
+        $out_data = array();
+        $hosts = array();
+        $hids = getPoolMasters();
+        foreach($hids as $hid){ array_push($hosts, getHost($hid) ); }
+        foreach($hosts as $h) {
+		$top = findVMsFromVdisOnHost($vdis, $h);
+		if(!is_null($top)){
+			array_push($out_data,$top);
+		}
+        }
+        return $out_data;
+}
+
+// find all KNOWN  (from DB) provisioned ABDs and delete them
+function dropABDs($force = false){
+	$sql = "SELECT * from appliance order by poolid";
+	$all = dbGet("nimbus", $sql);
+	foreach($all as $row){
+		if($row->vmOwner != 0 && $force ==false){
+			gen_log(LOG_INFO, "Skipping ABD $row->ID since it is being actively used (force not enabled)");
+			continue;
+		}
+		haltABD($row->ID, false);
+		deleteABD($row->ID);
+	}
+	$sql = "UPDATE abdNet set checkedout=0";
+	dbSet("nimbus", $sql);
+}
+
+function importABD($hostId){
+	if($hostId > 0){
+		return doPoolImport($hostId);
+	}else{
+		$all = getPoolMasters();
+		foreach($all as $hid){
+			echo "Connecting to hostid: $hid\n";
+			xen_connect($hid);
+			$h = getHost($hid);
+			if(!hasInstaSr()){
+				plugInstaSr($hid, $h->uuid);
+				scanSr($hid);
+			}
+			if(!hasInstaSr()){
+				throw new Exception("Could not Plug Alike SR to host: $hid");
+			}
+			gen_log(LOG_INFO, "ABD import for $hid");
+			doPoolImport($hid);
+		}
+	}
+}
+
+function getABDVhdUuid(){
+	global $reservedSrId;;
+	$vhdUuid = substr_replace($reservedSrId, "abdabd",0,6);
+	return $vhdUuid;
+}
+
+function getAbdTemplateName(){
+	global $reservedSrId;;
+	$abdName = "A3 ABD Template_" . substr($reservedSrId, -4);
+	return $abdName;
+}
+
+function findAndDestroyTemplates(){
+	$name = getAbdTemplateName();
+	$q = "template-list name-label=\"$name\"";
+	$res = json_decode(parse_xen_result(trim(xen_call($q))));
+	foreach($res as $r){
+		gen_log(LOG_WARNING, "Removing pre-exising ABD template: $r->uuid");
+		$q = "template-uninstall template-uuid=$r->uuid force=true";
+		xen_call($q);
+	}
+}
+function checkForExistingTemplate(){
+	$name = getAbdTemplateName();
+        $q = "template-list name-label=\"$name\"";
+        $res = json_decode(parse_xen_result(trim(xen_call($q))), true);
+	if(empty($res)){
+		return false;
+	}
+	$ret = array();
+	foreach($res as $r){
+		$out = new stdClass();
+		$out->name = $r["name-label"];
+		$out->desc = $r["name-description"];
+		$out->uuid = $r["uuid"];
+		array_push($ret, $out);
+	}
+	return $ret;
+}
+function validateTemplate($uuid){
+	$cmd = "template-param-list uuid=$uuid";
+        $res = trim(xen_call($cmd));
+        $inf = json_decode(parse_xen_result($res), false);
+	if(empty($inf[0]->uuid)){
+		throw new Exception("ABD Template has no disks!");
+	}
+
+        $cmd = "vbd-list vm-uuid=$uuid";
+        $res = trim(xen_call($cmd));
+        $inf = json_decode(parse_xen_result($res), true);
+        $vdi = $inf[0]["vdi-uuid"];
+	if(empty($vdi)){
+		throw new Exception("ABD Template has no VDI!");
+	}
+
+
+//	$cmd = " vdi-list vbd-uuids=". $inf[0]->VBDs;
+//        $res = trim(xen_call($cmd));
+//        $inf = json_decode(parse_xen_result($res), false);
+//	if(empty($inf[0]->uuid)){
+//		throw new Exception("ABD Template has no VDI!");
+//	}
+//	$vdi = $inf[0]->uuid;
+	global $reservedSrId;
+	$fp = "/mnt/instaboot/sr/xen/$reservedSrId/$vdi".".vhd";
+	if(!file_exists($fp)){
+		throw new Exception("Local Alike SR has no ABD template VHD.  Re-import the template, or restart the A3 to correct this.");
+	}
+	return true;	
+}
+
+function doPoolImport($hostId){
+	global $reservedSrId;;
+	$srId = $reservedSrId;
+
+	$h = getHost($hostId);
+
+	xen_connect($hostId);
+	$temps = checkForExistingTemplate();
+        if(!empty($temps)){
+		try{
+			validateTemplate($temps[0]->uuid);
+		}catch(Exception $ex){
+			array_push($temps, new stdClass());     // make it kill things if we have a bad template
+		}
+        }
+
+	if($temps !== false){
+		if(count($temps) ==1){
+			$tempUuid = $temps[0]->uuid;
+			gen_log(LOG_INFO, "Xen Pool already has an ABD Template ($tempUuid). Refreshing DB.");
+			setABDImage($tempUuid, $h->poolID, $srId, 25);
+			return;
+		}else{
+			gen_log(LOG_WARNING, "Multiple ABD templates found in pool ($h->poolID).  Cleaning up now.");
+			$res = deleteIdleABDs($h->poolID);
+			if($res ==1){
+				gen_log(LOG_ERR, "Failed to remove running ABD(s).  Are they part of a running job?");
+				return;
+			}
+			findAndDestroyTemplates();
+		}
+	}else{
+		gen_log(LOG_INFO, "No ABD template found in pool.  Deploying now.");
+	}
+
+	$vhdUuid = getABDVhdUuid();
+
+	$abdDesc = "\"Template for the A3 ABDs\"";
+	# Configurable settings for the ABDs
+	$cpu = 2;
+	$mem = 268435456;
+
+	$xen_params = array(
+		"VCPUs-max" 		=> "$cpu",
+		"VCPUs-at-startup" 	=> "$cpu",
+		"name-description" 	=> "$abdDesc",
+		"memory-static-max" 	=> "$mem",
+		"memory-dynamic-max"    => "$mem",
+		"memory-dynamic-min"    => "$mem",
+		"memory-static-min"     => "$mem",
+	);
+
+
+	//gen_log(LOG_WARNING, "A3 SR not found on host.  Plugging in...");
+	plugInstaSr($hostId, $h->uuid);	
+
+	try{
+		if(!plugSrPbds()){
+			gen_log(LOG_ERR_NOFAIL, "A3 SR not properly initialized.  Please check logs for details");
+			return;
+		}
+	}catch(Exception $ex){
+		gen_log(LOG_ERR_NOFAIL, "A3 SR has errors: ". $ex->getMessage());
+		return;
+	}
+
+	copyVhdIfNeeded($vhdUuid, $srId);	// copys the vhd and scans the sr as needed
+	if(!vdiExists($vhdUuid)){ throw new Exception("Xen could not find ABD template VHD after scan"); }
+
+	$abdName = getAbdTemplateName();
+	gen_log(LOG_DEBUG, "ABD Template name: $abdName ");
+	// Create the VM
+	$rez = makeBlankVmXen($abdName, $srId);
+	gen_log(LOG_DEBUG, "Made blank Vm from empty template. Result: $rez");	
+	$rez = trim($rez);
+	if(stripos($rez, "invalid") !== false) {
+		throw new Exception("Cannot create a new VM on SR $srId, Xen returned $rez");
+	}else if(strpos($rez, "No templates matched") !== false){
+                throw new Exception("Failed to provision ABD from template: $rez");
+        }
+	$uuid = $rez;
+
+	$rez = xen_call("vm-param-set", "uuid=$uuid", "is-a-template=true" );
+	gen_log(LOG_INFO, "ABD Template created with UUID: $uuid ");	
+
+
+	foreach($xen_params as $k => $val) {
+		gen_log(LOG_DEBUG, "Setting Xen param $k=$val");
+		$rez =xen_call("vm-param-set", "uuid=$uuid", "$k=$val");
+		logWarningOnNonEmpty($rez, "vm-param-set $k=$val");
+	}
+
+	$i=0;
+	$network = guessAXenNetwork();
+	if(empty($network)) {
+		gen_log(LOG_WARNING, "No appropriate Xen network found for VM $uuid VIF ");
+	}
+	gen_log(LOG_INFO, "Creating VIF for device $i on network $network for vm $uuid with no mac ");
+	$rez = xen_call("vif-create", "device=$i", "network-uuid=$network", "vm-uuid=$uuid" );
+	$rez = trim($rez);
+	if(stripos($rez, "invalid") !== false) {
+		gen_log(LOG_WARNING, "cannot create a new VIF for VM $uuid, Xen returned $rez");
+	}
+
+	$rez = xen_call("sr-scan uuid=$srId");
+	gen_log(LOG_DEBUG, "Attaching VHD ($vhdUuid) to ABD ($uuid) $rez");
+	try{
+		attachDiskToVmXen($uuid, $vhdUuid, true, 0);
+	}catch(Exception $ex){
+		if(stripos($ex->getMessage(), "VM_metrics") !== false) {
+                        gen_log(LOG_ERR, "Xen threw (probably erroneous) exception while attaching VDI: ". $ex->getMessage());
+                }
+	}
+	gen_log(LOG_DEBUG, "Updating DB with new ABD template ($uuid)");
+	setABDImage($uuid, $h->poolID, $srId, 24);
+}
+
+function guessAXenNetwork() {
+	$rez = xen_call("network-list params=uuid");
+	$lines = preg_split("/\r\n|\n|\r/", $rez);
+	$uuids = array();
+	foreach($lines as $l) {
+		//echo "Line is: $l\n";
+		$splits = preg_split("/\:/", $l);
+		if(count($splits) > 1){
+			$ud = trim($splits[1]);
+			//echo "Split found! $ud\n";
+			array_push($uuids, $ud);
+		}
+	}
+	$good_uuids = array();
+	foreach($uuids as $u) {
+		$rez = xen_call("network-param-list", "uuid=$u");
+		//echo "Rez is $rez\n";
+		if(stripos($rez, "host internal") || stripos($rez, "host_internal")) {
+			//echo "Skipping host-internal vileness!\n";
+			continue;
+		}
+		array_push($good_uuids, $u);
+	}
+	if(count($good_uuids) == 0) {
+		return "";
+	}
+	return $good_uuids[0];
+}
+function copyVhdIfNeeded($vhdUuid, $srId){
+	echo "COPYING ABD VHD\n";
+	$abdFile = "/home/alike/Alike/ext/abd.dat.7z";
+	$vhdFile = $vhdUuid.".vhd";
+	$vhdPath = "/mnt/instaboot/sr/xen/$srId";
+	$full = "$vhdPath/$vhdFile";
+	//  ABD's VHD is missing from the SR Share. Copy it up for us, please
+	if(!file_exists("$full")){
+		echo "Copying ABD image to NFS SR\n";
+		exec("7za e $abdFile -o$vhdPath/");
+		exec("mv $vhdPath/0.vhd $full");
+		exec("chown nobody.nogroup $full");
+		exec("chmod 664 $full");
+		echo "Requesting Xen SR Scan of NFS SR\n";
+		$rez = xen_call("sr-scan uuid=$srId");
+		$res =xen_call("vdi-param-set uuid=$vhdUuid name-label='A3 ABD System Disk'") ;
+		echo "Copied ABD VHD and Finished scanning SR ($rez) $res\n";
+	}else{
+		echo "ABD Image exists in SR\n";
+	}
+}
+function logWarningOnNonEmpty($rez, $deets) {
+	 if(empty(trim($rez)) == false) {
+     		gen_log(LOG_WARNING, "Xen returned error $rez for $deets");
+       	}
+}
+
+
+function getAllPools(){
+	$sql = "SELECT distinct poolid from Host where virtType=2";
+	return dbGetArray("nimbus", $sql);
+}
+
+function listABDDisks() {
+	global $reservedSrId;
+        global $nfsBase;
+
+        $abdBase = getABDVhdUuid();
+        $sr = "$nfsBase/base/xen/$reservedSrId";
+        $baseFile = "$sr/$abdBase.vhd";
+        if(!file_exists($baseFile)){
+		gen_log(LOG_WARNING, "$baseFile does not exist, assuming no ABDs are deployed yet");
+		return array();
+	}
+        $inf = xen_vdiMeta($baseFile);
+        if($inf["type"] == 3){
+		gen_log(LOG_WARNING, "$baseFile exists, but is a type-3 VDI, and thus does not have children");
+		return [$baseFile];
+        }
+
+        $actualBase = basename($inf["pPath"], ".vhd");
+        $vdis = array();
+        $files = glob("$sr/*.vhd", GLOB_BRACE);
+        foreach($files as $file) {
+		$vdi =  basename($file, ".vhd");
+                if($vdi == $abdBase){
+                        array_push($vdis, $vdi);
+                }else if($vdi == $actualBase){
+                        array_push($vdis, $vdi);
+                }else{
+                        $meta = xen_vdiMeta($file);
+                        if($meta["type"] != 3){
+                                $par = basename($meta["pPath"], ".vhd");
+                                if($par == $actualBase || $par == $abdBase){
+                                        array_push($vdis, $vdi);
+                                }
+                        }
+                }
+
+        }
+	return $vdis;
+}
+
+function deleteIdleABDs($poolID=0){
+	$res = 0;
+	$abds = getABDsFromDB();
+	$cnt =0;
+	foreach($abds as $a){
+		if($poolID != 0 && $a->poolID != $poolID){ continue; }
+		if($a->vmOwner ==0){
+			if(!deleteABD($a->ID)){ $res = 1; }
+			$cnt++;
+		}
+	}
+	if($cnt ==0){
+		gen_log(LOG_INFO, "No idle ABDs found");
+	}
+	return $res;
+}
+
+// Call with extreme caution- only updates the DB state
+function resetAllABDs(){
+	$sql = "UPDATE ABDNet set checkedOut=0";
+	dbSet("nimbus",$sql);
+	$sql = "DELETE from Appliance";
+	dbSet("nimbus",$sql);
+}
+
+/////////////////////////////////////// These calls all assume you're connected to XAP ////////////////////////////////////////////////
+
+// non-destructive way to remove disks from an ABD... unless you call delete=true
+function detachDisksFromABD($abdUuid, $delete=false){
+	gen_log(LOG_DEBUG, "Calling detachDisksFromABD ");
+	$disks = getDisksXen($abdUuid, true);
+
+        foreach($disks as $d){
+                if($d->userdevice ==0){ continue; }
+                $res =unplugVBD($d->vbd_uuid);
+                if(strpos($res, "xenopsd internal error") !== false){
+			gen_log(LOG_WARNING, "Xen/XAPI Failure unpluging VBD: $res");
+			return cleanAbdSafe($abdUuid, true);
+                }
+
+                deleteVBD($d->vbd_uuid);
+		if($delete){
+			deleteVDI($d->vdi_uuid);
+		}
+        }
+}
+// We should already be connected to the right Xapi host!
+function cleanAbdSafe($uuid, $force=false){
+	gen_log(LOG_DEBUG, "Checking for stray VBDs on ABD (safe) ");
+        $disks = getDisksXen($uuid,true);
+	if(count($disks) == 1){ 
+		gen_log(LOG_DEBUG, "ABD only has 1 disk (system), no action required");
+		return;
+	}
+	if($force){ 
+		gen_log(LOG_DEBUG, "Halting ABD for cleanup");
+		$res = trim(xen_call("vm-shutdown force=true uuid=\"$uuid\"")); 
+	}
+
+        foreach($disks as $d){
+                if($d->userdevice ==0){ continue; }
+		if($force == false){
+			try{
+				gen_log(LOG_DEBUG, "Found VBD!  Unplugging now.  ". print_r($d));
+				unplugVBD($d->vbd_uuid);
+			}catch(Exception $ex){
+				gen_log(LOG_DEBUG, "Error unplugging VBD (".$ex->getMessage()."). Will try again");
+				return cleanAbdSafe($uuid, true);
+			}
+		}
+                deleteVBD($d->vbd_uuid);
+        }
+	if($force){
+		gen_log(LOG_DEBUG, "Starting ABD post cleanup");
+		$res = trim(xen_call("vm-start uuid=\"$uuid\""));
+		sleep(10);
+	}
+}
+
+function checkAndMoveABD($abdUuid, $targetUuid){
+	$res = trim(xen_call("vm-param-get param-name=\"possible-hosts\" uuid=\"$targetUuid\""));
+	$possible = explode("; ", $res);
+	$state = trim(xen_call("vm-param-get param-name=\"power-state\" uuid=\"$abdUuid\""));
+	if($state  != "running"){
+		gen_log(LOG_INFO,"Booting ABD");
+		$res = trim(xen_call("vm-start uuid=\"$abdUuid\""));
+	}
+	$abdHostUuid = trim(xen_call("vm-param-get param-name=\"resident-on\" uuid=\"$abdUuid\""));
+	if(!in_array($abdHostUuid, $possible)){
+		echo "We need to move our ABD!\n";
+
+		$winner = $possible[0];
+		gen_log(LOG_INFO,"Migrating ABD to suitable host ($winner)");
+		echo trim(xen_call("vm-migrate host-uuid=\"$winner\" uuid=\"$abdUuid\""));
+	}
+
+}
+
+function validateABD($abd){
+	$uuid = getAbdUuidRaw($abd->ip);
+	$tries = 30;
+	while(empty($uuid)){
+		sleep(1);
+		$tries--;
+		$uuid = getAbdUuidRaw($abd->ip);
+		if($tries <= 0){ 
+			xen_call("vm-shutdown uuid=\"$abd->uuid\" force=true");
+			deleteVmXen($abd->uuid);
+                        forgetABD($abd->ID);
+			throw new Exception("Failed to validate ($uuid) ABD $abd->id after 30 seconds."); 
+		}
+	}
+	if($uuid != $abd->uuid){
+		throw new Exception("ABD $abd->ID has a uuid mis-match ($uuid, expected: $abd->uuid)");
+	}
+	checkAbdHealth($abd);
+	gen_log(LOG_DEBUG,"ABD $abd->ID passed validation ($abd->ip -- $uuid)");
+}
+
+function prepAbdForJob($ip){
+	$cmd = "rm /tmp/job*";
+	runAbdCmd($ip, $cmd);
+	$cmd = "rm /tmp/result*";
+	runAbdCmd($ip, $cmd);
+	$cmd = "rm /tmp/logs/*";
+	runAbdCmd($ip, $cmd);
+	abdMountADS($ip);
+	$uuid = getAbdUuidRaw($ip);
+	$disks = getDisksXen($uuid, false);
+	$num = count($disks);
+        if($num != 1){
+		gen_log(LOG_DEBUG, "Found $num disks on fresh ABD.  Scrubbing.");
+		detachDisksFromABD($uuid);
+	}
+}
+
+function getAbdUuidRaw($ip){
+	$cmd = "/usr/bin/xenstore-read vm | tr '/' ' ' | awk {'print $2'}";
+	return trim(runAbdCmd($ip, $cmd));
+}
+
+// dev should be xvdb, not /dev/xvdb
+function checkDeviceExists($ip, $dev){
+	$cmd = "test -b /dev/$dev && echo \"1\" || echo \"0\"";
+	$res = runAbdCmd($ip, $cmd);
+	if($res == "1" || $res == 1){ return true; }
+	return false;
+}
+function checkFileExists($ip, $file){
+	$cmd = "test -f $file && echo \"1\" || echo \"0\"";
+	$res = runAbdCmd($ip, $cmd);
+	if($res == "1" || $res == 1){ return true; }
+	return false;
+}
+
+// a simple function to calculate how much free mem you need to run munger PER DISK
+function checkMemRequired($bsKB){
+	$memNeeded = ($bsKB * 6 * 2) + 20480;	// we use 6 dualBuffs and munge takes ~20MB on its own
+	return $memNeeded;
+}
+function getFreeKb($ip){
+	$cmd = "free -k | awk 'NR==2 {print $7}'";
+	return trim(runAbdCmd($ip, $cmd));
+}
+
+?>

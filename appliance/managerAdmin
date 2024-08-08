@@ -1,0 +1,115 @@
+#!/usr/bin/php -q
+<?php
+include_once("/usr/local/sbin/common_lib");
+include_once("/usr/local/sbin/manager_lib");
+include_once("/usr/local/sbin/shared_lib");
+$me = pathinfo(__FILE__, PATHINFO_FILENAME);
+
+if($argc < 2){ usage(); }
+if($argv[1] != "import" ){ usage(); }
+
+
+if($argv[1] == "import"){
+	doNimbusImport();
+}
+
+function usage(){
+        echo "Usage: [import] <args>\n";
+        echo "\timport: Imports required settings from nimbus.db to manager.db\n";
+        exit(1);
+}
+
+// we are full stack, pulling things in from an existing nimbus
+// headless guys don't use manager.db
+function doNimbusImport(){
+
+	$node_mode =getNodeMode();
+	if($node_mode !=2){
+		echo "Only full stack nodes need this update\n";
+		return;
+	}
+
+	$mdb = getMgrDB();	// this will make the DB since it shouldn't exist yet
+
+
+
+	$ip = "127.0.0.1";
+	$guid = getInstallID();
+	$welcome = getSetting("welcomeShown");
+	$pass = getSetting("a3ManagerPass");
+	$hostIP = getSetting("hostIP");
+	$maxOn = getSetting("numVersions");
+	$maxOff = getSetting("numVersionsOffsite");
+	$email = getSetting("smtpToAddress");
+	$apiKey = getSetting("apiKey");
+	$logLevel = getSetting("debugLevel");
+	if(empty($apiKey)){
+		$apiKey = strtoupper(substr(str_shuffle(str_repeat('0123456789abcdefghijklmnopqrstuvwxyz', 16)), 0, 16));
+		setSetting("apiKey", $apiKey);
+	}
+	setSettingMgr("apiKey", $apiKey);
+
+	// we store a few mgr settings in nimbus only on fullstack
+	// this is b/c the mgr.db is ephemeral and must be recreated on boot
+	$poll = getSetting("jobPollSec");
+	setSettingMgr("jobPollSec", $poll);
+	$dbSync = getSetting("dbSyncSec");
+	setSettingMgr("dbSyncSec", $dbSync);
+	$wsTime = getSetting("wsTimeout");
+	setSettingMgr("wsTimeout", $wsTime);
+	$sess = getSetting("sessionTimeout");
+	setSettingMgr("sessionTimeout", $sess);
+
+	setSetting("welcomeShown", $welcome);
+	setSetting("managerIP", $ip);
+	setSettingMgr("managerIP", $ip);
+	setSettingMgr("numVersions", $maxOn);
+	setSettingMgr("numVersionsOffsite", $maxOff);
+	setSettingMgr("debugLevel", $logLevel);
+
+	if(empty($pass)){
+		$pass = "reserved";
+		setSetting("a3ManagerPass", $pass);
+	}
+	$id = doAddA3($guid, $ip, $pass, "Local A3");
+	$a3 = getA3ByGuid($guid);
+	syncHosts($a3);
+	syncA3($a3);
+	// pull in and renumber any remote gfs profiles
+	//$s = getGfsRemote($a3);
+
+//	$gfs = getGFSProfiles();
+
+	$db = getMgrDB();
+	try{
+	$agents = getAllPhysicalVms();
+	foreach($agents as $a){
+		// add the agents into the manager.db
+		// id , guid , name , powerState , hostUUID , poolID , ipaddress , type , state , totalSize , authProfile , accessIP , maxOnsite , maxOffsite , lastJobResult , lastJobID , lastSuccess
+		$sql = "INSERT or REPLACE into vms VALUES(NULL,?,?,?,2,'',?,?,10,2,?,?,?,?,?,0,0,0)";
+		$st = $db->prepare($sql);
+		$size = 0;	// we don't know this yet
+		$res = $st->execute(array($a3->id, $a->UUID, $a->VMName, $a->poolID, $a->accessIP, $size, $a->authProfile, $a->accessIP, $a->maxVersions, $a->maxVersionsOffsite ));
+
+
+	}
+	}
+	catch(Exception $ex){
+		echo "Failed to rehydrate Agents table (".$ex->getMessage()."\n";
+	}
+        $hosts = getAllHosts();
+        foreach($hosts as $h){
+                if($h->key == 'licensed'){
+                        $sql = "UPDATE hosts set licensed=1 where guid=?";
+                        $st = $db->prepare($sql);
+                        $res = $st->execute(array($h->uuid));
+                }
+        }
+
+	unset($db);
+
+
+	syncSub();
+}
+
+?>

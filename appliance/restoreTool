@@ -1,0 +1,886 @@
+#!/usr/bin/php -q
+<?php
+
+include_once("engine_common");
+include_once("hv_common");
+include_once("phys_common");
+include_once("xen_common");
+include_once("abd_common");
+
+$me = pathinfo(__FILE__, PATHINFO_FILENAME);
+if($argc < 2){ usage(); }
+
+pcntl_signal(SIGTERM, 'killHandler');
+
+
+
+$jobId=null;
+$vmId=null;
+$hostId=null;
+$srId=null;
+$ts=null;
+$quickRest=null;
+
+// Parse our arguments
+$args = array();
+for($i=0; $i < $argc; $i++ ){
+	if($argv[$i] == "-j"){
+		if($argc > $i){
+			$i++;
+			$jobId = $argv[$i];
+		}	
+	}
+	else if($argv[$i] == "-v"){
+		if($argc > $i){
+			$i++;
+			$vmId = $argv[$i];
+		}	
+	}
+	else if($argv[$i] == "-h"){
+		if($argc > $i){
+			$i++;
+			$hostId = $argv[$i];
+		}	
+	}
+	else if($argv[$i] == "-t"){
+		if($argc > $i){
+			$i++;
+			$ts = $argv[$i];
+		}	
+	}
+	else if($argv[$i] == "-s"){
+		if($argc > $i){
+			$i++;
+			$srId = $argv[$i];
+		}	
+	}
+	else if($argv[$i] == "-r"){
+		if($argc > $i){
+			$i++;
+			$gorp = $argv[$i];
+			$quickRest = parseMagic($gorp);
+		}	
+	}
+}
+
+function parseMagic($fn){
+	if(!file_exists($fn)){
+		exit(1);
+	}
+	$gorp = json_decode(file_get_contents($fn));
+	$vm = getVMSimple($gorp->vmUuid);	
+	global $vmId ;
+	$vmId = $vm->VMID;
+	return $gorp;
+}
+
+
+if(!is_numeric($jobId) || !is_numeric($vmId)){
+	usage();
+	exit();
+}
+$GLOBALS["__insta_job_id"] = $jobId;
+$GLOBALS["__insta_vm_id"] = $vmId;
+
+function usage(){
+        echo "Usage: -v <vmID> -j <jobID> [-h <hostID> -t <timestamp> -s <srID> for Rep Initials only]\n";
+        exit();
+}
+
+
+// Now that setup is done, let's do the actual work
+try{
+	$res=null;
+
+	if($quickRest){
+		$res = doQuickRestore($quickRest, $jobId);
+	}else if($ts != null && $hostId != null ){
+		$res = doRestoreDirect($vmId, $hostId, $ts, $jobId, $srId);
+	}else{
+		$res = doRestore($vmId, $jobId);
+	}
+	exit($res);
+}catch(Exception $ex){
+	gen_log(LOG_ERR_NOFAIL, $ex->getMessage() );
+	exit(1);
+}
+
+
+// make sure the ADS is mounted and connect to your preferred hypervisor/agent
+function checkEnv($h){
+	if(!file_exists("/tmp/jads.status")){
+		throw new Exception("ADS is not mounted, or in an inconsistent state.  Restores can't run until this is resolved. (jads.status is missing)");
+	}
+	if($h->type ==2){ 					// Xen
+		connectXapiByPool($h->poolID);
+		gen_log(LOG_DEBUG, "Connected to Xen $h->poolID");
+	} else{ 						// HV
+		$hostIP = $h->name;
+		gen_log(LOG_DEBUG, "Connected to Hyper-v host agent $hostIP");
+		$st = agentStatus($hostIP);	// check our HV host
+		if(empty($st) || !is_object($st)){
+			throw new Exception("Failed to connect to HV host agent! ($hostIP)");
+		}
+		echo "Host agent: $st->version\n"; 
+	}
+}
+
+function doRestore($vmId, $jobId){
+	$pre = time();
+	$vmUuid = getVMUuid($vmId);
+	$vm = getVMSimple($vmUuid);
+	$j = getJob($jobId);
+	if(!isVMinJob($vm, $j)){
+		throw new Exception("VM ($vm->name) is not a part of this job($j->name)!");
+	}
+
+	// we handle only 2 kinds of restores: instaBoot (Xen), full (HV)
+
+	$topMsg = "Processing: $vm->name (ID $vm->VMID) ";
+        $veid = addJobLog($topMsg,3, $j->jobID, 0);
+	$logState =0;
+
+	try{
+		$opt = getVmOptsFromSchedule($j->scheduleID, $vmId);
+		if(is_null($opt)){
+			throw new Exception("Failed to find VM options in job (vmid:$vmId, jobid: $j->jobID)");
+		}
+		$h = getHost($opt->hostID);
+		checkEnv($h); // Check for ADS status and connect to host/agent/etc.  Also sets up XAPI connection if needed
+		if($h->type ==3){
+			// HV
+			doRestoreHV($vmId, $j,$h, $opt);
+		}else{
+			// Xen
+			doRestoreXen($vmId, $j, $h, $opt);
+		}
+		if(checkForCancel($j->jobID)){
+			$msg = "$topMsg Finished (Cancelled)";
+			updateJobLog($msg, 2, $veid);
+		}else{
+			$msg = "$topMsg Compelete.";
+			updateJobLog($msg, 0, $veid);
+		}
+
+		gen_log(LOG_INFO,"Restore of $vm->name Complete.");
+	}catch(Exception $ex){
+		$logState =1;
+		addJobLog("ERROR: ". $ex->getMessage(),1, $j->jobID, $vm->VMID);
+		return 1;
+	}finally{
+		$st = "[Complete]";
+		if($logState ==1){ $st = " [Failed]"; }
+		else if($GLOBALS["hasWarnings"] ==1){ $st = " [Complete, with warnings]"; $logState =2; }
+		updateJobLog("$topMsg $st",$logState, $veid);	// always update the top line job entry 
+	}
+	return 0;
+
+}
+
+function doQuickRestoreHV($h, $gorp, $jobID){
+	$hostIP = $h->hostName;
+
+	$vmUuid = $gorp->vmUuid;
+	$vm = getVMSimple($vmUuid);
+	$offsite =false;
+	if($gorp->ds  ==1 ){ $offsite = true; }
+	$restInf = getRestInfo($vm->VMID, $vmUuid, $gorp->ts );
+	$restoreFsPath = $restInf->restoreDir;
+
+	$ecl = restoreFsBasePathToEclFile($restoreFsPath);
+	gen_log(LOG_DEBUG, "Fetching Meta from ECL: $ecl");
+	$meta = engine_getMetaInfoDecoded($ecl);
+
+	return doRestoreHVReal($vm->VMID, $jobID, $hostIP, $meta, $gorp->vhd, $restoreFsPath);
+}
+function doRestoreHV($vmId, $j, $h, $opt){
+	$hostIP = $h->name;
+	echo "Restore to HV\n";
+	// do all the stuff we need to for HV?
+	$vmUuid = getVMUuid($vmId);
+	$vm = getVMSimple($vmUuid);
+
+	$restInf = getTSForRestore($vmId,$vmUuid, $j);
+	$restoreFsPath = $restInf->restoreDir;
+	
+	$opt = getVmOptsFromSchedule($j->scheduleID, $vmId);
+	gen_log(LOG_INFO, "Beginning restore of $vm->name to Hyper-V host: $h->name siteID: $restInf->siteId ($restoreFsPath)");
+	$vhdPath = $opt->srID;
+
+	$ecl = restoreFsBasePathToEclFile($restoreFsPath);
+	gen_log(LOG_DEBUG, "Fetching Meta from ECL: $ecl");
+	$meta = engine_getMetaInfoDecoded($ecl);
+
+	return doRestoreHVReal($vmId, $j->jobID, $hostIP, $meta, $vhdPath, $restoreFsPath);
+}
+
+
+function doRestoreHVReal($vmId, $jobID, $hostIP, $meta, $vhdPath, $restoreFsPath, $vmName=""){
+
+	$genType =1;	// <-- get from meta blob.  1= gen1, 2=gen2
+	foreach($meta->platform as $k){
+		if($k == "Microsoft:Hyper-V:SubType:2=true" ){ $genType =2; }
+	}
+	if(!empty($vhdPath) && !is_numeric($vhdPath) ){
+		echo "Restore to: $vhdPath\n";
+		echo agentMakeFolder($hostIP, $vhdPath, true);
+		gen_log(LOG_DEBUG, "Restore to Custom PATH: $vhdPath");
+	}else{
+		$vhdPath = getDefaultVhdPathHV($hostIP);
+		gen_log(LOG_DEBUG, "Restore to DEFAULTVHD PATH: $vhdPath");
+	}
+	$files = array();
+	if($genType ==2){
+		$files = glob("$restoreFsPath/*.vhdx", GLOB_BRACE);
+	}else{
+		$files = glob("$restoreFsPath/*.vhd", GLOB_BRACE);
+	}
+	gen_log(LOG_DEBUG, "VM is a Gen $genType");
+	gen_log(LOG_INFO, "Restoring VM's disks to Hyper-v host");
+	$remoteFiles = array();
+	$i =0;
+	// this primes the pump, so that the total progress knows about all the drive sizes up front
+	// this is needed since we do the drives single-file
+	foreach($files as $vhd){
+		$byteSize = filesize($vhd);
+		updateProgTmpFile($jobID, $vmId, $i, 0, $byteSize);
+		$i++;
+	}
+	$i=0;
+	foreach($files as $vhd){
+		$byteSize = filesize($vhd);
+		$sz = bytesToString($byteSize);
+		$fn = "Alike_restore-".$jobID."_".$vmId."_". basename($vhd);
+		$remote = $vhdPath ."\\$fn";	// agentUpload takes unix slashes
+		echo "Upload $vhd  [$sz] to $remote\n";
+		gen_log(LOG_INFO, "Restoring disk $i: ". basename($fn) ." [$sz]");
+		$st = time();
+		$msg = "Restoring Disk $i: ";
+		$eid = addJobLog($msg ." <Pending>",3, $jobID, $vmId);
+
+		$pid = pcntl_fork();
+                if($pid ==0) {
+			showHVProgress($eid, $msg, $jobID, $vmId, $i, $byteSize);
+                        exit(0);
+                }
+
+		$out = agentUploadFileWin($hostIP, $vhd, $remote, $eid);
+		gen_log(LOG_DEBUG, "Results: $out");
+                pcntl_waitpid($pid, $status, WNOHANG);
+                if(posix_getpgid($pid)){
+                        sleep(3);
+                        posix_kill($pid,0);
+                }
+
+		$total = time() - $st;
+		echo "Uploaded $sz in $total seconds\n";
+		array_push($remoteFiles, $remote);
+		$i++;
+	}
+	if(empty($vmName)){
+		$vmName = $meta->name ."_Alike_restore";
+	}
+	$memoryMB = $meta->memory / 1024 / 1024;
+	gen_log(LOG_INFO, "Data transfer complete.  Creating new VM $vmName");
+	$uuid = createVmHV($hostIP, $vmName, $genType, $meta->numCPUs, $memoryMB, $remoteFiles);
+
+	gen_log(LOG_INFO, "Restore complete.");
+	return 0;
+}
+
+function doQuickRestore ($gorp, $jobId ){
+	// we need to figure out if we're a HV or xen restore, then the destUuid could be a pool or host
+	$h = null;
+	$allHosts = getAllHosts();
+	foreach($allHosts as $g){
+		if($gorp->destUuid == $g->uuid){
+			$h = $g;
+			break;
+		}
+	}
+	if($h == null){
+		$pools = getAllPools();
+		foreach($pools as $p){
+			if($gorp->destUuid == $p){
+				$m = getPoolMasters($p);	
+				$h = getHost($m[0]);
+				break;
+			}
+		}
+	}
+	if($h == null){
+		throw new Exception("Couldn't find restore destination: $gorp->destUuid");
+	}
+	$type = $h->type;
+	if(!isset($h->type)){
+		$type = $h->virtType;
+	}
+	if($type == 3){
+		return doQuickRestoreHV($h, $gorp, $jobId);
+	}else if($type ==2){
+		return doQuickRestoreXen($h, $gorp, $jobId);
+	}else{
+		throw new Exception("Unknown Host type ($h->virtType) for restore destination.");
+	}
+}
+function doQuickRestoreXen($h, $gorp, $jobID){
+	$j = getJob($jobID);
+	xen_connect($h->hostID);
+	$vmUuid = $gorp->vmUuid;
+	$vm = getVMSimple($vmUuid);
+	$offsite =false;
+	if($gorp->ds  ==1 ){ $offsite = true; }
+	$restInf = getRestInfo($vm->VMID, $vmUuid, $gorp->ts );
+try{
+	$sr = getSR($gorp->sr);
+}catch(Exception $ex){
+print_r($ex);
+exit();
+}
+	$newName = $vm->name ."-Alike_Restore";
+
+	if(isset($gorp->disks)){
+		if(!is_array($gorp->disks)){
+			$val = $gorp->disks;
+			$gorp->disks =[];
+			array_push($gorp->disks, $val );
+		}
+		$tmp = [];
+		foreach($gorp->disks as $d){
+			if(isset($restInf->disks[$d])){
+				$tmp[] = $restInf->disks[$d];
+			}
+		}
+		$restInf->disks = $tmp;
+	}
+
+	// we need to pass in the network (uuid) from the gorp
+
+	$resUuid = null;
+	if($gorp->sr == "AlikeSR"){
+		$restUuid = doInstaBoot($vm->VMID, $h->hostID, $j, $restInf, $gorp->network);
+	}else{
+		$restUuid = doRestoreXenReal($vm->VMID, $restInf, $sr, $newName, $jobID, $h->hostID, $gorp->network);
+	}
+	if($restUuid == null){ return 1; }
+	return 0;
+}
+
+// new home for instaboot jobs
+function doInstaBoot($vmId, $hostId, $j, $restInf, $network){
+	$restUuid = instaBootVm($vmId, $hostId, true, $restInf->ts, $restInf->siteId, "", true, $network);
+	return $restUuid;
+}
+
+// used only for replication to create the initial
+function doRestoreDirect($vmId, $hostID, $ts, $jobID, $srID ){
+	$h = getHost($hostID);
+	if($h->type ==2){
+		return doRestoreXenDirect($vmId, $hostID, $ts, $jobID, $srID );
+	}else if($h->type ==3){
+		return doRestoreHvDirect($vmId, $hostID, $ts, $jobID, $srID );
+	}
+}
+function doRestoreHvDirect($vmId, $hostID, $ts, $jobID, $srID ){
+	$h = getHost($hostID);
+        $vmUuid = getVMUuid($vmId);
+        $vm = getVMSimple($vmUuid);
+        $restInf = getRestInfo($vmId, $vmUuid, $ts );
+	$restoreFsPath = $restInf->restoreDir;
+        $j= getJob($jobID);
+        $opt = getVmOptsFromSchedule($j->scheduleID, $vmId);
+
+	$ecl = restoreFsBasePathToEclFile($restoreFsPath);
+	gen_log(LOG_DEBUG, "Fetching Meta from ECL: $ecl");
+	$meta = engine_getMetaInfoDecoded($ecl);
+
+        $newName = $vm->name ."-Alike Replica";
+	$res = doRestoreHVReal($vmId, $jobID, $h->name, $meta, $srID, $restoreFsPath, $newName);
+        $success = true;
+	$restUuid = null;
+        if($res != 0){ $success = false; }
+	else{
+		$restUuid = getVmUuidHv($h->name, $newName);
+	}
+	
+        $tmp = new stdClass();
+        $tmp->results = $success;
+        $tmp->uuid = $restUuid;
+        file_put_contents("/tmp/rep_rest_$vmId.json", json_encode($tmp));
+}
+
+function doRestoreXenDirect($vmId, $hostID, $ts, $jobID, $srID ){
+	xen_connect($hostID);
+	$vmUuid = getVMUuid($vmId);
+	$vm = getVMSimple($vmUuid);
+	$restInf = getRestInfo($vmId, $vmUuid, $ts );
+	$sr = getSR($srID);
+        $j= getJob($jobID);
+        $opt = getVmOptsFromSchedule($j->scheduleID, $vmId);
+
+	$newName = $vm->name ."-Alike_Restore";
+	$restUuid = doRestoreXenReal($vmId, $restInf, $sr, $newName, $jobID, $hostID, $opt->network);
+	$success = false;
+	if($restUuid != null){ $success = true; }
+	$tmp = new stdClass();
+	$tmp->results = $success;
+	$tmp->uuid = $restUuid;
+	file_put_contents("/tmp/rep_rest_$vmId.json", json_encode($tmp));
+}
+
+function doRestoreXen($vmId, $j, $h, $opt){
+	echo "Restore to Xen\n";
+	xen_connect($opt->hostID);
+
+	$vmUuid = getVMUuid($vmId);
+	$vm = getVMSimple($vmUuid);
+	$sr = null;
+	if($opt->srID != "AlikeSR"){
+		$sr = getSR($opt->srID);
+	}
+	$newName = $vm->name ."-Alike_Restore";
+
+	//$ts = getTSForRestore($vmId,$vmUuid, $j);
+	$restInf = getTSForRestore($vmId,$vmUuid, $j);
+
+
+	addJobLog("Preparing VM VDIs for restore (Source path: $restInf->restoreDir)", 0, $j->jobID, $vmId);
+
+	$success = false;
+	$restUuid = null;
+	if($opt->srID == "AlikeSR"){
+		$restUuid = doInstaBoot($vmId, $opt->hostID, $j, $restInf, $opt->network);
+	}else{
+		$restUuid=  doRestoreXenReal($vmId, $restInf, $sr, $newName, $j->jobID, $opt->hostID, $opt->network);
+	}
+	if($restUuid != null){ $success=true; }
+
+	if($success==true && array_key_exists("boot", $j->Options ) && $j->Options["boot"]==1 && $suspend_vdi == null){ 
+		$res = startVmXen($restUuid);
+		gen_log(LOG_INFO, "Starting VM: $newName ($restUuid) - $res");
+	}
+	if($success){
+		addJobLog("Restore complete.  New VM named: $newName", 0, $j->jobID, $vmId);
+	}else{
+		addJobLog("Restore incomplete!  Restored VM may still exist: $newName", 2, $j->jobID, $vmId);
+	}
+}
+
+function doRestoreXenReal($vmId, $restInf, $sr, $newName, $jobID, $hostID, $network="sandbox"){
+
+	$suspend_vdi = null;
+	$restUuid = null;
+	try{
+		$msg = "Restoring VM with name: $newName (using Xen net $network)";
+		addJobLog($msg, 0, $jobID, $vmId);
+		$restUuid = makeRestoredVMXen($restInf, $newName, $network, $hostID);
+		if($restUuid == null){
+			throw new Exception("Failed to provision new VM for restore");
+		}
+		$i=0;
+		foreach($restInf->disks as $d){
+			if($d->diskType ==2){ 
+				$suspend_vdi = $d->filename;
+			}else{
+				// this will, in theory, throw if there's no space, etc from Xen
+				$vdi = createVdiForVm($restUuid, $d->fullsize, $sr->uuid, $d->name, $d->description );
+				xen_call("vbd-create", "vdi-uuid=$vdi", "vm-uuid=$restUuid", "device=$i");
+				$d->vdi = $vdi;
+			}
+			$i++;
+		}
+		addJobLog("Restore preparation complete", 0, $jobID, $vmId);
+	}catch(Exception $ex){
+		addJobLog("Failed to provision local restore structures", 1, $jobID, $vmId);
+		addJobLog("Error: ".$ex->getMessage(), 1, $jobID, $vmId);
+		return;
+	}
+	gen_log(LOG_INFO, "Beginning data transfer data to Xen SR");
+
+	$fl = getJobLockFile($jobID."-".$vmId."_lck");
+	exec("echo 0 > $fl");
+	$fp = fopen($fl, "r+");
+	$pids = array();
+
+	$success=false;
+	try{
+		$i =0;
+		foreach($restInf->disks as $d){
+			if($d->diskType == 2){ continue; }
+			else if(checkForCancel($jobID)){ break; }
+			incrementLocked($fp,$fl);
+			$pid = pcntl_fork();
+			if($pid ==0) {
+				restoreDiskXen($d, $i, $jobID, $vmId);
+				exit(0);
+			}
+			$i++;
+			array_push($pids, $pid);
+			sleep(2);	// time for progress task to spin up
+		}
+	}catch(Exception $ex){
+		addJobLog("Xen Error: ". $ex->getMessage(), 1, $jobID, $vmId);
+	}
+	$nv = readLocked($fp,$fl);
+	gen_log(LOG_DEBUG,"Num processors: $nv");
+	while($nv > 0){
+		sleep(1);
+		$nv = readLocked($fp,$fl);
+		if(checkForCancel($jobID) ){
+			gen_log(LOG_WARNING,"Detected cancel request for job.  Issuing stop to workers");
+			sleep(2);
+			foreach($pids as $p){
+				$res = shell_exec("kill $p");
+				gen_log(LOG_DEBUG,"Killing pid $p res: $res");
+				sleep(1);
+			}
+			foreach($restInf->disks as $d){
+				$res = shell_exec("pkill -f $d->vdi");
+				gen_log(LOG_DEBUG,"Cancelling vdi upload: $d->vdi res: $res");
+				sleep(1);
+			}
+			break;
+		}
+	}
+	foreach($pids as $p){  pcntl_waitpid($p,$status, WNOHANG); }    // un-zombify our children
+	gen_log(LOG_DEBUG,"Completed locked loop.");
+
+
+	if(!checkForCancel($jobID)){
+		$success=true;
+		if($suspend_vdi != null){
+			// we need to start, then suspend this guy, then clobber it's suspend_vdi with our own
+			addJobLog("Attempting to recover system state/memory for: $newName", 0, $jobID, $vmId);
+			startVmXen($restUuid);
+			doMemoryDance($restUuid, $suspend_vdi);
+		}
+	}
+	return $restUuid;
+
+}
+
+function restoreDiskXen($d, $i, $jobID, $vmID){
+        try{
+		if($d->diskType == 2){ return; }
+		else if(checkForCancel($jobID)){ return; }
+		$pid = pcntl_fork();
+		if($pid ==0) {
+			showVHDUploadProgress($jobID, $vmID, $i, $d->fullsize);
+			exit(0);
+		}
+		$out = "Pending";
+		$maxSize = 2199023255552;
+		$maxSize = 1024;
+		if($d->fullsize > $maxSize){
+			gen_log(LOG_DEBUG, "Transferring disk (raw): ". $d->rawname);
+			$out = uploadRaw($d->rawname, $d->vdi);
+		}else{
+			gen_log(LOG_DEBUG, "Transferring disk: ". $d->filename);
+			$out = uploadVhd($d->filename, $d->vdi);
+		}
+		gen_log(LOG_DEBUG, "Upload finished. Result: $out");
+		pcntl_waitpid($pid, $status, WNOHANG);
+        }catch(Exception $ex){
+                addJobLog("Xen Error: ". $ex->getMessage(), 1, $jobID, $vmID);
+        }finally{
+                if(posix_getpgid($pid)){
+                        sleep(1);
+                        exec("kill $pid");
+                }
+                gen_log(LOG_DEBUG, "Progress pid $pid (Disk $i) should now be done.");
+
+                $fl = getJobLockFile($jobID."-".$vmID."_lck");
+                if(file_exists($fl)){
+                        $fp = fopen($fl, "r+") or die("Couldnt open lock file");
+                        decrementLocked($fp, $fl);
+                        fclose($fp);
+                }
+	}
+}
+
+function cleanInstaVm($uuid, $j, $vmId){
+        global $reservedSrId;
+        global $nfsBase;
+        $base = "$nfsBase/base/xen/$reservedSrId";
+
+        addJobLog("Cleaning local temporary VDIs", 4, $j->jobID, $vmId);
+        $res = xen_call("vbd-list vm-uuid=$uuid");
+        $vbds = json_decode(parse_xen_result($res), true);
+        xen_call("vm-destroy uuid=$uuid");
+        foreach($vbds as $v){
+                if(strpos($v["vdi-uuid"], "in database") !== false){
+                        continue;       // skip blanks
+                }
+                $vhd =  "$base/".$v["vdi-uuid"].".vhd";
+
+                //$meta = xen_vdiMeta($vhd);
+                //$who = shell_exec("whoami");
+                $cmd = "sudo rm $vhd";
+                $out = shell_exec($cmd);
+                echo "Deleting $vhd ($out)\n";
+                addJobLog("$cmd == ($out)", 4, $j->jobID, $vmId);
+
+                //$parent = "$base/".$meta["pPath"];
+                //$cmd = "rm $parent";
+                //$out = shell_exec($cmd);
+                //addJobLog("Parent: $cmd == ($out)", 4, $j->jobID, $vmId);
+                //echo "Deleting Parent: $parent ($out)\n";
+        }
+}
+
+
+function getTSForRestore($vmId, $vmUuid, $j){
+
+        $ts =0;
+        $version =0;
+        foreach($j->vmsInJob as $v){
+                if($v->VMID == $vmId){
+                        $ts = $v->VM_Version;
+                        break;
+                }
+        }
+	if($ts ==0){ 
+		throw new Exception("Failed to find version for VM in Restore Job settings. Please edit/recreate the job.");
+	}
+	$prefOffsite = false;
+	if(array_key_exists("preferOffsite", $j->Options ) && $j->Options["preferOffsite"]==1){ 
+		$prefOffsite = true;
+	}
+	return getRestInfo($vmId, $vmUuid, $ts, $prefOffsite);
+}
+
+function getRestInfo($vmId, $vmUuid,$ts, $prefOffsite=false){
+	$out = new stdClass();
+	$out->ts =$ts;
+	$out->restorePath = "";
+	$out->restoreDir = "";
+	$out->siteId = 0;
+	$adsName = getRestorePathName($vmUuid,0);	// this comes back w/ the full path w/o the ts
+	$odsName = getRestorePathName($vmUuid,1);	// this comes back w/ the full path w/o the ts
+	$afp = $adsName ."/$out->ts";
+	$ofp = $odsName ."/$out->ts";
+	if($prefOffsite){ 
+		if(file_exists("$ofp/info.meta")){
+			$out->restoreDir = $ofp;
+			$out->restorePath = "$ofp/$out->ts";
+			$out->siteId = 1;
+			$inf = json_decode(file_get_contents("$ofp/info.meta"));
+			$out->ecl = $inf->ecl;
+		}else if(file_exists("$afp/info.meta")){
+			$out->restoreDir = $afp;
+			$out->restorePath = "$afp/$out->ts";
+			$out->siteId = 0;
+			$inf = json_decode(file_get_contents("$afp/info.meta"));
+			$out->ecl = $inf->ecl;
+			gen_log(LOG_WARNING, "Restore from offsite vault requested, but backup version is only available onsite ($out->ts)");
+		}else{
+			throw new Exception("Failed to find backup version for VM ($out->ts)!");
+		}
+	}else{
+		if(file_exists("$afp/info.meta")){
+			$out->restoreDir = $afp;
+			$out->restorePath = "$afp/$out->ts";
+			$out->siteId = 0;
+			$inf = json_decode(file_get_contents("$afp/info.meta"));
+			$out->ecl = $inf->ecl;
+		}else if(file_exists("$ofp/info.meta")){
+			$out->restoreDir = $ofp;
+			$out->restorePath = "$ofp/$out->ts";
+			$out->siteId = 1;
+			$inf = json_decode(file_get_contents("$ofp/info.meta"));
+			$out->ecl = $inf->ecl;
+			gen_log(LOG_INFO, "Restoring from Offsite Vault ($out->ts)");
+		}else{
+			throw new Exception("Failed to find backup version for VM ($out->ts)!");
+		}
+
+	}
+	$out->disks = getDiskInRfs($out->restoreDir, $out->ecl);
+
+	$out->meta =  json_decode(trim(shell_exec("instaAdmin extractMeta $out->ecl")));
+	return $out;	
+}
+
+function getDiskInRfs($path, $ecl){
+	$out = array();
+	$files = glob("$path/*.vhd", GLOB_BRACE);
+	$meta = engine_getMetaInfoDecoded($ecl);
+	$i=0;
+	foreach ($files as $vhd){
+		$d = new stdClass();
+		$img = dirname($vhd) ."/". pathinfo(basename($vhd),PATHINFO_FILENAME).".img";
+		$sz = filesize($img);
+		$d->filename = $vhd;
+		$d->rawname = $img;
+		$d->fullsize = $sz;
+		$d->diskType = $meta->VBDS[$i]->devicetype;
+		$d->device = $meta->VBDS[$i]->device;
+		$d->name = $meta->VBDS[$i]->name;
+
+		// Bad, just to continue testing.  For some reason the meta-info doesn't come back as a 2 
+		if($d->name == "Suspend image"){ $d->diskType = 2; }
+
+		$d->description = $meta->VBDS[$i]->description;
+		array_push($out, $d);
+		$i++;
+	}
+	return $out;
+}
+
+
+
+function isVMinJob($vm, $j){
+	foreach($j->vmsInJob as $guy){
+		if($vm->uuid == $guy->UUID){ return true; }
+	}
+	return false;
+}
+
+function showVHDUploadProgress($jobID, $vmID, $devNum, $size, $name="VDI import"){
+	$sz = bytesToString($size);
+	$blub = "$devNum [$sz]";
+
+        $e = time();
+        $vmsg = "Restoring VM disk $blub";
+        $veid = addJobLog($vmsg.", In progress",3, $jobID, $vmID);
+        sleep(1);
+        $res = xen_call("task-list");
+        $tasks = json_decode(parse_xen_result($res), true);
+        $taskUuids = array();
+        foreach($tasks as $t){
+                if($t["name-label"] == $name){
+                        $msg = "Found possible task: $name: ". $t["uuid"];
+                        gen_log(LOG_DEBUG, $msg);
+                        array_push($taskUuids, $t["uuid"]);
+                }
+        }
+        $uuid = "";
+        $created = "";
+        $winner = new stdClass();
+        $winner->uuid = "";
+        $winner->drift =10000000;
+        foreach($taskUuids as $u){
+                $res = xen_call("task-param-list uuid=$u");
+                $dets = json_decode(parse_xen_result($res), true);
+                $st = strtotime($dets[0]["created"]);
+                $d = abs($st - $e);
+                $msg= "Task: ". $dets[0]["uuid"] ." Drift: $d";
+                gen_log(LOG_DEBUG, $msg);
+                if($d < $winner->drift){
+                        $winner->uuid = $dets[0]["uuid"];
+                        $winner->drift = $d;
+                }
+        }
+        $uuid = $winner->uuid;
+        if(empty($uuid)){
+                updateJobLog("Xen failed to provide progress for VDI import task!",2, $veid);
+                return;
+        }
+	        $msg = "Task uuid: $uuid (drift: $winner->drift)";
+        gen_log(LOG_DEBUG, $msg);
+        // now we loop on that task progress and poop it to the joblog
+        while (true){
+                $res = xen_call("task-param-list uuid=$uuid");
+                // what if there's an error?  die... but what does an error look like?
+                $dets = json_decode(parse_xen_result($res), true);
+                if(!array_key_exists("progress", $dets[0])){
+                        echo "Progress: 100%\n";
+                        updateJobLog($vmsg.": 100%",0, $veid);
+                        break;
+                }
+                $prog = $dets[0]["progress"];
+                $prog *= 100;
+                $state = 3;
+                if($prog == 100){ $state = 0; }
+                updateJobLog($vmsg.": $prog%",$state, $veid);
+
+		updateProgTmpFile($jobID, $vmID, $devNum, $prog, $size);
+		
+                sleep(2);
+                if($prog >= 100){ break; }
+                if(checkForCancel($jobID)){
+                        $res = xen_call("task-cancel uuid=$u");
+                        updateJobLog($vmsg." (cancelled): $prog%",2, $veid);
+                        return false;
+                }
+        }
+
+        return $uuid;
+}
+
+
+function doMemoryDance($vmUuid, $suspend_vdi){
+	$slept = 0;
+	while(true) {
+		$rez = trim(xen_call("vm-suspend uuid=$vmUuid"));
+		gen_log(LOG_DEBUG, "VM suspend call result is: $rez");
+		if(stripos($rez, "invalid") !== false) {
+			gen_log(LOG_WARNING, "VM suspend/pause call failed with $rez");
+		} else {
+			$rez = trim(xen_call("vm-param-get", "uuid=$vmUuid", "param-name=\"power-state\""));
+			if(stripos($rez, "invalid") !== false) {
+				gen_log(LOG_ERR, "Cannot query power state for VM '$vmUuid' with error $rez");
+			} else if(strpos($rez, "suspended") === false) {
+				gen_log(LOG_DEBUG, "Waiting for suspend to kick in...");
+			} else {
+				gen_log(LOG_INFO, "Suspend SUCCESS");
+				break;
+			}
+		}
+		$slept += 10;
+		if($slept > (60 * 10)) {
+			throw ErrorException("VM not suspended after ten minutes");
+		}
+		sleep(10);
+	}
+	gen_log(LOG_DEBUG, "Suspend complete, now resetting state....");
+	$rez = trim(xen_call("vm-param-get", "param-name=suspend-VDI-uuid", "uuid=$vmUuid"));
+	if(stripos($rez, "invalid") !== false) {
+		throw new ErrorException("Cannot get suspend disk for VM '$vmUuid' with error $rez");
+	}
+	gen_log(LOG_DEBUG, "Uploading VM memory state: $suspend_vdi, to $rez");
+	$out = uploadVhd($suspend_vdi, $rez);
+	gen_log(LOG_DEBUG, "Upload results: $out");
+	$rez = trim(xen_call("vm-resume uuid=$vmUuid"));
+	if(stripos($rez, "invalid") !== false) {
+		gen_log(LOG_ERR, "Boot of VM failed with $rez");
+	}
+
+}
+
+
+function killHandler($signo) {
+	switch ($signo) {
+	case SIGTERM:
+		gen_log(LOG_DEBUG, "Process is being killed.  Cleaning up");
+		exit(0);
+		break;
+	}
+}
+
+
+function makeRestoredVMXen($restInfo, $newName, $network, $hostId){
+	$eclPath = $restInfo->ecl;
+
+        $rez = "";
+        $outCode = -1;
+        $myCmd = "/usr/local/sbin/setXenMeta $eclPath $hostId $network '".$newName."'";
+        gen_log(LOG_DEBUG, "Will issue command $myCmd");
+        exec($myCmd, $rez, $outCode);
+        if($outCode != 0) {
+               throw new ErrorException("Setting Xen metainformation failed!");
+        }
+        // Catch up our user on standard out, if needed
+        if(amIConsole()) {
+                $most = array_slice($rez, 0, -1);
+
+                foreach($most as $m) {
+                        echo "$m\n";
+                }
+        }
+        $vmUuid = trim(end($rez));
+	return $vmUuid;
+}
+
+
+?>

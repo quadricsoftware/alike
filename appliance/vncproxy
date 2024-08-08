@@ -1,0 +1,239 @@
+#!/usr/bin/php -q
+<?php
+include_once("/usr/local/sbin/xen_common");
+
+if(count($argv) < 3){
+	echo "vncproxy -l hostId listenPort vmuuid\n";
+        echo "Need to specify a port (remember that VNC is typically 5900+screenNo) that we bind to\n";
+	echo "OR you can do\n";
+	echo "vncproxy -s hostId vmuuid\n";
+	echo "This will take a snapshot of the command using vncsnapshot (which I hope you have installed....\n";
+        return;
+}
+
+$cmd = $argv[1];
+
+if(trim($cmd) === "-s") {
+	$hostId = $argv[2];
+	$vmUuid = $argv[3];
+	doScreenshot($hostId, $vmUuid);
+	return;
+}
+
+$port = $argv[3];
+$hostId = $argv[2];
+$vmUuid = $argv[4];
+
+makeVncServer($hostId, $port, $vmUuid);
+
+function makeVncServer($hostId, $port, $vmUuid) {
+	echo "Connecting to hostId $hostId for vm $vmUuid\n";
+	xen_connect($hostId);
+	$rez = xen_call("console-list vm-uuid=$vmUuid");
+	validateRez($rez);
+	$rez = trim(preg_split("/location\s\(\sRO\):/", $rez)[1]);
+	if(empty($rez)) {
+        	echo "VM $vmUuid does not have a console or cannot be located on host $hostId";
+	        return;
+	}
+	$xenHost = trim(preg_split("/\//", $rez)[2]);
+	$xenIp = $xenHost;
+	$uuid = trim(preg_split("/uuid=/", $rez)[1]);
+	$isOpaque = false;
+	if(empty($uuid)) {
+		echo "Uuid not found, looking for opaque ref instead...\n";
+		$uuid = trim(preg_split("/OpaqueRef:/", $rez)[1]);
+		if(empty($uuid)) {
+			echo "VM $vmUuid cannot be found on host $hostId because $rez does not seem to have a uuid or opaque ref for its console\n";
+			return;
+		}
+		$isOpaque = true;
+	}
+
+
+
+	// XAPI connection parameters
+	//$hostname = '192.168.1.19';
+	$host = getHost($hostId);
+	$username = 'root';
+	$password = $host->password;
+	$consolePort = 443;
+
+
+	echo "Console is running on $xenHost with console UUID $uuid\n";
+
+	// SSL context options to disable certificate verification
+	$sslOptions = array(
+	    'ssl' => array(
+        	'verify_peer' => false,
+	        'verify_peer_name' => false
+	    )
+	);
+
+	// Create a stream context with SSL options
+	$context = stream_context_create($sslOptions);
+
+	// Open a socket connection to the server using the stream context
+	$myUrl = 'ssl://' . $xenIp . ':' . $consolePort;
+	echo "Connecting at $myUrl....\n";
+	$fp = stream_socket_client($myUrl, $errno, $errstr, 30, STREAM_CLIENT_CONNECT, $context);
+
+	if (!$fp) {
+	    echo "Unable to connect socket stream o console at $myUrl: $errstr ($errno)\n";
+	    exit;
+	}
+	echo "Connection ok, sending auth\n";
+
+	// Send HTTP CONNECT request with authentication headers
+	$baseUrl = "/console?uuid=$uuid";
+	if($isOpaque) {
+		$baseUrl = "/console?ref=OpaqueRef:$uuid";
+	}
+	$request = "CONNECT $baseUrl HTTP/1.1\r\n";
+	$request .= "Host: $xenIp\r\n";
+	$request .= "Authorization: Basic " . base64_encode("$username:$password") . "\r\n";
+	$request .= "Connection: Keep-Alive\r\n\r\n";
+	
+	fwrite($fp, $request);
+
+	// Read and discard response headers
+	$foundOk = false;
+	$myBarf = "";
+	while ($line = fgets($fp)) {
+		if(trim($line) == "HTTP/1.1 200 OK") {
+			$foundOk = true;
+    		}
+		$myBarf = "$myBarf $line";
+	    	if ($line === "\r\n") {
+        		break;
+		}	
+	}	
+	if($foundOk == false){
+		echo "HTTP response does not include 200 OK, likely authentication or server problem!";
+		echo "$myBarf";
+		exit;
+	}
+	echo "Auth ok, starting server\n";
+
+	$host = '0.0.0.0';
+
+
+	// Create server socket
+	$socket = null;
+	try {
+
+	$socket = stream_socket_server("tcp://$host:$port", $errno, $errstr);
+	if (! $socket) {
+	    echo "Failed to create socket: " . socket_strerror(socket_last_error()) . "\n";
+	    exit;
+	}
+
+	echo "Server listening on $host:$port\n";
+
+	// Accept incoming connection
+	$clientStream = stream_socket_accept($socket, -1);
+	if($clientStream === false) {
+		echo "Unable to handshake with client, dying\n";
+		exit;
+	}
+
+	echo "Client connected\n";
+
+	$writeStreams = null;
+	$exceptStreams = null;
+
+	stream_set_blocking($clientStream, false);
+	stream_set_blocking($fp, false);
+
+	while(true) {
+		$readStreams = [$fp, $clientStream];
+		$writeStreams = [$fp, $clientStream];
+		if (stream_select($readStreams, $writeStreams, $exceptStreams, null) === false) {
+			echo "Unable to select streams\n";
+			break;	
+		}
+		if(in_array($clientStream, $readStreams) && in_array($fp, $writeStreams)) {
+
+			$data = stream_copy_to_stream($clientStream, $fp);
+			if(feof($clientStream)) {
+				echo "EOF on client socket reached, dying\n";
+				exit;
+			}
+			if ($data === false) {
+        			echo "Client probs disconnected.\n";
+				break;
+			}
+			echo "XFERD $data TO VNC SERVER\n";
+		
+		}
+		if(in_array($fp, $readStreams) && in_array($clientStream, $writeStreams)) {
+			$data = stream_copy_to_stream($fp, $clientStream);
+		
+			if(feof($fp)) {
+				echo "EOF on VNC socket reached, dying\n";
+				exit;
+			}
+        	        if ($data === false) {
+                        	echo "VNC server probs disconnected.\n";
+	                        break;
+        	        }
+			if($data === '') {
+				echo "Read of VNC server socket would block, which is crazy\n";
+				sleep(1);
+				continue;
+			}
+			echo "XFERED $data BYTES TO CLIENT\n";
+
+		}
+	}	
+
+
+
+	// Close client socket
+	echo "Client disconnected\n";
+	fclose($clientStream);
+
+	} finally {
+		fclose($fp);
+		fclose($socket);
+	}
+}
+
+function doScreenshot($hostId, $vmUuid) {
+	$myPort = 5901;
+	$pid = pcntl_fork();
+	if($pid == 0) {
+		// I'm the parent process
+		echo "Started child server, waiting for it to start....\n";
+		sleep(1);
+		$cmd = "vncsnapshot 127.0.0.1:1 replica.jpg";
+		echo "REQUESTING SCREENSHOT via $cmd!\n";
+
+		shell_exec($cmd);
+		$cnt = 0;
+		while(true) {
+			$res = pcntl_waitpid($pid, $status, WNOHANG);
+			if($res == -1 || $res > 0) {
+				echo "Server is done, exiting\n";
+				break;
+			}
+			sleep(1);
+			if($cnt++ > 10) {
+				echo "Waited, but child appears hung\n";
+				 posix_kill($pid, SIGTERM);
+			}
+		}
+			
+	} else {
+		makeVncServer($hostId, $myPort, $vmUuid);
+	}
+	
+}
+
+// Register signal handler
+pcntl_signal(SIGTERM, function ($signo) {
+    echo "Received SIGTERM, terminating...\n";
+    exit(1);
+});
+
+?>

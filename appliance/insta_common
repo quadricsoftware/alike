@@ -1,0 +1,1584 @@
+<?php
+
+include_once("/usr/local/sbin/common_lib");
+include_once("/usr/local/sbin/shared_lib");
+include_once("/usr/local/sbin/xen_common");
+include_once("/usr/local/sbin/engine_common");
+
+
+/*
+ * Common vars and such for instaboot
+ */
+
+$nfsBase = "/mnt/instaboot";
+$setMetaCommandPath = "/usr/local/sbin/setXenMeta";
+
+$instabootActiveFile = "/home/alike/INSTABOOT_ACTIVE";
+$instaTagVal = getInstallID();
+$reservedSrId = "a2a2a2a2-a2a2-a2a2-a2a2-a2a2a2a2a2a2";
+$scratchDisk = "/dev/xvdc1";
+
+$myConf = "$nfsBase/sr.id";
+if(file_exists($myConf == false)) {
+        gen_log(LOG_ERR, "$myConf does not exist!");
+        exit(-1);
+}
+$rez = file_get_contents($myConf);
+$json = (array) json_decode($rez);
+$reservedSrId = $json['sr-uuid'];
+$srNameLabel = $json['name'];
+//gen_log(LOG_INFO, "Reserved SR is $reservedSrId and label is $srNameLabel");
+
+
+function createUuid() {
+	return trim(`cat /proc/sys/kernel/random/uuid`);
+}
+
+function getNfsIp() {
+	return getSetting("hostIP");
+}
+
+function getUpgradeTimestamp() {
+	$foo = getSetting("orphanVdiTs");
+	if(strlen($foo) > 0) {
+		return intval($foo); 
+	} else {
+		gen_log(LOG_ERR, "Cannot find setting \"orphanVdiTs\" in nimbusdb! Is there an installation problem?");
+		return time();
+	}
+}
+
+function checkNfsService() {
+        //$rez = shell_exec("/usr/sbin/service nfs-kernel-server status");
+        //echo "$rez\n";
+        //if(stripos($rez, "Active: active")) {
+         //       return true;
+        //}
+        //return false;
+	return true;
+}
+
+
+
+/*
+ * Use this function to attach all the VDIs of a guest VM to the host
+ * $restoreFsPath should be DIR
+ * 
+ * TODO: MEMORY STATE 
+ */
+function attachVdis($eclFile, $vmUuid, $restoreFsDir, $hostId) {
+	global $reservedSrId;
+	xen_connect($hostId);
+	$xm = engine_getMetaInfoDecoded($eclFile);
+	$vbds = $xm->VBDS;
+	$index = 0;
+	// We'll return this so folks know if there is memstate
+	$myStateDisk = array();
+	$needsMemDiskState = false;
+	foreach($vbds as $d) {
+		$a = (array) $d;
+		$userdevice = $a["userdevice"];
+		if(empty($userdevice)) {
+			$userdevice = "$index";
+		}
+		$bootable = intval($a["bootable"]);
+		$name = $a["name"];
+		$desc = $a["description"];
+		//$device = $a["device"];
+		$type = intval($a["devicetype"]);
+		if($type == 2) {
+			$needsMemDiskState = true;
+			gen_log(LOG_INFO, "VM $vmUuid contains VBD metainformation for a non-disk type; will treat it as a memory-state disk ");
+		}
+		$vdiName = importVdi("$restoreFsDir/$index.vhd");
+		$vdi = trim(substr($vdiName, -40, 36));
+		gen_log(LOG_DEBUG, "VDI uuid (from filename) is: $vdi");
+		// They are going to need to know about the memory disk
+		// AND the boot disk if they are disk + mem
+		if($type == 2 || $index == 0) {
+			$tmpHash = array();
+			$tmpHash['vdiUuid'] = $vdi;
+			$tmpHash['vdiPath'] = $vdiName;
+			$tmpHash['bootPos'] = $index;
+			array_push($myStateDisk, $tmpHash);
+			// We don't need to alert Xen of the presence of this disk,
+			// since it's gonna be internals only
+			if($type == 2) {
+				continue;
+			}	
+		}	
+		if(empty($desc)) {
+			// Somewhat helpful, I suppose
+			$desc = $vdi;
+		}
+
+		$fn = "/tmp/xen.lck";
+		$fp = @fopen($fn, "w");
+		if(!$fp) {
+			$msg = "xen_call Failed to open lock file: $fn";
+			syslog(LOG_WARNING, $msg);
+		} else if(flock($fp, LOCK_EX) == false) {
+			syslog(LOG_WARNING,"xen_call Unable to flock $fn");
+		}
+		$cmd = "sr-scan uuid=$reservedSrId";
+		gen_log(LOG_DEBUG, $cmd);
+		$rez = "";
+		$rez = xen_call($cmd);
+		flock($fp, LOCK_UN);
+
+		if(stripos($rez, "invalid") !== false) {
+			throw new ErrorException("sr-scan call failed with $rez");
+		} else {
+			gen_log(LOG_DEBUG, "sr-scan returned $rez");
+		}
+		$cmd = "vdi-param-set uuid=$vdi name-label=\"$name\" name-description=\"$desc\"";
+		$rez = trim(xen_call($cmd));
+		if(stripos($rez, "invalid") !== false) {
+                        throw new ErrorException("vdi-param-set failed with $rez");
+                }
+		$cmd = "vbd-create vdi-uuid=$vdi vm-uuid=$vmUuid type=disk device=$userdevice";
+		gen_log(LOG_DEBUG, $cmd);
+		$rez = xen_call($cmd);
+		if(stripos($rez, "invalid") !== false) {
+        		throw new ErrorException("vbd-create failed with $rez");
+		}
+		if(stripos($rez, "A device with the name given already exists on the selected VM") !== false) {
+			throw new ErrorException("vbd-create failed, VM contains duplicate disks");
+		}
+		$vbd = trim($rez);
+		gen_log(LOG_INFO, "Created VBD $vbd");
+		//gen_log(DEBUG, "Ok, vbd is $vbd);
+		// These calls are unecessary because device IS userdevice in Xen now,
+		// at least in our API version
+
+		//$cmd = "vbd-param-set uuid=$vbd userdevice=$userdevice";
+		//echo "Would call $cmd\n";
+		//$rez = xen_call($cmd);
+		//if(stripos($rez, "invalid") !== false) {
+		//	gen_log(LOG_ERROR, "vbd-param-set userdevice failed, continuing anyway");
+		//}
+		$index++;
+	}
+	if($needsMemDiskState) {
+		return $myStateDisk;
+	}
+	return false;
+		
+}
+
+function cleanOrphanSymsReal($myTimestamp) {
+	$orphans = findOrphanSyms($myTimestamp);
+       	$cnt = count($orphans);
+       	if($cnt > 0) {
+       		gen_log(LOG_INFO, "Found $cnt orphaned instaboot VHDs, cleaning up");
+               	foreach($orphans as $op) {
+               		gen_log(LOG_DEBUG, "Deleting $op");
+                      	shell_exec("sudo rm $op");
+              	}
+     	}
+}
+
+
+function cleanOrphanSyms() {
+	if(file_exists("/tmp/jads.status") == false) {
+		gen_log(LOG_INFO, "Skipping cleanOrphanSyms because jads.status is not present");
+		return;
+	}
+	// Obtain upgrade timestmap OUT of the locking regime, in case
+	// of contention funny business
+	$myTimestamp = getUpgradeTimestamp();
+	// Dine with the philosophers
+	$fn = "/tmp/instaboot_lock";
+        $fp = @fopen($fn, "w");
+        if(! $fp) {
+                $msg = "Failed to open lock file: $fn";
+                throw new ErrorException($msg);
+                }
+        flock($fp, LOCK_EX);
+        try {
+		cleanOrphanSymsReal($myTimestamp);
+        } finally {
+                flock($fp, LOCK_UN);
+        }
+}
+
+function findOrphanSyms($myTimestamp) {
+	global $nfsBase;
+        global $reservedSrId;
+        $vdiDir = "$nfsBase/base/xen/$reservedSrId";
+
+	$map = instaVhdToRestoreFsPaths();
+	
+	$cmd = "ls -l $vdiDir/*.vhd 2>/dev/null |grep \">\"";
+        //echo "CMD IS: $cmd\n";
+        $foo = shell_exec($cmd);
+        //echo $foo;
+        $symsInDir = array();
+	$orphans = array();
+        foreach(preg_split("/((\r?\n)|(\r\n?))/", $foo) as $l){
+                $l = explode(" ", $l);
+                //var_dump($l);
+                $l = @trim(array_reverse($l)[2]);
+                //var_dump($l);
+                if(empty($l)) {
+                        continue;
+                }
+                //echo "L is: $l\n";
+		array_push($symsInDir, $l);	
+	
+	}
+	foreach($symsInDir as $parent) {
+		$rez = reverseLink($parent);
+        	if($rez === false) {
+			// Symlink is broken, hence orphaned
+			gen_log(LOG_INFO, "$parent is a broken symlink");
+        		array_push($orphans, $parent);
+			continue;
+		}
+        	
+	}
+	// Second pass to find VHDs whose parent is an orphan
+	$nonLinks = getInstaVhds();
+	$linkedAncestors = array();
+	foreach($nonLinks as $non) {
+		if(hasMetaParent($non) == false) {
+			//gen_log(LOG_DEBUG, "VHD $non has no VHD parent, skipping");
+			continue;
+		}
+		$parent = findSymlinkParent($non);	
+		if($parent === false) {
+			//gen_log(LOG_DEBUG, "VHD $non does not descend from a symlink, skipping it");
+			
+		} else {
+			array_push($linkedAncestors, $parent);
+			//echo "Found parent of $non: $parent\n";
+			if(in_array($parent, $orphans)) {
+				gen_log(LOG_INFO, "VHD $non has an orphaned parent symlink of $parent");
+				array_push($orphans, $non);
+			}
+		} 
+	}
+	// Third pass to find symlinks without heads at all
+	foreach($symsInDir as $parent) {
+		$rootVdi = reverseLink($parent);
+		if(in_array($rootVdi, $linkedAncestors) == false) {
+			gen_log(LOG_INFO, "Root VHD $rootVdi (sym'd to $parent) has no R/W child, thus is no longer in use");
+			array_push($orphans, $parent);
+		}
+	}
+	// Final pass to find "short" trees
+
+	//$myTimestamp = getUpgradeTimestamp();
+	//$myTimestamp = time();
+	$more = findLeaflessInstabootChains($myTimestamp);
+	$orphans = array_merge($orphans, $more);	
+	// Deal with possible dups
+	$orphans = array_unique($orphans);
+	return $orphans;
+}
+
+
+/*
+ * Import a new VDI into the instaboot area.
+ * Furnish us a path to the VHD delta on the restoreFS.
+ * If this VHD is already symlinked and delta'd, does not create a duplicate,
+ * but simply returns the existing one.
+ */
+function importVdi($restoreFsPath) {
+	// Avoid dining philosophers
+	$myTimestamp = getUpgradeTimestamp();
+	// OK to flock now
+	$fn = "/tmp/instaboot_lock";  
+	$fp = @fopen($fn, "w");
+        if(! $fp) {
+                $msg = "Failed to open lock file: $fn";
+		throw new ErrorException($msg);         
+		}
+        flock($fp, LOCK_EX);
+	try {
+		// Make sure to CLEAN UP FIRST
+		cleanOrphanSymsReal($myTimestamp);
+		return importVdiReal($restoreFsPath);
+	} finally {
+		flock($fp, LOCK_UN);
+	}
+		
+}
+
+function importVdiReal($restoreFsPath) {
+	global $reservedSrId;
+	global $nfsBase;
+
+	// Obtain size of source
+	$imgFile = substr($restoreFsPath, 0, -3);
+	$imgFile = "$imgFile"."img";
+	$sz = filesize($imgFile);
+	if($sz === false) {
+		throw new ErrorException("Cannot determine size of $imgFile");
+	}
+	$restoreSource = "restore";
+	//$rel = preg_split("/\//", $restoreFsPath);
+	//var_dump($rel);
+	//$rel = implode("/", array_slice($rel, 3));
+	//var_dump($rel);
+	
+	$linkSource = $restoreFsPath;
+	$linkDest = "$nfsBase/base/xen/$reservedSrId";
+	// Sanity-check for preexisting instaboots
+	$rez = "";
+	$findCmd = "find $linkDest -maxdepth 1 -lname $linkSource 2>&1";
+	//echo "Find Cmd is $findCmd\n";
+	exec($findCmd, $rez, $outCode);
+	$rez = implode($rez, ' '); 
+	$rez = trim($rez);
+	//var_dump($rez);
+	if($outCode > 0) {
+		throw new ErrorException($rez);
+	}
+	if(!empty($rez)) {
+		throw new ErrorException("Instaboot VHD base $linkSource already exists as $rez");
+	} 
+	$basey = createUuid();
+	//var_dump($basey);
+	$basey = $basey . ".vhd";
+	$linkDest = "$linkDest/$basey";
+	exec("sudo ln -s $linkSource $linkDest 2>&1", $rez, $outCode);
+	if($outCode > 0) {
+		throw new ErrorException(implode($rez, ' '));
+	}	
+	$parentGuid = substr($linkDest, -40, 36);
+	//echo "Parent guid is $parentGuid\n";
+	
+	/*
+         *  CODEPATH A: Return immediately, don't create stub
+         */
+
+	/*
+	return $linkDest;	
+	*/
+
+	
+	/*
+	 * CODEPATH B: Create an AVHD via Java that's R/W, hand that back to client (this way since launch)
+ 	 */
+	
+	
+	// Make the AVHD
+	gen_log(LOG_DEBUG, "Generating an AVHD child for $parentGuid");
+	
+	$guid = createUuid();
+	$javaCommand = "/home/alike/Alike/java/vhdTool.bash";
+	$avhdPath = "$nfsBase/base/xen/$reservedSrId/$guid.vhd";
+	$rez = shell_exec("sudo $javaCommand $parentGuid $avhdPath $sz");
+	// Make it so it's writable
+	$rez2 = shell_exec("sudo chown nobody.nogroup $avhdPath");
+	
+	/* 
+	return $avhdPath;
+	*/
+	
+
+	/*
+         * CODEPATH C: Snapshot the symlink or AVHD, in hopes that creates a "true" read-only base
+         */
+        $retries = 10;
+        $myReturnUuid = "";
+        $allGood = false;
+        for($x = 0; $x < $retries; ++$x) {
+                try {
+                        gen_log(LOG_INFO, "Issuing sr-scan...");
+                        $rez = xen_call("sr-scan", "uuid=$reservedSrId");
+                        gen_log(LOG_DEBUG, "SR-scan returned $rez");
+                        gen_log(LOG_DEBUG, "Snapshotting AVHD $guid");
+                        $rez = trim(xen_call("vdi-snapshot uuid=$guid"));
+                        if(stripos($rez, "invalid") !== false) {
+                                throw new ErrorException("Generation of read-only base snapshot VDI failed with $rez");
+                        } else {
+                                gen_log(LOG_DEBUG, "vdi-snapshot returned $rez");
+                        }
+                        $myReturnUuid = $rez;
+                        $allGood = true;
+                        break;
+                } catch(Exception $ex) {
+                        $barf = $ex->getMessage();
+                        gen_log(LOG_DEBUG, "Snapshot of AVHD failed with $barf, retrying....");
+                        sleep(1);
+                }
+        }
+        if($allGood) {
+                return $myReturnUuid;
+        }
+        throw new ErrorException("Generation of read-only base VDI failed after $retries retries!");
+}
+	
+
+function unplugInstaSr($hostId, $hostUuid) {
+	global $reservedSrId;
+	xen_connect($hostId);
+	try{
+		if(hasInstaSr() == false) {
+			gen_log(LOG_WARNING, "No need to uplug instaboot SR from host $hostUuid as it has none");
+			return;
+		}
+	}catch(Exception $ex){
+		gen_log(LOG_WARNING, "Our SR has errors with host $hostUuid");
+	}
+	$rez =xen_call("pbd-list sr-uuid=$reservedSrId params=uuid");
+	validateRez($rez);
+	//gen_log(LOG_DEBUG, "Rez from PBD list is: $rez");
+	$lines = preg_split("/\r\n|\n|\r/", $rez);
+        $uuids = array();
+        foreach($lines as $l) {
+                //echo "Line is: $l\n";
+                $splits = preg_split("/\:/", $l);
+                if(count($splits) > 1){
+                        $ud = trim($splits[1]);
+                        //echo "Split found! $ud\n";
+                        array_push($uuids, $ud);
+                }
+        }
+	foreach($uuids as $u) {
+		gen_log(LOG_INFO, "Unplugging PBD $u");
+		$rez = xen_call("pbd-unplug uuid=$u");
+		gen_log(LOG_DEBUG, trim($rez));
+		gen_log(LOG_INFO, "Destroying PBD $u");
+		$rez = xen_call("pbd-destroy uuid=$u");
+		gen_log(LOG_DEBUG, trim($rez));
+	}
+	gen_log(LOG_INFO, "Forgetting SR $reservedSrId");
+	$rez = xen_call("sr-forget uuid=$reservedSrId");
+	gen_log(LOG_DEBUG, $rez);
+}
+
+
+function getAllActiveHostsInPool() {
+	$rez = xen_call("host-list params=uuid");
+	validateRez($rez);
+	$lines = preg_split("/\r\n|\n|\r/", $rez);
+        $uuids = array();
+        foreach($lines as $l) {
+                //echo "Line is: $l\n";
+                $splits = preg_split("/\:/", $l);
+                if(count($splits) > 1){
+                        $ud = trim($splits[1]);
+                        //echo "Split found! $ud\n";
+                        array_push($uuids, $ud);
+                }
+	}
+	$goodguys = array();
+	foreach($uuids as $u) {
+		$rez = xen_call("host-param-get param-name=enabled uuid=$u");
+		validateRez($rez);
+		if(stripos($rez, 'true') !== false) {	
+			$goodguys[] = $u;
+		} else {
+			gen_log(LOG_ERR, "Host $u is disabled, will not be included in pool list");
+		}
+	}
+	return $goodguys;
+	
+}
+
+function obtainLooseHosts() {
+        $ehf = "/tmp/_extraHosts";
+        $extras = array();
+        if(file_exists($ehf) == false) {
+                gen_log(LOG_DEBUG, "Extra hosts file ($ehf) does not exist, will not pull it");
+        } else {
+                gen_log(LOG_DEBUG, "Found extra hosts file at $ehf, will load extras");
+                $rez = file_get_contents($ehf);
+                $lines = preg_split("/\r\n|\n|\r/", $rez);
+                foreach($lines as $l) {
+			$l = trim($l);
+			if(empty($l)) {
+				continue;
+			}
+                        array_push($extras, $l);
+                }
+        }
+        return $extras;
+
+}
+
+
+function checkAndExportAll($hostUuids) {
+	$newHosts = array();
+	foreach($hostUuids as $u) {
+		//gen_log(LOG_INFO, "About to obtain IP for $u");
+                try {
+			$rez = xen_call("host-param-get param-name=address uuid=$u");
+			validateRez($rez);
+		} catch(Exception $e) {
+			gen_log(LOG_WARNING, "Cannot obtain IP for host $u, skipping...");
+			continue;
+		}
+		$rez = trim($rez);
+		//gen_log(LOG_INFO, "Adding hosty $rez....");
+		array_push($newHosts, $rez);
+	}
+	$extras = obtainLooseHosts();
+	$extras = array_merge($extras, $newHosts);
+	$extras = array_unique($extras);
+	$barf = implode("\n", $extras);
+	$sizey = count($extras);
+	gen_log(LOG_DEBUG, "Requesting $sizey (potentially) extra host(s) to be placed in NFS exports file");
+	file_put_contents("/tmp/_extraHosts", $barf);
+	shell_exec("sudo /usr/local/sbin/setupNfs");
+	
+}
+	
+	
+/*
+ * Plug in a new instaboot SR into the host of your choice
+ */
+function plugInstaSr($hostId, $hostUuid) {
+	global $reservedSrId;
+	global $srNameLabel;
+	xen_connect($hostId);
+	// Sanity-check
+	try{
+		if(hasInstaSr()) {
+			gen_log(LOG_INFO, "Call to plugInstaSr -SR already plugged. Checking PBDs");
+			if(!plugSrPbds()){
+				gen_log(LOG_ERROR, "Failed to plug PBDs for SR!");
+				return;
+			}
+			gen_log(LOG_INFO, "SR appears to be healthly");
+			return;
+		}
+	}catch(Exception $ex){
+		gen_log(LOG_WARNING,"SR in errored state: ". $ex->getMessage() );
+	}
+	$myIp = getNfsIp();
+	gen_log(LOG_DEBUG, "Found my NFS IP is $myIp");
+	$rez = xen_call("sr-introduce", "uuid=$reservedSrId", 
+			"shared=true", "type=nfs", 
+			"name-label=$srNameLabel");
+	validateRez($rez);
+	// Determine all hosts in the pool
+	$hostUuids = getAllActiveHostsInPool();
+	checkAndExportAll($hostUuids);
+	foreach($hostUuids as $hId) {	
+		$rez = xen_call("pbd-create sr-uuid=$reservedSrId", "host-uuid=$hId", 
+				"device-config:type=nfs",
+				"device-config:server=$myIp", 
+				"device-config:serverpath=/xen",
+				"device-config:nfsversion=4"
+				);
+		validateRez($rez);
+		try {
+			if(strpos($rez, "PBD already") !== false) {
+				$barf = parse_xen_result($rez);
+				$barf = json_decode($barf);
+				$pbd = $barf[0];
+				$rez = xen_call("pbd-param-get", "uuid=".$pbd->pbd, "param-name=currently-attached");
+				$plugged = trim($rez);
+				if($plugged == "true"){
+					throw new Exception("PBD is already attached to Host");
+				}else{
+					$rez = xen_call("pbd-plug", "uuid=".$pbd->pbd );	// this can throw
+				}
+			}
+			$pbd = trim($rez);
+			gen_log(LOG_DEBUG,"PBD is: $pbd, will plug it");
+			$rez = xen_call("pbd-plug", "uuid=$pbd");
+			validateRez($rez);
+		} catch(Exception $e) {
+			throw new ErrorException("pdb-plug to host $hId failed with: ". $e->getMessage());
+		}
+	
+	}
+	gen_log(LOG_INFO, "Issuing sr-scan...");
+	$rez = xen_call("sr-scan", "uuid=$reservedSrId");
+	validateRez($rez);
+	$rez = trim($rez);
+	gen_log(LOG_DEBUG, "SR scan complete with $rez");
+	
+}
+
+function scanSr($hostId) {
+        global $reservedSrId;
+        xen_connect($hostId);
+        gen_log(LOG_INFO, "Issuing sr-scan...");
+        $rez = xen_call("sr-scan", "uuid=$reservedSrId");
+        validateRez($rez);
+        $rez = trim($rez);
+        gen_log(LOG_DEBUG, "SR scan complete with $rez");
+}
+
+
+
+function hasMetaParent($vhd) {
+	$meta = xen_vdiMeta($vhd);
+        $name = $meta["pPath"];
+        if(empty(trim($name))) {
+                return false;
+        }
+	return true;
+}
+
+function getMetaParent($vhd) {
+	if(file_exists($vhd) == false) {
+		return false;
+	}
+	$meta = xen_vdiMeta($vhd);
+        $name = $meta["pPath"];
+        if(empty(trim($name))) {
+                return false;
+        }
+	return $name;
+}
+
+function getRootVhd($vhd) {
+	$rez = getMetaParent($vhd);
+	if($rez === false) {
+		return $vhd;
+	}
+	return getRootVhd($rez);
+}
+	
+
+function findLeaflessInstabootChains($afterTime) {
+	global $nfsBase;
+        global $reservedSrId;
+        $vdiDir = "$nfsBase/base/xen/$reservedSrId";
+
+	$chains = findVhdChainsFromRestoreFsOnly($afterTime);
+	$orphans = array();
+	foreach($chains as $k => $v) {
+		if(count($v) <= 1) {
+			gen_log(LOG_INFO, "VHD chain with restoreFs root $k is too short to support an instaboot, will be deleted.");
+			$orphans[] = "$vdiDir/$k";
+			$orphans = array_merge($orphans, $v);
+		}
+	}
+	return $orphans;
+}
+
+function findVhdChainsFromRestoreFsOnly($afterTime=0) {
+	global $nfsBase;
+        global $reservedSrId;
+        $vdiDir = "$nfsBase/base/xen/$reservedSrId";
+	//$xenViewDir = "$nfsBase/sr/xen/$reservedSrId";
+	
+	$heads = findVhdChains();
+	$bad_heads = array();
+	foreach($heads as $k => $v) {
+		$realVdiName = trim(substr($k, -40, 36));
+		$realVdi = "$vdiDir/$realVdiName.vhd";
+		if(is_link($realVdi) == false) {
+			gen_log(LOG_DEBUG, "Head key $realVdi is not linked to restoreFS, ignoring this chain");
+			$bad_heads[] = $k;
+			continue;
+		} 
+		$myTime = lstat($realVdi);
+		$myTime = $myTime['mtime'];
+		//gen_log(LOG_DEBUG, "myTime is $myTime.....");
+		if($myTime <= $afterTime) {
+			gen_log(LOG_WARNING, "Head key $realVdi has modified time ($myTime) before last A3 software update ($afterTime), ignoring this chain");
+                        $bad_heads[] = $k;		
+		}
+
+	}
+	foreach($bad_heads as $b) {
+		//gen_log(LOG_DEBUG, "Nuking $b");
+		unset($heads[$b]);
+	}
+	return $heads;
+}
+	
+
+function findVhdChains() {
+	$vhdList = getInstaVhds();
+	$vhdHeads = array(); 
+	$unmatched = array();
+	foreach($vhdList as $v) {
+		$root = getRootVhd($v);
+		if(key_exists($root, $vhdHeads) == false) {
+			//gen_log(LOG_DEBUG, "VHD $v with root $root not in heads. Adding head $root");
+			$myNewArray = array();
+			$vhdHeads[$root] = $myNewArray;
+		} 
+		//gen_log(LOG_DEBUG, "VHD $root has child $v! Cool!");
+		array_push($vhdHeads[$root], $v);
+			 
+	}
+	//var_dump($vhdHeads);
+	return $vhdHeads;
+}
+	
+
+function reverseLink($parent) {
+	$cmd = "readlink -f $parent";
+        //echo "CMD is: $cmd\n";
+        $rez = "";
+        $outCode = 0;
+        exec($cmd, $rez, $outCode);
+        //var_dump($rez);
+        if($outCode > 0) {
+	        gen_log(LOG_WARNING, "Broken/missing link for $parent");
+                return false;
+        }
+        //var_dump($rez);
+        return trim(implode($rez));
+}
+
+
+function findSymlinkParent($vhd) {
+	global $nfsBase;
+        global $reservedSrId;
+        $vdiDir = "$nfsBase/base/xen/$reservedSrId";
+	if(file_exists($vhd) == false) {
+		return false;
+	}
+	$meta = xen_vdiMeta($vhd);
+	$name = $meta["pPath"];
+	if(empty(trim($name))) {
+		return false;
+	}
+	$parent = "$vdiDir/$name";
+	// REVERSE the symlink curse
+        //gen_log(LOG_DEBUG, "Testing if $parent is a symlink...");
+      	if(is_link($parent) == false) {
+        	// recurse
+		return findSymlinkParent($parent);
+      	} 
+      	return reverseLink($parent);
+}
+
+/*
+ * Returns a map of insta-vhds to restoreFS VHD paths
+ * In theory, these restoreFS paths are "actively" instabooted
+ */
+function instaVhdToRestoreFsPaths() {
+	$instaVhds = getInstaVhds();
+	$returnMe = array();
+	foreach($instaVhds as $v) {
+		 $rez = false;
+                try {
+                        $rez = findSymlinkParent($v);
+                } catch(Exception $e) {
+                        //$rez = false;
+                        gen_log(LOG_WARNING, "Error looking up VDI parent $v, will skip");
+                }
+		if($rez === false) {
+			continue;
+		}
+		$returnMe[$v] = $rez;
+	}
+	return $returnMe;
+			
+}
+
+
+/* 
+ * returns a list of insta vhds
+ */
+function getInstaVhds() {
+	global $nfsBase;
+	global $reservedSrId;
+	$vdiDir = "$nfsBase/base/xen/$reservedSrId";
+	// Ignore the symlinked vdis 
+	$cmd = "ls -l $vdiDir/*.vhd 2>/dev/null |grep -v \">\"";
+	//echo "CMD IS: $cmd\n";
+	$foo = shell_exec($cmd);
+	//echo $foo;
+	$returnMe = array();
+	foreach(preg_split("/((\r?\n)|(\r\n?))/", $foo) as $l){
+		$l = explode(" ", $l);
+		//var_dump($l);
+		$l = trim(end($l));
+		//var_dump($l);
+		if(empty($l)) {
+			continue;
+		}
+		//echo "L is: $l\n";
+		array_push($returnMe, $l);
+	}
+	return $returnMe;
+}
+
+/*
+ * Crosscheck to see if an ECL is instabooted somewhere
+ */
+function isInstaBooted($restoreFsPath) {
+	$assoc = instaVhdToRestoreFsPaths();
+	$vhd = "";
+	foreach($assoc as $k => $v) {
+		if($v == $restoreFsPath) {
+			$vhd = $k;
+			break;
+		}
+	}	
+	if(empty($vhd)) {
+		return false;
+	}
+	// Query hosts
+	$simpleVhdName = basename($vhd);
+	gen_log(LOG_DEBUG, "RestoreFS path $restoreFsPath is linked as VHD $simpleVhdName, checking if it's running in xen...");
+	
+	$allVms = listInstaVmHosts();
+	foreach($allVms as $item) {
+		$vm = $item["vm"];
+		$host = $item["host"];
+		$disks = $item["disks"];
+		foreach($disks as $d) {
+			$vdi = $d['vdi'];
+			if($vdi == $vhd) {
+				gen_log(LOG_DEBUG, "Host $host has VM $vm with VDI $simpleVhdName");
+				return true;
+			}
+		}
+	}
+	$cnt =  count($allVms);
+	gen_log(LOG_DEBUG, "Checked $cnt instaBoot host/VM/VDI tuples and found no matched for $restoreFsPath");
+	return false;
+}
+
+			
+			
+	
+
+/*
+ * Returns an array of "vm" => uuid, "host" = > uuid mappings
+ * You can use this array of mappings to list instaboot VMs and hosts
+ */
+function listInstaVmHosts() {
+	global $reservedSrId;
+	global $nfsBase;
+	$out_data = array();
+        $hosts = array();
+        $hids = getPoolMasters();
+        foreach($hids as $hid){ array_push($hosts, getHost($hid) ); }
+
+	$vdis = getInstaVhds();
+	//var_dump($vdis);
+	$vdiMap = instaVhdToRestoreFsPaths();
+	//var_dump($vdiMap);
+	$county = count($vdis);
+	$hostCount = count($hosts);
+	//gen_log(LOG_DEBUG, "Found $county VHDs on the instaboot SR, crosschecking $hostCount hosts"); 
+        foreach($hosts as $h) {
+		//var_dump($h);	
+		$hostName = $h->name;
+		xen_connect($h->hostID);
+		try{
+			if(hasInstaSr() == false) { continue; }
+		}catch(Exception $ex){
+			gen_log(LOG_ERR, "Error in (listVmHosts) hasInstaSr: ".$ex->getMessage()); 
+			continue;
+		}
+		$rez = parse_xen_result(xen_call("vbd-list", "params=vdi-uuid,vm-uuid"));
+		//gen_LOG(LOG_DEBUG, "Host $hostName returned JSON $rez");
+		$rez = json_decode($rez, true);
+		//var_dump($rez);
+		foreach($rez as $e) {
+			//gen_log(LOG_DEBUG, implode($e, ' '));
+			//$e = (array) $e;
+			$vm = $e['vm-uuid'];
+			$vdi = $e['vdi-uuid'];
+			$vdi = "$nfsBase/base/xen/$reservedSrId/$vdi.vhd";
+			//echo "Checking for $vdi\n";
+			if(in_array($vdi, $vdis)) {
+				// Some VDIs are snapshot VDIs or other rando stuff
+				if(isset($vdiMap[$vdi]) == false) {
+					//gen_log(LOG_DEBUG, "VDI map does not contain $vdi");
+					continue;
+				}
+				if(array_key_exists($vm, $out_data)) {
+					// Key already exists, that's ok, just add in more ducks
+					$foo = $out_data[$vm];
+					$disks = $foo['disks'];
+					$disk1 = array();
+					$disk1['vdi'] = $vdi;
+					$disk1['rfs'] = $vdiMap[$vdi];
+					$disk1['changedBytes'] = filesize($vdi);
+					array_push($disks, $disk1);
+					$foo['disks'] = $disks;
+					$out_data[$vm] = $foo;
+				} else {
+					// Key does not exist, create a new entry
+					$foo = array();
+					$foo['vm'] = $vm;
+					$foo['host'] = $hostName;
+					$disks = array();
+					$disk1 = array();
+					$disk1['vdi'] = $vdi;
+					$disk1['rfs'] = $vdiMap[$vdi];
+					$disk1['changedBytes'] = filesize($vdi);
+					array_push($disks, $disk1);
+					$foo['disks'] = $disks;
+					
+					$parent = $vdiMap[$vdi];
+					// Obtain metadata
+					$parts = preg_split("/\//", $parent);
+					$most = array_slice($parts, 0, -1);
+					$most = implode("/", $most);
+					$ecl = restoreFsBasePathToEclFile($most);
+					//gen_log(LOG_DEBUG, "ECL is $ecl");
+					$meta = engine_getMetaInfoDecoded($ecl);
+					//gen_log(LOG_DEBUG, "Meta is". print_r($meta, true));
+					//$meta = json_decode($meta, true);
+					$foo['meta'] = $meta;	
+					// Add in some more stuff about the boot
+					$foo['bootDate'] = filemtime($parent);
+					// Need to make an associative array
+					$out_data[$vm] = $foo;
+				}
+			}
+                }
+	}
+	// Clients expect something WITHOUT key/value pairs
+	return array_values($out_data);
+		
+}
+
+function findNonInstas(){
+        global $reservedSrId;
+        global $nfsBase;
+        $out_data = array();
+        $hosts = array();
+        $hids = getPoolMasters();
+        foreach($hids as $hid){ array_push($hosts, getHost($hid) ); }
+        $vdis = getInstaVhds();
+        $vdiMap = instaVhdToRestoreFsPaths();
+        $county = count($vdis);
+        $hostCount = count($hosts);
+        //gen_log(LOG_DEBUG, "Found $county VHDs on the instaboot SR, crosschecking $hostCount hosts");
+        foreach($hosts as $h) {
+		$top['host'] = $h->name;
+		$top['vms'] = array();
+                xen_connect($h->hostID);
+                try{
+                        if(hasInstaSr() == false) { continue; }
+                }catch(Exception $ex){
+                        gen_log(LOG_ERR, "Error in (findNon) hasInstaSr: ". $ex->getMessage());
+                        continue;
+                }
+
+                $rez = parse_xen_result(xen_call("vbd-list", "params=vdi-uuid,vm-uuid,vm-name-label"));
+                $rez = json_decode($rez, true);
+                foreach($rez as $e) {
+                        $vm = $e['vm-uuid'];
+                        $name = $e['vm-name-label'];
+                        $vdi = $e['vdi-uuid'];
+                        $vdi = "$nfsBase/base/xen/$reservedSrId/$vdi.vhd";
+                        if(in_array($vdi, $vdis)) {
+                                if(isset($vdiMap[$vdi]) == true) { continue; }  // skip known VMs
+                                $foo = array();
+                                $foo['vm'] = $vm;
+                                $foo['name'] = $name;
+                                array_push($top["vms"],$foo);
+				$hostName = $h->name;
+                                //gen_log(LOG_DEBUG, "Found $name ($vm) on our SR (on host $hostName) ");
+                        }
+                }
+		array_push($out_data,$top);
+        }
+        return $out_data;
+}
+
+
+function getLockedVersions() {
+	$map = listInstaVmHosts();
+	$out = array();
+	foreach($map as $item) {
+		$rfsDisk = $item["disks"][0]['rfs'];
+		$parts = preg_split("/\//", $rfsDisk);
+		//var_dump($parts);
+		$timestamp = $parts[5];
+		$siteId = $parts[3];
+		$most = array_slice($parts, 0, -1);
+		$most = implode("/", $most);
+		$myInfo = "$most/info.meta";
+        	if(file_exists($myInfo) == false) {
+                 	throw new ErrorException("File $myInfo not found on restoreFS!");
+        	}
+        	$cont = file_get_contents($myInfo);
+        	$matches;
+        	$pat = <<< END
+/"uuid"\s*:\s*"([^"]+)"/
+END;
+        	//echo "PAT IS $pat\n";
+        	$vmUuid = preg_match($pat, $cont, $matches);
+        	$vmUuid = $matches[1];
+		gen_log(LOG_DEBUG, "Found root VM with uuid $vmUuid");
+		$entry = array();
+		$entry["siteId"] = $siteId;
+		$entry["uuid"] = $vmUuid;
+		$entry["ts"] = $timestamp;
+		$out[] = $entry;		
+	}
+	return $out;
+}
+
+
+/*
+ * Ensure the PBDs are actually plugged in for our SR
+ */
+function plugSrPbds(){
+	global $reservedSrId;
+        $rez = xen_call("sr-param-get", "uuid=$reservedSrId", "param-name=PBDs");
+        $pbds = trim($rez);
+	if (strpos($pbds, ';') !== false) {
+		$pbds = explode(";", $pbds );
+	}else{
+		$p = $pbds;
+		$pbds = array();
+		array_push($pbds, $p);
+	}
+	if(empty($pbds)){ 
+		gen_log(LOG_ERROR, "PBD list is blank for SR! ($reservedSrId)");
+		return false; 
+	}
+	foreach($pbds as $pd){
+		$pd = trim($pd);
+		$prez = xen_call("pbd-param-get", "uuid=$pd", "param-name=currently-attached");
+		$prez = trim($prez);
+		if (strpos($prez, 'false') !== false) {
+			$prez = trim(xen_call("pbd-plug", "uuid=$pd" ));
+			gen_log(LOG_INFO, "PBD for SR required plugging! ($pd)");
+		}
+		
+	}
+	return true;
+}
+		
+
+/*
+ * Obtain the instaboot SR for a host, if it has one
+ */
+function hasInstaSr() {
+	global $reservedSrId;
+	$rez = xen_call("sr-list", "uuid=$reservedSrId", "params=uuid");
+	$rez = trim($rez);
+	if(empty($rez)) {
+		return false;
+	}
+	$rez = xen_call("sr-param-list", "uuid=$reservedSrId");
+	$rez = trim($rez);
+	$info = json_decode(parse_xen_result($rez), true);
+	if($info[0]["physical-size"] == -1){
+		throw new Exception("Xen has error with SR (inconsistent) on host: ".$info[0]['host'] );
+	}
+
+	$checkForMe = "uuid";
+	if(substr($rez, 0, strlen($checkForMe)) == $checkForMe) {
+		return true;
+	}
+	return false;
+}
+	
+	
+
+function myDie($msg){
+        gen_log(LOG_ERR,$msg);
+        //echo $msg;
+        exit(1);
+}
+
+function checkAndMakeDir($dir) {
+        if(file_exists($dir)){
+                gen_log(LOG_INFO, "Directory $dir already exists, but that's ok");
+		return;
+        }
+        if(!mkdir($dir)){ 
+		myDie("Failed to create directory: $dir\n"); 
+	}
+}
+
+function isMounted($mount) {
+	global $scratchDisk;
+	$rez = shell_exec("mount |grep $scratchDisk");
+        if(empty(trim($rez))) {
+		return false;
+	}
+	return true;
+}
+
+
+
+
+
+function isInstabootActive() {
+	global $instabootActiveFile;
+	if(file_exists($instabootActiveFile)) {
+		return true;
+	}
+	return false;
+}
+
+function toggleInstaboot($on) {
+	global $instabootActiveFile;
+	if($on) {
+		shell_exec("touch $instabootActiveFile");
+		if(isInstabootActive() == false) {
+			throw ErrorException("Touch failed of $instabootActiveFile");
+		}	
+	} else {
+		shell_exec("rm $instabootActiveFile");
+		if(instabootActive()) {
+			throw ErrorException("RM failed of $instabootActiveFile");
+		}
+	}
+}
+
+function restoreFsBasePathToEclFile($myRestoreFullPath) {
+	$myInfo = "$myRestoreFullPath/info.meta";
+	if(file_exists($myInfo) == false) {
+		throw new ErrorException("File $myInfo not found on restoreFS!");
+	}
+	$cont = file_get_contents($myInfo);
+	$matches;
+	$pat = <<< END
+/"ecl"\s*:\s*"([^"]+)"/
+END;
+	//echo "PAT IS $pat\n";
+	$eclPath = preg_match($pat, $cont, $matches);
+	$eclPath = $matches[1];
+	return $eclPath;
+}
+
+function prepareVmForRestore($uuid, $hostId, $ts, $siteId, $name, $network) {
+        return instaBootVm($uuid, $hostId, false,$ts,$siteId, $name, false, $network);
+}
+
+function instaBootVm($vmOrUuid, $hostId, $shouldBoot=true, $timestamp=0, $siteId=0, $xenRestoreName="", $checkEd=true, $network="sandbox") {
+	$ed = getEdition();
+	if($ed != 2 && $checkEd == true){
+		throw new ErrorException("Alike DR Edtion required.");
+	}
+	global $nfsBase;
+	global $setMetaCommandPath;
+	global $reservedSrId;
+	$uuid = $vmOrUuid;
+	if(checkNfsService() == false) {
+		throw new ErrorException("NFS not running, please setup NFS first");
+	}
+	if(is_numeric($vmOrUuid)) {
+		$uuid = getVMUuid($vmOrUuid);
+		gen_log(LOG_DEBUG, "VMID $vmOrUuid has uuid $uuid");
+	}	
+	$vm = getVMSimple($uuid);
+	if($vm === false) {
+		throw new ErrorException("VM $vmOrUuid not found in database");
+	}
+	//var_dump($vm);
+	$eclFile = "/mnt/ads";
+	if($siteId == 1) {
+		$eclFile = "/mnt/ods1";
+	}
+	$eclFile = "$eclFile/journals/";
+	$namy = $vm->name;	
+	gen_log(LOG_INFO, "Instabooting VM $namy");
+	// Link up VHDs
+	$restoreFsPath = "/mnt/restore/$siteId";
+	$uuidList = "$restoreFsPath/uuid.list";
+	gen_log(LOG_DEBUG, "Checking uuid.list at $uuidList");
+	$h = fopen($uuidList, "r");
+	if(!$h) {
+		throw new ErrorException("uuid.list not available");
+	}
+	$simpUuid = str_replace("-", "", $uuid);
+	$simpUuid = strtoupper($simpUuid);
+	$myRestoreName = "";
+	$myCount = 0;
+	try {
+		while(($line = fgets($h)) !== false) {
+			//gen_log(LOG_DEBUG, "Line is $line");
+			$splitz = preg_split("/=/", $line);
+			$targ = trim($splitz[0]);
+			//gen_log(LOG_DEBUG, $targ);
+			if($targ == $simpUuid) {
+				$myRestoreName = trim($splitz[1]);
+				break;
+			}
+			$myCount++;
+		}		
+			
+	} finally {
+		fclose($h);
+	}
+	if(empty($myRestoreName)) {
+		$namy = $vm->name;
+		throw new ErrorException("VM $namy ($simpUuid) not found on restoreFS, checked $myCount uuid.list entries");
+	}
+	// if they passed in 0, use the latest
+	if($timestamp == 0) {
+		gen_log(LOG_DEBUG, "You requested latest version of for $namy, obtaining it...");
+		$rez = shell_exec("ls $restoreFsPath/$myRestoreName 2>/dev/null"); 
+		$myTime = 0;
+		foreach(preg_split("/\s+/", $rez) as $l){
+			if(is_numeric($l)) {
+				$newTime = intval($l);
+				if($newTime > $myTime) {
+					$myTime = $newTime;
+				}
+			}
+		}
+		$timestamp = $myTime;
+	}
+	$myRestoreFullPath = "$restoreFsPath/$myRestoreName/$timestamp";
+	$myRestoreFsVhd0 = "$myRestoreFullPath/0.vhd";
+	gen_log(LOG_INFO, "Checking to see if $myRestoreFsVhd0 is linked to any pre-existing instabooted vm...");
+	if(isInstaBooted($myRestoreFsVhd0)) {
+		throw new ErrorException("VM $namy already instabooted!");
+	}
+	
+	gen_log(LOG_INFO, "Loading ECL information from $myRestoreFullPath");
+	$eclPath = restoreFsBasePathToEclFile($myRestoreFullPath);
+	
+	// Plug instaboot SR
+	xen_connect($hostId);
+	$globoHost = $GLOBALS["host"];
+	$hostUuid = $globoHost->uuid;
+	$hostName = $globoHost->name;
+	gen_log(LOG_INFO, "Checking for instaboot SR on host $hostName");
+	plugInstaSr($hostId, $hostUuid);
+	// Obtain VM metainformation and import it into Xen	
+	$rez = "";
+        $outCode = -1;
+        $myCmd = "$setMetaCommandPath $eclPath $hostId $network '".$xenRestoreName."' ";
+        gen_log(LOG_DEBUG, "Will issue command $myCmd");
+        exec($myCmd, $rez, $outCode);
+        if($outCode != 0) {
+               throw new ErrorException("Setting Xen metainformation failed!");
+        }
+	// Catch up our user on standard out, if needed
+	if(amIConsole()) {
+		$most = array_slice($rez, 0, -1);
+	
+		foreach($most as $m) {
+			echo "$m\n";
+		}	
+	}
+	$vmUuid = trim(end($rez));
+	gen_log(LOG_DEBUG, "Attaching VDIs to $vmUuid host: $hostId");	
+	
+	// Plug VHDs
+	$memDiskState = attachVdis($eclPath, $vmUuid, $myRestoreFullPath, $hostId);
+	if($shouldBoot === true || $shouldBoot === "true") {
+		gen_log(LOG_INFO, "Booting VM $vmUuid");
+		$rez = xen_call("vm-start uuid=$vmUuid");
+		$rez = trim($rez);
+		if(stripos($rez, "invalid") !== false) {
+                        gen_log(LOG_ERROR, "Boot of VM failed with $rez");
+                }
+		if($memDiskState === false) {
+			if(empty($rez)) {	
+				gen_log(LOG_DEBUG, "Booted VM $namy");
+			} else {
+				gen_log(LOG_ERR, "Xen boot request returned $rez");
+			}
+		} else {
+			// It's a mem disk resto, so need to HANDLE it
+			// Suspend the VM, or at least try
+			gen_log(LOG_INFO, "Suspending VM and restoring memory state");
+			$slept = 0;
+			while(true) {
+				$rez = trim(xen_call("vm-suspend uuid=$vmUuid"));
+				gen_log(LOG_DEBUG, "VM suspend call result is: $rez");
+				if(stripos($rez, "invalid") !== false) {
+                	        	gen_log(LOG_WARNING, "VM suspend/pause call failed with $rez");
+				} else {
+				 	$rez = trim(xen_call("vm-param-get", "uuid=$vmUuid", "param-name=\"power-state\""));
+                			if(stripos($rez, "invalid") !== false) {
+		                        	gen_log(LOG_ERR, "Cannot query power state for VM '$vmUuid' with error $rez");
+					} else if(strpos($rez, "suspended") === false) {
+                        			gen_log(LOG_DEBUG, "Waiting for suspend to kick in...");
+					} else {
+						gen_log(LOG_INFO, "Suspend SUCCESS");
+						break;
+					}
+				}
+				$slept += 10;
+				if($slept > (60 * 10)) {
+					throw ErrorException("VM not suspended after ten minutes");
+				}
+				sleep(10);
+			}
+			gen_log(LOG_DEBUG, "Suspend complete, now resetting state....");
+			foreach($memDiskState as $m) {
+				$bootPos = $m['bootPos'];
+				if($bootPos != 0) {
+	                        	$memDiskLocalFileVile = $m['vdiPath'];
+					$memDiskLocalFile = "$nfsBase/base/xen/$reservedSrId/$memDiskLocalFileVile.vhd";
+		                        $memDiskLocalUuid = $m['vdiUuid'];
+					$memDiskRemoteUuid = "UNDEFINED";
+					$bootPos = $m['bootPos'];
+					if($bootPos != 0) {
+						$rez = trim(xen_call("vm-param-get", "param-name=suspend-VDI-uuid", "uuid=$vmUuid"));
+						if(stripos($rez, "invalid") !== false) {
+                	                        	throw new ErrorException("Cannot get suspend disk for VM '$vmUuid' with error $rez");
+						}
+						$memDiskRemoteUuid = $rez;
+
+						gen_log(LOG_DEBUG, "Uploading memory state disk $memDiskLocalFile from local storage to Xen VDI $memDiskRemoteUuid");
+						uploadMemDisk($memDiskLocalFile, $memDiskRemoteUuid);
+					} else {
+						// This is just gonna be too slow my dude
+						//gen_log(LOG_DEBUG, "Overwriting boot disk with backup point-in-time");
+						//uploadMemDisk($memDiskLocalFile, $memDiskLocalUuid);
+					}
+				}
+			}
+			gen_log(LOG_INFO, "Resuming VM $vmUuid");
+                	$rez = xen_call("vm-resume uuid=$vmUuid");
+	                $rez = trim($rez);
+        	        if(stripos($rez, "invalid") !== false) {
+                	        gen_log(LOG_ERROR, "Boot of VM failed with $rez");
+	                }
+		}
+		
+		
+	}
+	return $vmUuid;
+	
+}
+
+function uploadMemDisk($sourceDisk, $memDiskUuid) {
+	// Obtain the base restoreFS VDI
+	$fsMemDisk = findSymlinkParent($sourceDisk);
+	//gen_log(LOG_DEBUG, "About to upload memory disk $fsMemDisk to Xen");
+	try {
+		$rez = trim(xen_call("vdi-import", "filename=$fsMemDisk", "uuid=$memDiskUuid", "format=vhd"));
+		if(stripos($rez, "invalid") !== false) {
+			throw new ErrorException("Upload of suspend disk $fsMemDisk to $memDiskUuid failed with $rez");
+		}
+	} finally {
+		gen_log(LOG_INFO, "Cleaning up memory blob at $sourceDisk");
+		shell_exec("sudo rm $sourceDisk");
+	}
+}
+
+/* 
+ * suspends ALL instaboot VMs, anywhere
+ */ 
+function setStateForAllInstabootVms($want) {
+	$kids = array();
+	$hosts = getHosts();
+	$map = listInstaVmHosts();
+	$curHost =0;
+	foreach($map as $m) {
+        	$vmUuid = $m["vm"];
+	        $hostName = $m["host"];
+		$hostId = -1;
+		foreach($hosts as $h) {
+			if($h->name == $hostName) {
+				$hostId = $h->hostID;
+				break;
+			}
+		}
+		if($hostId == -1) {
+			gen_log(LOG_ERR, "Host $hostUuid is not found in database, please manually inspect!");
+			continue;
+		}
+		if($curHost != $hostId){
+			gen_log(LOG_DEBUG, "Connecting to host $h->name to halt VM $vmUuid");
+			xen_connect($hostId);
+			$curHost = $hostId;
+		}
+		$state = trim(xen_call("vm-param-get", "uuid=$vmUuid", "param-name=\"power-state\""));
+		if(stripos($state, "invalid") !== false) {
+                        gen_log(LOG_ERR, "Cannot query power state for VM '$vmUuid' with error $state");
+			continue;
+                }
+		if($want == "halt"){
+			// we want to force these to stop, asap
+			if(strpos($state, "halted") !== false) {
+				gen_log(LOG_DEBUG, "Ignoring VM $vmUuid on host $h->name because it is already halted");
+				continue;
+			} 
+			$pid = pcntl_fork();
+			if($pid==0){
+				gen_log(LOG_DEBUG, "Halting VM $vmUuid on host $h->name");
+				$rez = trim(xen_call("vm-shutdown force=true uuid=$vmUuid"));
+				exit();
+			}else{
+				$kids[$pid] = $pid;
+			}
+			continue;
+		}
+		// now we either want to pause or suspend.  We must be running for either
+		if(strpos($state, "running") === false) {
+			gen_log(LOG_DEBUG, "Ignoring VM $vmUuid on host $h->name because it is not running");
+			continue;
+		} 
+		$can = xen_call("vm-param-get", "uuid=$vmUuid", "param-name=allowed-operations");
+		if(strpos($can, "suspend") !== false && $want == "suspend") {
+			gen_log(LOG_INFO, "Suspending vm $vmUuid on host $h->name");
+			$pid = pcntl_fork();
+			if($pid==0){
+				$rez = trim(xen_call("vm-suspend uuid=$vmUuid"));
+				exit();
+			}else{
+				$kids[$pid] = $pid;
+			}
+			continue;
+		}
+		if($want == "suspend"){
+			gen_log(LOG_INFO, "Suspend NOT supported- Pausing VM instead: $vmUuid on $h->name");
+		}else{
+			gen_log(LOG_INFO, "Pausing VM $vmUuid on $h->name");
+		}
+		$rez = trim(xen_call("vm-pause uuid=$vmUuid"));
+		if(stripos($rez, "invalid") !== false) {
+			gen_log(LOG_ERROR, "VM suspend/pause call failed with $rez");
+		}
+	}
+	while (count($kids) > 0){
+		foreach($kids as $k => $pid) {
+			$res = pcntl_waitpid($pid, $status, WNOHANG);
+			if($res == -1 || $res > 0){ 
+				unset($kids[$k]);
+			}
+		}
+		usleep(10000);
+	}
+}
+	
+function setStateForAllNonInstabootVms($want){
+	$arr = findNonInstas();
+	$kids = array();
+	foreach($arr as $h){
+		xen_connect($h["host"]);
+		foreach($h["vms"] as $vm){
+			$vmUuid = $vm["vm"];
+			$cur = trim(xen_call("vm-param-get", "uuid=".$vm["vm"], "param-name=\"power-state\""));
+			if($want == "pause"){
+				if(strpos($cur, "running") === false) {
+					gen_log(LOG_DEBUG, "Ignoring VM pause (".$vm["vm"].") because it is not in a running state ($cur)" );
+					continue;
+				} 
+				gen_log(LOG_INFO, "Pausing VM ".$vm["vm"] ." on ".$h["host"]);
+				$rez = trim(xen_call("vm-pause uuid=".$vm["vm"]));
+			}else if($want == "suspend"){
+				if(strpos($cur, "running") === false) {
+					gen_log(LOG_DEBUG, "Ignoring VM suspend (".$vm["vm"].") because it is not in a running state ($cur)" );
+					continue;
+				} 
+				$can = xen_call("vm-param-get", "uuid=$vmUuid", "param-name=allowed-operations");
+				$cmd = "";
+				if(strpos($can, "suspend") === false) {
+					gen_log(LOG_INFO, "Suspending VM ".$vm["vm"] ." on ".$h["host"]);
+					$cmd = "vm-suspend uuid=".$vm["vm"];
+				}else{
+					gen_log(LOG_INFO, "Suspend not supported for VM- Halting instead.  ".$vm["vm"] ." on ".$h["host"]);
+					$cmd = "vm-shutdown force=true uuid=".$vm["vm"];
+				}
+				$pid = pcntl_fork();
+				if($pid==0){
+					$rez = trim(xen_call($cmd));
+				}else{
+					$kids[$pid] = $pid;
+				}
+
+			}else if($want == "halt"){
+				if(strpos($cur, "halted") !== false) {
+					gen_log(LOG_DEBUG, "Ignoring VM halt (".$vm["vm"].") because it is already halted ($cur)" );
+					continue;
+				} 
+				gen_log(LOG_INFO, "Halting VM ".$vm["vm"] ." on ".$h["host"]);
+
+				$pid = pcntl_fork();
+				if($pid==0){
+					$rez = trim(xen_call("vm-shutdown force=true uuid=".$vm["vm"]));
+					exit();
+				}else{
+					$kids[$pid] = $pid;
+				}
+			}
+		}
+	}
+	while (count($kids) > 0){
+		foreach($kids as $k => $pid) {
+			$res = pcntl_waitpid($pid, $status, WNOHANG);
+			if($res == -1 || $res > 0){ 
+				unset($kids[$k]);
+			}
+		}
+		usleep(10000);
+	}
+	
+}
+
+function getSrSpaceInfo() {
+	global $nfsBase;
+	 $rez = shell_exec("df --block-size=1 $nfsBase | grep $nfsBase |  tr -s \" \"| awk {'print $4'}");
+        $rez = trim($rez);
+	$rez2 = shell_exec("df --block-size=1 $nfsBase | grep $nfsBase |  tr -s \" \"| awk {'print $2'}");
+	$rez2 = trim($rez2);
+	$returnMe = array();
+	$returnMe['free'] = $rez;
+	$returnMe['total'] = $rez2;	
+	return $returnMe;
+}	
+
+function showInstaProgress($jobID, $vmID, $name="VM.copy"){
+        $e = time();
+        $vmsg = "Restoring VM data";
+        $veid = addJobLog($vmsg.", In progress",3, $jobID, $vmID);
+        sleep(1);
+        $res = xen_call("task-list");
+        $tasks = json_decode(parse_xen_result($res), true);
+        //$start = trim(shell_exec('date +"%Y%m%dT%H:%M:%S"'));
+        $taskUuids = array();
+        foreach($tasks as $t){
+                if($t["name-label"] == $name){
+                        $msg = "Found possible task: $name: ". $t["uuid"];
+                        gen_log(LOG_DEBUG, $msg);
+                        array_push($taskUuids, $t["uuid"]);
+                }
+        }
+        $uuid = "";
+        $created = "";
+        $winner = new stdClass();
+        $winner->uuid = "";
+        $winner->drift =10000000;
+        foreach($taskUuids as $u){
+                $res = xen_call("task-param-list uuid=$u");
+                $dets = json_decode(parse_xen_result($res), true);
+                $st = strtotime($dets[0]["created"]);
+                $d = abs($st - $e);
+                $msg= "Task: ". $dets[0]["uuid"] ." Drift: $d";
+                gen_log(LOG_DEBUG, $msg);
+                if($d < $winner->drift){
+                        $winner->uuid = $dets[0]["uuid"];
+                        $winner->drift = $d;
+                }
+        }
+        $uuid = $winner->uuid;
+        if(empty($uuid)){
+                updateJobLog("Xen failed to provide progress for VM.copy task!",2, $veid);
+                return;
+        }
+        $msg = "Task uuid: $uuid (drift: $winner->drift)";
+        gen_log(LOG_DEBUG, $msg);
+        // now we loop on that task progress and poop it to the joblog
+        while (true){
+                $res = xen_call("task-param-list uuid=$uuid");
+                // what if there's an error?  die... but what does an error look like?
+                $dets = json_decode(parse_xen_result($res), true);
+                if(!array_key_exists("progress", $dets[0])){
+                        echo "Progress: 100%\n";
+                        updateJobLog($vmsg.": 100%",0, $veid);
+                        break;
+                }
+                $prog = $dets[0]["progress"];
+                $prog *= 100;
+                $state = 3;
+                if($prog == 100){ $state = 0; }
+                updateJobLog($vmsg.": $prog%",$state, $veid);
+                sleep(2);
+                if($prog >= 100){ break; }
+                if(checkForCancel($jobID)){
+                        $res = xen_call("task-cancel uuid=$u");
+                        updateJobLog($vmsg." (cancelled): $prog%",2, $veid);
+                        return false;
+                }
+        }
+
+	return $uuid;
+}
+
+?>

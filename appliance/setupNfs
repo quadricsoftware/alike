@@ -1,0 +1,167 @@
+#!/usr/bin/php -q
+<?php
+/* 
+ * Creates and configs all NFS-related stuff 
+ */
+
+
+include_once("/usr/local/sbin/common_lib");
+include_once("/usr/local/sbin/xen_common");
+include_once("/usr/local/sbin/insta_common");
+
+// Only way this is gonna work
+if(!amRoot()){
+        gen_log(LOG_ERR, "This script must be run as root.");
+        exit(-1);
+}
+
+
+// First, a sanity-check--are we serving NFS?
+if(checkNfsService()) {
+	gen_log(LOG_WARNING, "NFS service is already running");
+}
+
+verifyInstaArea();
+checkAndMakeDirs();
+bindUp();
+fixFsPerms();
+
+$useGanesha = false;
+
+$ganesh = getenv('HOST_NFS');
+if(empty($ganesh) == false && $ganesh == "1") {
+        $useGanesha = true;
+}
+if($useGanesha == false) {
+        setupNfsPermissions();
+        startNfs();
+}
+
+
+
+
+function fixFsPerms() {
+	global $nfsBase;
+	global $reservedSrId;
+	shell_exec("chown -R nobody:nogroup $nfsBase/sr/xen");
+	shell_exec("chmod g+w $nfsBase/sr/xen/$reservedSrId");
+}
+
+function verifyInstaArea() {
+	global $nfsBase;
+	global $scratchDisk;
+	$hile = "$nfsBase/test.file";
+	touch($hile);
+	if(file_exists($hile) == false) {
+		gen_log(LOG_ERR, "$nfsBase is not writable");
+		exit(-1);
+	}
+	unlink($hile);
+	// How much space do they have?
+	$rez = shell_exec("df --block-size=1 $nfsBase | grep $nfsBase |  tr -s \" \"| awk {'print $4'}");
+	$rez = trim($rez);
+	$min = 1024 * 1024 * 1024;
+	if($rez < $min) {
+		gen_log(LOG_ERR, "$nfsBase must have at least $min bytes free; it has $rez");
+		//exit(-1);
+	}
+	gen_log(LOG_DEBUG, "$nfsBase has $rez bytes free");
+}
+	
+
+function checkAndMakeDirs() {
+	global $nfsBase;
+	global $reservedSrId;
+	gen_log(LOG_INFO, "Generating $nfsBase instaboot directories");
+	checkAndMakeDir("$nfsBase/sr");
+	checkAndMakeDir("$nfsBase/base");
+	checkAndMakeDir("$nfsBase/base/xen");
+	checkAndMakeDir("$nfsBase/base/xen/$reservedSrId");
+	//checkAndMakeDir("$nfsBase/base/xen/$reservedSrId/restore");
+}
+
+function hasMount($mnt) {
+ 	$rez = shell_exec("mount |grep $mnt");
+	//echo "Grep rez is $rez\n";
+        if(empty(trim($rez))) {
+		return false;
+	}
+	return true;
+}
+
+function bindUp() {
+	global $nfsBase;
+	global $reservedSrId;
+
+	$instaFsExe = "/usr/local/sbin/instafs";
+	$bind2 = "$nfsBase/sr";
+	if(!hasMount($bind2)) {
+		shell_exec("$instaFsExe --resolve-symlinks --force-group=nogroup --force-user=nobody --multithreaded $nfsBase/base $bind2");
+	}
+	if(!hasMount($bind2)) {
+	//if(!hasMount($bind1) || !hasMount($bind2)) {
+		myDie("instafs bind failed");
+	}
+		
+}
+
+function setupNfsPermissions() {
+	global $nfsBase;
+	$mask = intval(getSetting("nfsMask"));
+	if($mask == 0) {
+		$mask = 8;
+	}
+	
+
+	gen_log(LOG_INFO, "Configuring NFS permissions for A3 hosts, will use CIDR mask of $mask. Change this with the setting nfsMask");
+	$exportsheader = <<< END
+# /etc/exports: the access control list for filesystems which may be exported
+#               to NFS clients.  See exports(5).
+#
+# Example for NFSv2 and NFSv3:
+# /srv/homes       hostname1(rw,sync,no_subtree_check) hostname2(ro,sync,no_subtree_check)
+#
+# Example for NFSv4:
+# /srv/nfs4        gss/krb5i(rw,sync,fsid=0,crossmnt,no_subtree_check)
+# /srv/nfs4/homes  gss/krb5i(rw,sync,no_subtree_check)
+#
+
+END;
+	$entry = <<< END
+%s %s/%d(fsid=0,subtree_check,rw,async)
+
+END;
+	//Go to the database and get some stuff
+	$hosts = getHosts();
+	$extras = obtainLooseHosts();
+	if(count($hosts) == 0 && count($extras) == 0) {
+		gen_log(LOG_WARNING, "Alike has no hosts configured/discovered; will not change the NFS exports file");
+		return;
+	}
+	$myHostIps = array();
+	foreach($hosts as $h) {
+		// Only Xen guys
+		if($h->type == 2) {
+			array_push($myHostIps, $h->name);
+		}
+	}	
+	// Check for hosts that haven't been added yet
+	$combined = array_merge($extras, $myHostIps);
+	$combined = array_unique($combined);
+	foreach($combined as $e) {
+		$exportsheader .= sprintf($entry, "$nfsBase/sr", $e, $mask);
+	}
+	file_put_contents("/etc/exports", $exportsheader);
+}
+
+function startNfs() {
+	gen_log(LOG_INFO, "Starting NFS server");
+	$rez = shell_exec("/usr/sbin/exportfs -a");
+	//echo "$rez\n";
+	//$rez = shell_exec("service nfs-kernel-server start");
+	if(checkNfsService() == false) {
+		$rez = trim($rez);
+		myDie("Nfs service start failed with $rez");
+	}
+}
+?>

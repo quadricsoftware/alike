@@ -1,0 +1,994 @@
+#!/usr/bin/php -q
+<?php
+
+include_once("abd_common");
+include_once("hv_common");
+
+$me = pathinfo(__FILE__, PATHINFO_FILENAME);
+if($argc < 2){ usage(); }
+
+$jobId=null;
+$vmId=null;
+
+$args = array();
+for($i=0; $i < $argc; $i++ ){
+	if($argv[$i] == "-j"){
+		if($argc > $i){
+			$i++;
+			$jobId = $argv[$i];
+		}	
+	}
+	else if($argv[$i] == "-v"){
+		if($argc > $i){
+			$i++;
+			$vmId = $argv[$i];
+		}	
+	}
+}
+echo "I got VMID: $vmId, Job: $jobId\n";
+if(!is_numeric($jobId) || !is_numeric($vmId)){
+	usage();
+	exit(1);
+}
+$GLOBALS["__insta_job_id"] = $jobId;
+$GLOBALS["__insta_vm_id"] = $vmId;
+
+try{
+	doReplicate($vmId, $jobId);
+}catch(Exception $ex){
+	$msg = $ex->getMessage();
+	$noSpace = "SR_BACKEND_FAILURE_44";
+	if(strpos($msg, $noSpace) !== false){
+		$msg = "Xen reported an error: SR_BACKEND_FAILURE_44.  The SR does not have enough free space to take the requested snapshot.";
+	}
+	gen_log(LOG_ERR_NOFAIL, $msg );
+	exit(-1);
+}
+
+function usage(){
+        echo "Usage: -v <vmID> -j <jobID>\n";
+        exit(1);
+}
+
+function checkEnv($vm){
+	if(!file_exists("/tmp/jads.status")){
+		throw new Exception("ADS is not mounted, or in an inconsistent state.  Replications can't run until this is resolved. (jads.status is missing)");
+	}
+
+	$res = licenseCheck(null, null, null, "replicate");
+	// licensing problem
+	if($res->status == "error"){ throw new Exception("Licensing error: $res->message"); }	// no plan
+	if($res->status == "denied"){ throw new Exception("Licensing error- $res->message."); }	// no DR
+
+	if($vm->virtTech == 10){
+		// agents
+		$res = licenseCheck($vm->guid, null, null, null);
+		if($res->status == "error"){ throw new Exception("Licensing error: $res->message"); }	// no plan
+		if($res->status == "denied"){ throw new Exception("Licensing error- $res->message."); }	// no DR
+		if($res->status == "allowed"){
+			gen_log(LOG_DEBUG, "License check success- Agent is fully licened. $res->message");
+			return;
+		}
+	}else if($vm->virtTech == 2){
+		$res = licenseCheck(null, null, $vm->poolID, "backup");
+                if($res->status == "error"){ throw new Exception("Licensing error: $res->message"); }
+                if($res->status == "allowed"){
+                        gen_log(LOG_DEBUG, "License check success- The whole Xen pool is licensed.");
+                        return;
+                }
+		connectXapiByPool($vm->poolID);
+		gen_log(LOG_DEBUG, "Connected to Xen $vm->poolID");
+		// not all hosts in pool are licensed.  see if they're running on a licensed host
+		$homer = getHomeHostXen($vm->uuid );
+		if($homer == null){
+			// vm isn't homed or running, check if pool is fully licensed
+			throw new Exception("Licensing error- VM is not running/homed on a licensed host.");
+		}
+		$h = getHostByUuid($homer);
+		$res = licenseCheck(null, $h->uuid, null, "backup");
+		if($res->status == "allowed"){
+			gen_log(LOG_DEBUG, "License check success- VM is running/homed on licensed Xen host: $h->nativeName.");
+			return;
+		}
+	}else if($vm->virtTech == 3){
+		$h = getHost($vm->hostID);
+		$res = licenseCheck(null, $h->uuid, null, "backup");
+		if($res->status == "allowed"){
+			gen_log(LOG_DEBUG, "License check success- VM is running on licensed HV host: $h->nativeName.");
+			return;
+		}
+
+	}
+	throw new Exception("Licensing error- VM is on an unlicened host.  Please license $h->nativeName or migrate this system to proceed.");
+}
+
+function doReplicate($vmId, $jobId, $ts=0){
+	$j = getJob($jobId);
+	$vmUuid = getVMUuid($vmId);
+	$vm = getVMSimple($vmUuid);
+
+	checkEnv($vm);
+
+	$isCbt=false;
+	if(array_key_exists("doCBT", $j->Options ) && $j->Options["doCBT"]==1){ $isCbt=true; }
+	$targetUuid = getTargetUuid($j, $vm, $isCbt);
+	$res = 1;
+
+
+	if($isCbt){
+		$res= doCbtReplicate($j, $vm, $targetUuid);
+	}else{
+		$res=doBackupReplicate($j, $vm, $targetUuid, $ts);
+	}
+	if($res==0){
+		gen_log(LOG_INFO, "Replication of $vm->name is complete.");
+	}else{
+		gen_log(LOG_ERR_NOFAIL, "Replication of $vm->name failed.");
+	}
+
+	exit($res);
+}
+
+
+function doBackupReplicate($j, $vm, $targetUuid, $ts){
+	$result =0;
+	$path = getRestorePathName($vm->uuid);
+	gen_log(LOG_DEBUG,"Rest path: $path");
+
+	if($ts ==0){ $ts = getLatestVersion($path); }
+
+
+	if($targetUuid == null){
+		return makeNewReplica($j, $vm, $ts);	// Lets make a new VM (restore), which we can sync from now on
+	}
+	$srcVersion = "$path/$ts";
+
+	if(!file_exists("$srcVersion/0.img")){
+		throw new Exception("Could not find disk image to replicate ($srcVersion)");
+	}
+
+	$guy = getJobVMTarget($j->jobID, $vm->VMID);
+	$h = getHost($guy->hostID);
+	if($h->type ==3){
+		gen_log(LOG_DEBUG, "Got existing target VM uuid: $targetUuid.  Syncing to HV host $h->name");
+		return syncExistingHV($j, $guy, $h, $srcVersion, $targetUuid);
+	}else{
+		return syncExisingXen($j, $vm, $targetUuid, $ts, $srcVersion);
+	}
+}
+
+function syncExistingHV($j, $guy, $h, $srcVersion, $uuid){
+	// make sure target exists
+	// power it off, if needed
+	// get remote disk file paths
+	// overwrite disks
+	//echo "RepHV: $h->name, $srcVersion, $uuid\n";
+	$ip = $h->name;
+	$vhds = getVmVhdFilesHV($ip, $uuid);
+	//$vhds = getVmDisksHV($ip, $uuid);
+	powerOffVM($ip, $uuid);
+
+	$ext = "vhd";
+	if (strtolower (substr($vhds[0], -1)) === 'x'){ $ext = "vhdx"; }
+
+	$i=0;
+        foreach($vhds as $v){
+		$local = "$srcVersion/$i.$ext";
+                $byteSize = filesize($local);
+                updateProgTmpFile($j->jobID, $guy->vmid, $i, 0, $byteSize);
+echo "$local: $byteSize\n";
+                $i++;
+        }
+	$i=0;
+	foreach($vhds as $v){
+		$v = trim($v);
+		$actFile = $v;				// record the actual filename before rewriting 
+
+		$v = str_replace('\\','/', $v);
+		$baseFile = basename($v);
+		$v .= ".tmp";
+		$remoteTmp = "$actFile.tmp";
+		$ren = "cmd /c ren \"$remoteTmp\" \"$baseFile\"";	// save for after to rename back
+
+		$local = "$srcVersion/$i.$ext";
+		$byteSize = filesize($local);
+
+		$msg = "Restoring Disk $i: ";
+		$eid = addJobLog($msg ." <Pending>",3, $j->jobID, $guy->vmid);
+                $pid = pcntl_fork();
+                if($pid ==0) {
+                        showHVProgress($eid, $msg, $j->jobID, $guy->vmid, $i, $byteSize);
+                        exit(0);
+                }
+echo "Sending $local to $v\n";
+		$out = agentUploadFileWin($ip, $local, $v, $eid);
+		gen_log(LOG_DEBUG, "Disk $i upload results: $out");
+		pcntl_waitpid($pid, $status, WNOHANG);
+                if(posix_getpgid($pid)){
+                        sleep(3);
+                        posix_kill($pid,0);
+                }
+		$kill = "cmd /c del \"$actFile\"";
+		$out = array_filter(explode(PHP_EOL,agentRunCmd($ip, $kill)));
+		gen_log(LOG_DEBUG, "Deleting old VHD: res: $out");
+		$out = array_filter(explode(PHP_EOL,agentRunCmd($ip, $ren)));
+		gen_log(LOG_DEBUG, "Renaming new VHD: res: $out");
+
+		$i++;
+	}
+	gen_log(LOG_INFO, "Data transfer complete for replication.");
+}
+
+function syncExisingXen($j, $vm, $targetUuid, $ts, $srcVersion){
+	gen_log(LOG_DEBUG, "Got target VM uuid: $targetUuid");
+	$destVm = getVMSimple($targetUuid);
+	if(empty($destVm) || $destVm->uuid != $targetUuid){
+		gen_log(LOG_ERR_NOFAIL, "Could not find target VM: $targetUuid.  If it was just created, please try running a meta-refresh.");
+		return;
+	}
+	connectXapiByPool($destVm->poolID);// conenct to target xapi
+	$abdID = 0;
+	try{
+		$abdID = assignABDbyPool($destVm->poolID, $vm->VMID);
+		gen_log(LOG_DEBUG,"Checked out ABD: $abdID");
+		$dirty = false;
+		$abd= getABDsFromDB($abdID);
+		$targPower = getVmPowerStateXen($targetUuid);
+		if($targPower != "halted"){
+			gen_log(LOG_INFO, "Replication target was $targPower, powering off target, and forcing full scan");
+			xen_call("vm-shutdown force=\"true\" uuid=\"$targetUuid\"");
+			$dirty=true;	
+		}
+		checkAndMoveABD($abd->uuid, $targetUuid);
+		validateABD($abd);
+		cleanAbdSafe($abd->uuid);	
+		$out =runAbdCmd($abd->ip, "\"rm -f /tmp/*\"");
+		gen_log(LOG_DEBUG, "Cleaned workspace on abd: $out ($abd->ip)");
+
+		// do our safety snap here?		
+		$safeSnap = null;
+		if(array_key_exists("snapshotTarget", $j->Options ) && $j->Options["snapshotTarget"]==1){
+			gen_log(LOG_INFO, "Taking snapshot of target VM based on job settings.");
+			$safeSnap = takeSnapshotXen($targetUuid, "Alike ER Safety snapshot");	
+		}
+	
+		$worked=false;
+		$targDisks = getDisksXen($targetUuid,true);
+		gen_log(LOG_INFO, "Attaching target disks to ABD for data sync");
+		$start = time();
+		try{
+			attachDisksToVmXen($abd->uuid, $targDisks, true);
+			// loop over disks and repTool
+			$abdDisks = getDisksXen($abd->uuid,true);
+			abdMountRestore($abd->ip);
+			$dev = 0;
+			foreach($abdDisks as $d){
+				if($d->userdevice ==0){ continue; } // skip abd boot disk
+				gen_log(LOG_INFO, "Syncing disk $dev ($d->device)");
+				syncDisk($vm->VMID, $j, $abd, $d, $srcVersion, $dev, $dirty);
+				$dev++;
+			}
+			$worked=true;
+		}finally{
+			$totalTime = time() - $start;
+			$jobTimeFile = "/tmp/job_ctl/". $j->jobID .".proctime";
+			incrementFileLocked($jobTimeFile, $totalTime);
+
+			detachDisksFromABD($abd->uuid);
+			gen_log(LOG_INFO, "Detaching target disks from ABD, and checking ABD back in");
+			if($safeSnap != null){
+				if($worked == false){
+					gen_log(LOG_WARNING, "Reverting target VM to pre-job state.");
+					xen_call("snapshot-revert snapshot-uuid=$safeSnap");
+				}
+				$res = xen_call("snapshot-destroy snapshot-uuid=$safeSnap");
+				gen_log(LOG_DEBUG, "Deleted safety snap ($safeSnap).");
+			}
+		}
+
+	}finally{
+		unassignABD($abdID);	// method don't care if id==0
+echo "Returned ABD: $abdID\n";
+	}
+}
+
+function syncDisk($vmId,$j, $abd, $d, $ver, $img, $isDirty=false){
+	// $vers = path to restoreFS (loop over x.img files)
+	$ABDip = $abd->ip;
+
+	if(!checkDeviceExists($ABDip, $d->device)){
+		throw new Exception("ABD missing blockdevice for disk $img ($d->device)");
+	}
+
+//	$bs = getSetting("blockSize");
+
+	$srcImg = "/mnt/restore/".substr("$ver/".$img.".img", 12);
+	$src = "$ver/".$img.".hcl";
+	if(!file_exists($src)){
+		throw new Exception("Could not open source file: $src");	
+	}else{ gen_log(LOG_DEBUG, "Using device as source: $src"); }
+
+	$makeCache = true;
+	exec("mkdir -p '/home/alike/Alike/agentShare/repCache/$vmId/'");	// just to be sure
+	$act = "/home/alike/Alike/agentShare/repCache/$vmId/$img.HCA";
+	if(array_key_exists("force", $j->Options ) && $j->Options["force"]==0){
+		if( file_exists($act) && $isDirty==false){
+			gen_log(LOG_INFO, "State caching is enabled, previous state found.");
+			$makeCache =false;
+		}else{
+			gen_log(LOG_INFO, "Previous state is invalid or missing, creating new state ($img.HCA), please wait...");
+		}
+	}else{
+		gen_log(LOG_INFO, "Generating state cache, please wait...");
+	}
+
+	$meta = json_decode(file_get_contents("$ver/info.meta"));
+	$bs = $meta->blockSize / 1024;
+	gen_log(LOG_DEBUG, "Discovered blocksize: $bs");
+
+	if($makeCache){
+		echo "Generating HCA...";
+		$cmd = "\"/usr/bin/munger -o -k $bs -d $d->device > /tmp/$img.HCA\"";
+		$out =runAbdCmd($ABDip, $cmd);
+		gen_log(LOG_DEBUG, "Scan results: $out");
+		$out = shell_exec("scp root@$ABDip:/tmp/$img.HCA $act");
+//		shell_exec("scp root@$ABDip:/tmp/$img.HCA /tmp/before-$img.HCA");
+		gen_log(LOG_INFO, "Finished creating new state (HCA)");
+//		gen_log(LOG_DEBUG, "Wrote HCA: $act (out: $out)");
+	}
+	if(!file_exists($act)){ throw new Exception("File not found: $act"); }
+
+	$workDir = "/home/alike/Alike/agentShare/$j->jobID/$vmId";
+	exec("mkdir -p $workDir");
+	$blank = getBlankBlock($bs);
+	$blankFile = "$workDir/$d->userdevice.blanks";
+	exec(" > $blankFile");
+	$syncFile = "$workDir/$d->userdevice.sync";
+	exec(" > $syncFile");
+
+	$hsrc = fopen($src, "r");
+	$hact = fopen($act, "r");
+	if ($hsrc) {
+		$i =0;
+		$num =0;
+		while (($srcLine = fgets($hsrc) ) !== false) {
+			if ($srcLine == "CODA"){ break; }
+			$srcLine = trim($srcLine);
+			$actLine = trim(fgets($hact));
+		$action = "";
+			if($actLine == $srcLine){
+		$action = "Skip!";
+				// no change
+			}else if($srcLine == $blank){
+		$action = "Blank";
+				exec("echo $i >> $blankFile");
+			echo "$i) $srcLine vs $actLine -- $action\n";
+				$num++;
+			}else{
+		$action = "Copy";
+				exec("echo $i >> $syncFile");
+				$num++;
+			}
+			$i++;
+		}
+		fclose($hsrc);
+		fclose($hact);
+		if($num ==0){
+			gen_log(LOG_INFO, "No data has changed!");
+			return;
+		}
+		$msg= "$num changed blocks. [". bytesToString($num * $bs * 1024). "]";
+		gen_log(LOG_INFO, "Detected $msg");
+		$cmd = "rm -f /tmp/$d->userdevice.*";
+		runAbdCmd($ABDip, $cmd);
+		exec("scp $blankFile root@$ABDip:/tmp/");
+		$testFile = "/tmp/". basename($blankFile); 
+		if(!checkFileExists($ip, $testFile)){
+			gen_log(LOG_ERROR, "Failed to transfer sync files (blank) to ABD ($ip)");
+			throw new Exception("Data sync failed.");
+		}else{
+			gen_log(LOG_DEBUG, "Blank file copy succeeded: $testFile");
+		}
+		exec("scp $syncFile root@$ABDip:/tmp/");
+		$testFile = "/tmp/". basename($syncFile); 
+		if(!checkFileExists($ip, $testFile)){
+			gen_log(LOG_ERROR, "Failed to transfer sync files (syncs) to ABD ($ip)");
+			throw new Exception("Data sync failed.");
+		}else{
+			gen_log(LOG_DEBUG, "Sync file copy succeeded: $testFile");
+		}
+		exec("scp /usr/local/sbin/rep_abd.sh root@$ABDip:/tmp/");
+		runAbdCmd($ABDip, "chmod 755 /tmp/rep_abd.sh");
+
+//		$tmpCmd = "dd if=$ver/$img.img of=/dev/$d->device bs=2M";
+//		gen_log(LOG_DEBUG, "Running: $tmpCmd");
+//		$out = runAbdCmd($ABDip, $tmpCmd);
+//		gen_log(LOG_DEBUG, "Res: $out");
+
+		$pid = pcntl_fork();
+		if($pid ==0) {
+			showRepProgress($ABDip,$d->userdevice, $j->jobID, $vmId);
+			gen_log(LOG_DEBUG, "Ending forked process for progress.");
+			exit(0);
+		}
+		$cmd = "/tmp/rep_abd.sh $d->userdevice $ver/$img.img $d->device $bs 2>&1 > /tmp/rep_$vmId-$img.log; $?";
+		gen_log(LOG_DEBUG, "Running rep_abd on abd: $cmd");
+		$out = runAbdCmd($ABDip, $cmd);
+		$repOut = trim(file_get_contents("/tmp/rep_$vmId-$img.log"));
+		unlink("/tmp/rep_$vmId-$img.log");
+		if($out != 0){
+			gen_log(LOG_ERROR, "Rep result $out Output: $repOut");
+			throw new Exception("Data sync failed.");
+		}else{
+			gen_log(LOG_DEBUG, "Results: $out");
+			gen_log(LOG_DEBUG, "Rep output: $repOut");
+		}
+
+		pcntl_waitpid($pid, $status, WNOHANG);
+		if(posix_getpgid($pid)){
+			sleep(3);
+			posix_kill($pid,0);
+		}
+		if(!unlink($act)){
+			$errors= error_get_last();
+			gen_log(LOG_ERROR, "Failed to delete HCA ($act): ".  $errors["message"] );
+		}
+		if(!copy($src, $act)){
+			$errors= error_get_last();
+			gen_log(LOG_ERROR, "Failed to copy HCA: ".  $errors["message"] );
+		}
+//	gen_log(LOG_DEBUG, "Copied $src to $act ");
+		gen_log(LOG_INFO, "Sync for disk $img Complete.");
+
+
+		$paranoid = false;
+		if($paranoid){
+			echo "Generating comparison HCA...";
+			$cmd = "\"/usr/bin/munger -o -k $bs -d $d->device > /tmp/after-$img.HCA\"";
+			$out =runAbdCmd($ABDip, $cmd);
+			gen_log(LOG_DEBUG, "Scan results: $out");
+			$out = shell_exec("scp root@$ABDip:/tmp/before* /tmp/");
+			$out = shell_exec("scp root@$ABDip:/tmp/after* /tmp/");
+			gen_log(LOG_DEBUG, "Manual comparison Before: $act (after: /tmp/after-$img.HCA)");
+		}
+
+
+	}
+}
+
+function showRepProgress($ip, $devNum, $jobID, $vmID){
+        $e = time();
+        $vmsg = "Processing disk $devNum"; 
+        $veid = addJobLog($vmsg.": 0%",3, $jobID, $vmID);
+
+	$file = "/tmp/$devNum.prog";
+        // now we loop on that task progress and poop it to the joblog
+        $errCount=20;
+        while (true){
+                sleep(2);
+		$prog = trim(runAbdCmd($ip, "cat $file"));
+                if(empty($prog)){
+                        $errCount--;
+                        if($errCount ==0){
+                                updateJobLog($vmsg.": -- Error getting progress from ABD",3, $veid);
+                                return;
+                        }
+                        $prog=0;
+                }else{
+                        $errCount=20;   // reset so only 10 in a row kills us
+                }
+//echo "Disk $devNum Prog: $prog\r";
+                $state = 3;
+                if(rtrim($prog,'%') == 100){ $state = 0; }
+                updateJobLog($vmsg.": $prog",$state, $veid);
+                if(rtrim($prog,'%') >= 100){ break; }
+                if(checkForCancel($jobID)){
+                        // cancel stuff
+                        updateJobLog($vmsg." (cancelled): $prog%",2, $veid);
+                        return false;
+                }
+        }
+
+//echo "\nComplete\n";
+}
+
+
+function getLatestVersion($path){
+	$files = scandir("$path");
+	if (($key = array_search('.', $files)) !== false) { unset($files[$key]); }
+	if (($key = array_search('..', $files)) !== false) { unset($files[$key]); }
+	sort($files);
+	return end($files);
+}
+
+
+function makeNewReplica($j, $vm, $ts){
+	$result=0;
+	$guy = getJobVMTarget($j->jobID, $vm->VMID);
+	$srID = $guy->SRID;
+	$hostID = $guy->hostID;
+	$start = time();
+
+	$h = getHost($hostID);
+	$type = $h->type;
+	
+	$cmd = "/usr/local/sbin/restoreTool -j $j->jobID -v $vm->VMID -h $hostID -s $srID -t $ts";
+	if(empty($srID)){
+		$cmd = "/usr/local/sbin/restoreTool -j $j->jobID -v $vm->VMID -h $hostID -t $ts";
+	}
+	gen_log(LOG_DEBUG, "Creating initial replica: $cmd");
+	exec($cmd, $res, $last);
+	if($last ==1){
+		throw new Exception("Failed to create initial replica: ". json_encode($res));
+	}
+
+	$totalTime = time() - $start;
+	$jobTimeFile = "/tmp/job_ctl/". $j->jobID .".proctime";
+	incrementFileLocked($jobTimeFile, $totalTime);
+
+	$vmId = $vm->VMID;
+	$out = "/tmp/rep_rest_$vmId.json";
+	if(!file_exists($out)){
+		throw new Exception("Missing initial replication data (json) file ($out)");
+	}
+	$newInf = json_decode(file_get_contents($out));
+	unlink($out);
+	if($type == 2){
+		gen_log(LOG_DEBUG, "Result: $res, new uuid: ". $newInf->uuid);
+		$newName =  $vm->name ."-Alike Replica";
+		setVmNameXen($newInf->uuid, $newName);
+		// clean up the temp file
+		$vmsg = "Requesting meta-refresh for new replica VM..."; 
+		$veid = addJobLog($vmsg,3, $j->jobID, $vm->VMID);
+		$cmd = "/home/alike/Alike/hooks/gatherXenMeta $hostID";
+		exec($cmd);
+	}
+	updateJobLog($vmsg." complete.",0, $veid);
+
+	$cmd = "echo $newInf->uuid > /home/alike/Alike/agentShare/repCache/$vm->VMID/replica.uuid";
+	exec($cmd);
+	$rp = getRestorePathName($vm->uuid);
+	$hcls = glob("$rp/$ts/*.hcl");
+	foreach ($hcls as $h){
+		$inf = pathinfo($h);
+		$cmd = "cp $h /home/alike/Alike/agentShare/repCache/$vm->VMID/". $inf['filename'] .".HCA";
+		$out = shell_exec($cmd);
+		gen_log(LOG_DEBUG, "Copied $h to HCA: $cmd, $out");
+	}
+	return $result;
+
+
+
+	// old instaboot stuff here
+	$siteID =0;
+	$uuid = getVMUuid($vm->VMID);
+	$srID = $guy->SRID;
+
+	$sr = getSR($srID);
+
+
+	$opt = getVmOptsFromSchedule($j->scheduleID, $vm->VMID);
+
+	xen_connect($hostID);
+	$msg = "Creating new replica VM with name: $newName (using Xen template $opt->template)";
+	addJobLog($msg, 0, $j->jobID, $vm->VMID);
+	$tmpName =  $vm->name ."-Alike Replica";
+	$newUuid = prepareVmForRestore($uuid, $hostID, $ts, $siteID, $tmpName, $opt->template);
+
+        $pid = pcntl_fork();
+        if($pid ==0) {
+                showInstaProgress($j->jobID, $vm->VMID);
+                exit(0);
+        }
+
+	$cmd = "vm-copy vm=$newUuid sr-uuid=$sr->uuid new-name-label=\"$tmpName\"";
+	$out = trim(xen_call($cmd));
+	gen_log(LOG_INFO, "VM copy res: $out");
+	try{
+		gen_log(LOG_INFO, "Destroying temporary instaVm $newUuid");
+		deleteVmXen($newUuid, true);
+	}catch(Exception $ex){
+		gen_log(LOG_INFO, "Error deleting temp instaVm: ".$ex->getMessage() );
+	}
+
+	pcntl_waitpid($pid, $status, WNOHANG);
+
+	$cmd = "echo $out > /home/alike/Alike/agentShare/repCache/$vm->VMID/replica.uuid";
+	exec($cmd);
+
+        $vmsg = "Requesting meta-refresh for new replica VM..."; 
+        $veid = addJobLog($vmsg,3, $jobID, $vmID);
+	$cmd = "/home/alike/Alike/hooks/gatherXenMeta $guy->hostID";
+	exec($cmd);
+	updateJobLog($vmsg." complete.",0, $veid);
+
+	$rp = getRestorePathName($vm->uuid);
+	$hcls = glob("$rp/$ts/*.hcl");
+	foreach ($hcls as $h){
+		$inf = pathinfo($h);
+		$cmd = "cp $h /home/alike/Alike/agentShare/repCache/$vm->VMID/". $inf['filename'] .".HCA";
+		$out = shell_exec($cmd);
+		gen_log(LOG_DEBUG, "Copied $h to HCA: $cmd, $out");
+	}
+	return $result;
+}
+
+function setLastCbtSnap($vmid, $uuid){
+	
+	$base = "/home/alike/Alike/agentShare/repCache/$vmid";
+	exec("mkdir -p $base");
+	$uuidFile = "$base/cbtMarker.uuid";
+	file_put_contents($uuidFile, $uuid);
+}
+function getLastCbtSnap($vmid){
+	$uuidFile = "/home/alike/Alike/agentShare/repCache/$vmid/cbtMarker.uuid";
+	if(file_exists($uuidFile)){
+		$uuid = trim(file_get_contents($uuidFile));
+		if(!empty($uuid)){ return $uuid; }
+	}
+	return null;
+}
+function getTargetUuid($j, $vm, $isCbt){
+	/*
+	$uuid =null;
+	$uuidFile = "/home/alike/Alike/agentShare/repCache/$vm->VMID/replica.uuid";
+	if(file_exists($uuidFile)){
+		$guy = trim(file_get_contents($uuidFile));
+		if(!empty($guy)){ 
+			$uuid = $guy; 
+		}
+	}
+	if(!empty($uuid)){
+		if(vmExistsXen($uuid)){ return $uuid; }	// double check the uuid we found in the file is good
+	}
+	*/
+	$tmpName =  $vm->name ."-Alike Replica";
+	if($isCbt){ $tmpName =  $vm->name ."-AlikeDR Replica"; }
+
+	$guy = getJobVMTarget($j->jobID, $vm->VMID);
+	$h = getHost($guy->hostID);
+	if($h->type ==2){
+		return getTargetUuidXen($guy, $tmpName);
+	}else if($h->type ==3){
+		return getTargetUuidHv($guy, $h, $tmpName);
+	}
+
+}
+function getTargetUuidHv($guy, $h, $name){
+	$ip = $h->name;
+	$uuid = getVmUuidHv($ip, $name);
+	return $uuid;
+}
+
+function getTargetUuidXen($guy, $name){
+	xen_connect($guy->hostID);
+
+	$q = "vm-list name-label=\"$name\"";
+	$res = xen_call($q);
+	$dat = json_decode(parse_xen_result($res), false);
+        if(empty($dat)){
+                gen_log(LOG_DEBUG, "Could not find existing target ($name) on pool/host $guy->hostID");
+                return null;
+        }
+        $uuid =  $dat[0]->uuid;
+        gen_log(LOG_DEBUG, "Found target ($name, uuid: $uuid) on pool/host $guy->hostID");
+        return $uuid;
+}
+
+function doCbtReplicate($j, $vm, $targetUuid){
+	// check that we're not going from new XS to old XS (mint->beast won't work)
+
+	// we need to check the src host for it's licensing state.  edition should have been checked upstream already
+	if(!licenseCheck(null, null, $vm->poolID, "replicate")){
+		connectXapiByPool($vm->poolID);				// conenct to target xapi
+                $homer = getHomeHostXen($vm->uuid );
+                if($homer == null){
+                        // vm isn't homed or running, check if pool is fully licensed
+                        throw new Exception("VM is not running or homed and the Xen pool is not fully licensed.");
+                }
+                $h = getHostByUuid($homer);
+		if(!licenseCheck(null, $h, null, "replicate")){
+			throw new Exception("VM is on an unlicened host!  Please license this host ($h->nativeName) in the Alike to proceed.");
+                }
+	}
+
+	$opt = getVmOptsFromSchedule($j->scheduleID, $vm->VMID);
+	gen_log(LOG_INFO, "Performing CBT for $vm->name");
+
+	verifyCBT($vm->uuid, $vm->hostID, $opt->hostID);
+
+	$dstHost = getHost($opt->hostID);
+	$srcHost = getHost($vm->hostID);
+	$sr = getSR($opt->srID);
+	connectXapiByPool($dstHost->poolID);				// conenct to target xapi
+	$exists = vmExistsXen($targetUuid);
+	if($exists == false){
+		gen_log(LOG_WARNING, "Could not find existing target VM ($targetUuid).  Creating new one");
+		$targetUuid = null;
+	}
+
+	if(empty($targetUuid)){
+		echo "Make a new guy!\n";
+		return makeNewReplicaCbt($j, $vm, $srcHost, $dstHost, $sr);
+	}else{
+		return syncExistingReplicaCbt($j, $vm, $srcHost, $dstHost, $targetUuid);
+	}
+}
+function syncExistingReplicaCbt($j, $vm, $srcHost, $dstHost, $targetUuid){
+	$result =0;
+	gen_log(LOG_INFO, "Found existing VM to sync");
+	$power = getVmPowerStateXen($targetUuid);
+	if($power != "halted"){
+		gen_log(LOG_WARN, "Target was $power, forcing shutdown for replication");
+		xen_call("vm-shutdown force=true uuid=\"$targetUuid\"");
+	}
+	revertToLastCbtSnap($vm->VMID);
+	$targDisks = getDisksXen($targetUuid, false, false);
+
+	$lastSnapUuid = getLastCbtSnap($vm->VMID);
+	connectXapiByPool($srcHost->poolID);				// conenct to source xapi
+	gen_log(LOG_DEBUG, "Looking for previous snapshot ($lastSnapUuid)");
+	$res =trim(xen_call("snapshot-list uuid=$lastSnapUuid"));
+	$inf = json_decode(parse_xen_result($res), true);
+	if(empty($inf)){
+		$hip = getSetting("hostIP");
+		gen_log(LOG_ERR_NOFAIL, "No previous CBT snapshot found ($lastSnapUuid).  Re-baseline required.  Please either delete the target replica VM, or remove the file: //$hip/ads/repCache/$vm->VMID/replica.uuid");
+		exit(1);
+	}else{
+		gen_log(LOG_INFO, "Found previous CBT checkpoint ($lastSnapUuid).  Taking snapshot.");
+		$snapTime = time();
+		$snapName = "AlikeERCBT_". $vm->VMID . "_". $snapTime;
+		$snapUuid = takeSnapshotXen($vm->uuid, $snapName);	
+		gen_log(LOG_DEBUG, "Took snapshot ($snapName => $snapUuid)");
+
+		$curSnapDisks = getDisksXen($snapUuid,false, true);
+		$prevSnapDisks = getDisksXen($lastSnapUuid,false, true);
+
+		if(count($curSnapDisks) != count($targDisks)){
+			deleteSnapshotXen($snapUuid, true);
+			throw new Exception("Source and Target VMs have a different number of disks!");
+		}
+		$start = time();
+		for($i=0; $i< count($curSnapDisks); $i++){
+			$res = syncDiskCbt($curSnapDisks[$i], $prevSnapDisks[$i],$targDisks[$i], $srcHost, $dstHost, $i);
+			if($res ==1){ 
+				$result = 1; 
+				throw new Exception("Sync of disk data failed!  Please review target Xen dom0 logs for details.");
+			}
+		}
+		$totalTime = time() - $start;
+		$jobTimeFile = "/tmp/job_ctl/". $j->jobID .".proctime";
+		incrementFileLocked($jobTimeFile, $totalTime);
+
+		gen_log(LOG_INFO, "Data sync complete.  Cleaning up now.");
+		rotateCbtSnapshot($vm, $lastSnapUuid, $snapUuid);	// delete the previous snap (none now), and hollow the new one out
+		// just in case we're not connected to the right pool
+		connectXapiByPool($dstHost->poolID);				
+		setTargetCbtSnap($vm->VMID, $targetUuid);
+	}
+	return $result;
+}
+
+function syncDiskCbt($curDisk, $prevDisk, $targDisk, $srcHost, $dstHost, $num){
+	//gen_log(LOG_INFO, "Syncing disk $num");
+	$download = "http://$srcHost->name/export_raw_vdi?vdi=$curDisk->vdi_uuid&base=$prevDisk->vdi_uuid&format=vhd";
+        $upload = "http://$dstHost->name/import_raw_vdi?vdi=$targDisk->vdi_uuid&format=vhd";
+
+        $context = array("http" => array("header" => "Authorization: Basic " . base64_encode("$srcHost->username:$srcHost->password")));
+        $src = fopen($download, 'r', false, stream_context_create($context));
+
+        $context2 = stream_context_create(array(
+            'http' => array(
+                'method' => 'PUT',
+                'header' => 'Content-Type: application/octet-stream',
+                'header' => 'Authorization: Basic '.base64_encode("$dstHost->username:$dstHost->password"),
+                'content' => $src
+            )
+        ));
+        $dst = fopen($upload, 'r', false, $context2);
+
+        gen_log(LOG_INFO, "Transferring delta for disk $num...");
+        $sentBytes=stream_copy_to_stream($src, $dst);
+	gen_log(LOG_INFO, "Transfer of VDI delta complete.  Sent ". bytesToString($sentBytes));
+
+	if($sentBytes === false){ return 1;}
+
+	return 0;
+}
+
+function makeNewReplicaCbt($j, $vm, $srcHost, $dstHost, $sr){
+	gen_log(LOG_WARNING, "System requires an initial baseline (export/import). This will take substantially longer than all subsequent runs.");
+	$result =0;
+	// take snapshot
+	connectXapiByPool($srcHost->poolID);// conenct to target xapi
+
+	$vmDisks = getDisksXen($vm->uuid, false, false);
+        gen_log(LOG_DEBUG, "Enabling CBT on individual VDIs");
+        foreach($vmDisks as $d){ 
+		$res = xen_call("vdi-enable-cbt uuid=$d->vdi_uuid"); 
+		if(strpos($res, "not allowed") !== false){
+			throw new Exception("Your Xen platform does not support CBT operations.  Error: $res");
+		}
+	}
+
+        gen_log(LOG_INFO, "Taking snapshot");
+	$snapTime = time();
+	$snapName = "AlikeERCBT_". $vm->VMID . "_". $snapTime;
+	$snapUuid = takeSnapshotXen($vm->uuid, $snapName);	//"81206e25-103c-e06a-d8c2-70b6ebe4f904";
+
+	$download = "http://$srcHost->name/export?uuid=$snapUuid";
+	$upload = "http://$dstHost->name/import?sr_uuid=$sr->uuid&force=true&restore=true"; 
+
+	$context = array("http" => array("header" => "Authorization: Basic " . base64_encode("$srcHost->username:$srcHost->password")));
+	$src = fopen($download, 'r', false, stream_context_create($context));
+
+	$start = time();
+	$context2 = stream_context_create(array( 
+	    'http' => array( 
+		'method' => 'PUT', 
+		'header' => 'Content-Type: application/octet-stream', 
+		'header' => 'Authorization: Basic '.base64_encode("$dstHost->username:$dstHost->password"), 
+		'content' => $src
+	    )
+	));
+	$dst = fopen($upload, 'r', false, $context2);
+
+        gen_log(LOG_INFO, "Transferring VM data, please wait... ");
+        gen_log(LOG_DEBUG, "Stream copy: $download => $upload");
+	$sentBytes=stream_copy_to_stream($src, $dst);
+
+	$totalTime = time() - $start;
+	$jobTimeFile = "/tmp/job_ctl/". $j->jobID .".proctime";
+	incrementFileLocked($jobTimeFile, $totalTime);
+
+	$worked=false;
+
+	if($sentBytes === false){
+		gen_log(LOG_ERR_NOFAIL, "Transfer Failed!  XAPI closed I/O stream.  If this persists, please check the XAPI logs for details.");
+		deleteSnapshotXen($snapUuid, true);
+	}else{
+		gen_log(LOG_INFO, "Transfer complete.  Sent ". bytesToString($sentBytes));
+		$worked=true;
+	}
+	sleep(2);
+	if($worked){
+		rotateCbtSnapshot($vm, null, $snapUuid);	// delete the previous snap (none now), and hollow the new one out
+
+		$newName = $vm->name ."-AlikeDR Replica";
+		connectXapiByPool($dstHost->poolID);// conenct to target xapi
+		$newUuid = getVmUuidXen($snapName, true);
+		setIsTemplateXen($newUuid, false);
+		// we clone the import b/c if we don't it can cause crazy DUPLICATE_VM errors in xen.  this regenerates the uuids
+		$res = trim(xen_call("vm-clone uuid=$newUuid new-name-label=\"$newName\""));
+		xen_call("vm-destroy uuid=$newUuid");
+		$newUuid = $res;
+
+		$cmd = "echo $newUuid > /home/alike/Alike/agentShare/repCache/$vm->VMID/replica.uuid";
+		exec($cmd);
+		
+		// just in case we're not connected to the right pool
+		connectXapiByPool($dstHost->poolID);
+		setTargetCbtSnap($vm->VMID, $newUuid);
+	}
+	fclose($src);
+	fclose($dst);
+	if($worked == false){ $result =1; }
+	return $result;
+}
+
+function rotateCbtSnapshot($vm, $old, $newUuid){
+//	$new = getDisksXen($newUuid, false, true);
+//        foreach($new as $d){
+//                $res = xen_call("vdi-data-destroy uuid=$d->vdi_uuid");          // hollow out the VDIs	!!! doesn't work b/c of VBDs?
+//                gen_log(LOG_DEBUG, "Data Destroyed CBT vdi ($d->vdi_uuid) Res: $res");
+//        }
+	if(!empty($old) ){
+		gen_log(LOG_DEBUG, "Deleting previous CBT marker ($old)");
+		deleteSnapshotXen($old, true);
+	}
+	setLastCbtSnap($vm->VMID, $newUuid);
+	gen_log(LOG_DEBUG, "Updated CBT marker with new snapID ($newUuid)");
+}
+
+function revertToLastCbtSnap($vmid){
+	$nm = "cbt_$vmid";
+	$json = parse_xen_result(xen_call("snapshot-list name-label=$nm"));
+	gen_log(LOG_DEBUG, "snapshot-list results: $json");
+	$inf = json_decode($json);
+	if(!empty($inf) && isset($inf[0]->uuid)){
+		$revCmd = "snapshot-revert snapshot-uuid=".$inf[0]->uuid;
+		$res = xen_call("snapshot-revert snapshot-uuid=".$inf[0]->uuid);
+		gen_log(LOG_DEBUG, "revert ($revCmd) results: $res");
+		if(!empty(trim($res))){
+			throw new Exception("Failed to revert target replica to base state!  Xen error: $res");
+		}
+	}else{
+		throw new Exception("No previous target replica base state (snap) found!  List: $json");
+	}
+}
+function setTargetCbtSnap($vmid, $uuid){
+	$nm = "cbt_$vmid";
+	$inf = json_decode(parse_xen_result(xen_call("snapshot-list name-label=$nm")));
+	if(!empty($inf) && isset($inf[0]->uuid)){
+		$res = xen_call("snapshot-destroy snapshot-uuid=".$inf[0]->uuid);
+		gen_log(LOG_DEBUG, "Cleaned old cbt snap: $res");
+	}
+	$newSnap = takeSnapshotXen($uuid, $nm);
+
+	if(strpos($newSnap, "Error") !== false){
+		gen_log(LOG_WARNING, "Failed to take cbt snap: $newSnap");
+	}else{
+		gen_log(LOG_DEBUG, "Took new cbt snap: $newSnap");
+	}
+}
+
+function verifyCBT($uuid, $srcHid, $dstHid){
+        $vmmem;
+        $dstMem;
+        $dstVers;
+        $srcVers;
+        xen_connect($srcHid);
+        $h = getHost($srcHid);
+        $res = xen_call("host-param-list", "uuid=$h->uuid" );
+        $resp = json_decode(parse_xen_result($res), true);
+        $det = $resp[0];
+        $srcVers = $det["software-version"]["product_version_text_short"];
+
+        $cmd = "vm-param-get uuid=$uuid param-name=memory-static-max";
+        $vmmem =trim(xen_call($cmd));
+        if(strpos($vmmem, "uuid") !== false){ throw new Exception("Could not find VM with UUID $uuid on source host"); }
+	$disks = getDisksXen($uuid,true);
+	foreach($disks as $d){
+		$has = trim(xen_call("vdi-param-get param-name=cbt-enabled uuid=$d->vdi_uuid"));
+                gen_log(LOG_DEBUG, "Xen says cbt-enabled status on vdi $d->vdi_uuid is $has");
+                if($has != "true"){
+                        $res = trim(xen_call("vdi-enable-cbt uuid=$d->vdi_uuid"));
+                        gen_log(LOG_DEBUG, "Enabling CBT on VDI $d->vdi_uuid (res: $res)");
+                }else{
+                        gen_log(LOG_DEBUG, "CBT enabled on vdi $d->vdi_uuid");
+                }
+	}
+        //echo "VM Memory: $vmmem\n";
+        $res =trim(xen_call("vif-list vm-uuid=$uuid"));
+        $macs = array();
+        $all = json_decode(parse_xen_result($res), true);
+        foreach($all as $a){
+                $cmd = "vif-param-get uuid=".$a["uuid"]." param-name=MAC";
+                $res =trim(xen_call($cmd));
+                array_push($macs, $res);
+        }
+        // do remote host stuff here
+        if($srcHid != $dstHid){
+                //echo "Connecting to dest: $dstHid\n";
+                xen_connect($dstHid);
+        }
+        $h = getHost($dstHid);
+        $res = xen_call("host-param-list", "uuid=$h->uuid" );
+        $resp = json_decode(parse_xen_result($res), true);
+        $det = $resp[0];
+        $dstVers = $det["software-version"]["product_version_text_short"];
+        $dstMem = $det["memory-free"];
+        //echo "Host: $dstMem, $dstVers\n";
+        if ($dstMem  < $vmmem){
+                //throw new Exception("Target Host does not have enough memory for VM (has: $dstMem, needs: $vmmem)");
+                gen_log(LOG_DEBUG, "Target Host does not have enough memory for VM (has: $dstMem, needs: $vmmem)");
+        }
+        //echo "Src: $srcVers -> Dest: $dstVers\n";
+        if ($srcVers >= 8.0 && $dstVers < 8.0){
+                throw new Exception("Target Host is not compatible with source host (too old: $dstVers vs $srcVers)");
+        }
+
+        $cmd = "vif-list params=MAC";
+        $res =json_decode(parse_xen_result(trim(xen_call($cmd))));
+        foreach($res as $m){
+                if(in_array($m->MAC, $macs)){
+                        echo "Found MAC: $m->MAC\n";
+                        throw new Exception("Duplicate MAC address found in target pool ($m->MAC)");
+                }
+        }
+
+
+}
+
+
+?>

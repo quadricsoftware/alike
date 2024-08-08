@@ -1,0 +1,15 @@
+#!/usr/bin/php -q
+<?php
+
+include_once("/usr/local/sbin/shared_lib");
+include_once("/usr/local/sbin/common_lib");
+
+$cmd = array();
+$cmd["command"] = "deleteVmRetainOnly";
+$cmd["site"] = $argv[1];
+$cmd["uuid"] = $argv[2];
+$cmd["retained"] = $argv[3];
+
+issueJavaCmd($cmd, 0, 0, 0);
+
+?>

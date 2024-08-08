@@ -1,0 +1,209 @@
+#!/usr/bin/php -q
+<?php
+
+include_once("/usr/local/sbin/xen_common");
+include_once("/usr/local/sbin/common_lib");
+include_once("/usr/local/sbin/insta_common");
+include_once("/usr/local/sbin/shared_lib");
+
+if(count($argv) < 2){
+	usage();
+}
+
+$mode="";
+
+if($argv[1] == "pre") {
+	$mode ="pre";
+}else if($argv[1] =="post"){
+	$mode ="post";
+}else{
+	usage();
+}
+
+function usage(){
+        die("Please choose: pre or post\n");
+}
+
+# Pre is run before startAlike since java has needs
+if($mode == "pre"){
+	checkADSShare();
+	// set smb passwords
+	updateLocalUsers();
+	updateHostname();
+	// set passwd
+
+	echo "Syncing new DB settings to ADS\n";
+	exec("/usr/local/sbin/dbSyncer /home/alike/Alike/DBs/nimbusdb.db");
+
+	$cnf = makeMungeConf();
+	echo "Backup Data transfer port bound to: $cnf\n";
+
+	echo "Checking A3 SR Setup\n";
+	echo makeInstaConfigs();
+
+	echo "Starting background tasks...";
+	popen("su - alike -c '/usr/local/sbin/gatherMetrics'", "r");
+	popen("su - alike -c '/usr/local/sbin/managerTasks'", "r");
+	echo " complete.\n";
+
+	echo "Enabling Xen-specific safety measures for A3 \n";
+	applyXenSafety();
+
+	echo "Checking for stray/orphan Alike_SRs\n";	
+	$hids = getPoolMasters();
+        foreach($hids as $hid){
+		xen_connect($hid);
+		checkOrphanSrs();
+	}
+
+}
+
+if($mode == "post"){
+	echo "Plugging NFS SR into Xen Pool(s)\n";
+	replugAll();
+
+	echo "Checking and preparing ABD templates\n";
+	setupABDs();
+
+	echo "Resuming any paused ABDs\n";
+	findAndUnpauseABDs();
+}
+
+
+function setupABDs(){
+	$hids = getPoolMasters();
+        foreach($hids as $hid){
+		$h = getHost($hid);
+		$cmd = "/usr/local/sbin/abdAdmin import $h->hostID";
+		echo shell_exec($cmd);
+	}
+}
+function findAndUnpauseABDs(){
+        $sql = "SELECT uuid,poolID from Appliance order by poolID";
+	$out = dbGet("nimbus", $sql);
+        $curHost = null;
+	foreach($out as $a){
+                if($curHost == null || $curHost->poolID != $a->poolID){
+                        $curHost = getPoolMasters($a->poolID);
+                        $h = $curHost[0];
+                        xen_connect($h);
+                }
+                $cmd = "vm-unpause uuid=$a->uuid";
+                $rez = trim(xen_call($cmd));
+        }
+}
+
+
+function replugAll(){
+        $all = getHosts();
+        foreach($all as $h){
+                if($h->type == 2){
+                        $cmd = "/usr/local/sbin/instaAdmin plugSrToHost $h->hostID";
+                        echo shell_exec($cmd);
+			scanSr($h->hostID);
+
+                }
+        }
+}
+
+
+function makeInstaConfigs(){
+	$cnf ="/mnt/instaboot/sr.id";
+	if(!file_exists($cnf)){
+		$uuid = strtolower(getInstallID());
+		$name = "QS_Alike_SR";
+		echo "Restore SR config missing. Creating defaults\n";
+		$d = array();
+		$d["sr-uuid"] = $uuid;
+		$d["name"] = $name;
+		$s = file_put_contents($cnf, json_encode($d) );
+		// { "sr-uuid" = "uuid", name="" }
+
+	}else{
+		$d = json_decode(file_get_contents($cnf),true);
+		echo "Restore SR config found.\n";
+		echo "SR Name: ". $d["name"] ."\n";
+		echo "SR UUID: ". $d["sr-uuid"] ."\n";
+	}
+}
+function makeMungeConf(){
+        $db = "/home/alike/Alike/DBs/nimbusdb.db";
+        $dbc = new PDO("sqlite:$db");
+
+        $sql = "select val from settings where name= ?";
+        $stmt = $dbc->prepare($sql);
+        $stmt->execute(array("hostIP" ));
+        $ip= $stmt->fetchColumn();
+        $sql = "select val from settings where name= ?";
+        $stmt = $dbc->prepare($sql);
+        $stmt->execute(array("mungePort" ));
+        $port= $stmt->fetchColumn();
+        if(empty($port) || $port ==""){ $port = "2811"; }
+        $key = strtoupper(md5(mt_rand(1,1000000)) );
+        $cont = "$ip,$port,$key";
+
+        file_put_contents("/home/alike/Alike/agentShare/munge.conf",$cont);
+        return "$ip:$port";
+}
+
+
+function updateLocalUsers(){
+	$sql = "SELECT val from settings where name='uiPass'";
+	$pass = dbGetColumn("nimbus", $sql);
+	updateUser("alike", $pass);
+	updateSMBUser("alike", $pass);
+
+	$sql = "SELECT val from settings where name='dataStorePass'";
+	$pass = dbGetColumn("nimbus", $sql);
+	updateSMBUser("ads", $pass);
+}
+
+
+function updateUser($user, $pass){
+	$pass = addslashes($pass);
+	$cmd = sprintf("echo '%s:%s' | /usr/sbin/chpasswd", $user, $pass);
+	exec($cmd);
+}
+function updateSMBUser($user, $pass){
+	$pass = addslashes($pass);
+	$cmd = sprintf("echo '%s\n%s\n%s' | smbpasswd -s -a %s", $pass, $pass, $pass, $user);
+        exec($cmd);
+}
+
+function checkADSShare(){
+	$ip = getHostIP();
+	if(empty($ip)){
+		die("Could not fine hostIP in DB!\n");
+	}
+	$share = "//$ip/ads/";
+	$sql ="REPLACE into settings (name,val) VALUES('dataStoreShare',?)";
+	dbSet("nimbus", $sql, array($share) );
+}
+
+
+function applyXenSafety(){
+	$guid = trim(file_get_contents("/sys/hypervisor/uuid"));
+	if(empty($guid)){
+		echo "Couldn't find Xen Guid!\n";
+		return;
+	}
+
+	$poolID = connectXapiByVm($guid);
+	if(empty($poolID)){
+		syslog(LOG_WARNING, "Could not find pool for A3 host- Failed to set A3 Xen safety restrictions!");
+		return;
+	}
+	// prevent users from caussing serious harm by blocking 
+	$cmd = "vm-param-set uuid=$guid blocked-operations:snapshot=false;";
+	xen_call($cmd);
+	$cmd = "vm-param-set uuid=$guid blocked-operations:checkpoint=false;";
+	xen_call($cmd);
+	$cmd = "vm-param-set uuid=$guid blocked-operations:suspend=false;";
+	xen_call($cmd);
+	$cmd = "vm-param-set uuid=$guid blocked-operations:migrate_send=false;";
+	xen_call($cmd);
+	$cmd = "vm-param-set uuid=$guid blocked-operations:pool_migrate=false;";
+	xen_call($cmd);
+}
+
+?>

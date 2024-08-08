@@ -1,0 +1,237 @@
+<?php
+
+
+$metaConverter = "/usr/local/sbin/converterleg.exe";
+
+
+function engine_getBlockFile(&$print, $useOds=false){
+        if(file_exists($print)){ return $print; }
+        $basey = "/mnt/ads/blocks/";
+        if($useOds) {
+                $basey = "/mnt/ods1/blocks/";
+        }
+        return $basey.substr($print, 0,3)."/$print";
+}
+
+/*
+ * Load and HCL block by block, extract the blocks, and echo them to std out
+ */
+function engine_extractBlocks($hclFile, $blockPasswd, $useOds) {
+	$handle = fopen($hclFile, "r");
+	if($handle === false) {
+		throw new Exception("File $hclFile cannot be opened");
+	}
+	try {
+	    	while (($line = fgets($handle)) !== false) {
+			$line = trim($line);
+			if($line == "CODA") {
+				continue;
+			}
+        		echo engine_extractBlock($line, $blockPasswd, $useOds);
+	    	}
+	} finally {
+	    fclose($handle);
+	}
+}
+
+function engine_extractBlock($print, $blockPasswd, $useOds=false) {
+	$pf = engine_getBlockFile($print, $useOds);
+        if(!file_exists($pf)){ throw new Exception("Could not find block file: $pf"); }
+        $fs = filesize($pf);
+        if($fs <= 4){ throw new Exception("Block $print is abnormally small ($fs bytes).\nFile: $pf"); }
+	
+        $fh = null;
+	$contents = "";
+	try {
+		$fh = fopen($pf, "r");
+	        $contents = fread($fh, $fs);
+	} finally {
+		fclose($fh);
+	}
+	$contSize = strlen($contents);
+	$privateParts = unpack("C*", substr($contents, 0, 4));
+	$head = $privateParts[1];
+	$blockSize = 1024 * 1024 * 2;
+	$payload = substr($contents,4);
+	$paySize = strlen($payload);
+	if(engine_isBlockEncrypted($head)) {
+		$payload = engine_decrypt($print, $payload, $blockPasswd);
+	}
+	if(engine_isBlockCompressed($head)) {
+		$payload = engine_lz4Decompress($payload);
+	}
+	return $payload;
+}
+
+function engine_lz4Decompress($in, $offset = 0) {
+  $len = strlen($in);
+  $out = '';
+  $i = $offset;
+  $take = function() use ($in, &$i) {
+    return ord($in[$i++]);
+  };
+  $addOverflow = function(&$sum) use ($take) {
+    do {
+      $sum += $summand = $take();
+    } while ($summand === 0xFF);
+  };
+  while ($i < $len) {
+    $token = $take();
+    $nLiterals = $token >> 4;
+    if ($nLiterals === 0xF) $addOverflow($nLiterals);
+    $out .= substr($in, $i, $nLiterals);
+    $i += $nLiterals;
+    if ($i === $len) break;
+    $offset = $take() | $take() << 8;
+    $matchlength = $token & 0xF;
+    if ($matchlength === 0xF) $addOverflow($matchlength);
+    $matchlength += 4;
+    $j = strlen($out) - $offset;
+    while ($matchlength--) {
+      $out .= $out[$j++];
+    }
+  }
+  return $out;
+}
+
+
+/* function engine_lz4Decompress($payload, $outSize) {
+	// Command to execute
+	$command = "/usr/local/sbin/lz4 -d -c stdin";
+	$inCount = strlen($payload);
+
+	// Open the process
+	$descriptors = array(
+    			0 => array('pipe', 'r'), // stdin
+			1 => array('pipe', 'w'), // stdout
+			2 => array('pipe', 'w') // stderr
+			);
+
+	$process = proc_open($command, $descriptors, $pipes);
+	$output = "";
+	$error = "";
+	$code = 0;
+	if (is_resource($process)) {
+	    // Write the variable's value to the stdin of the process
+	    // Write the header, magic first
+	fwrite($pipes[0], hex2bin("184D2204"));
+	// Poop out final size
+	fwrite($pipes[0], decbin($outSize));
+	// And "in" size
+	fwrite($pipes[0], decbin($inCount));
+ 	fwrite($pipes[0], $payload);
+	// Close stdin
+	fclose($pipes[0]);	
+	
+	    // Read the output from stdout and stderr
+	    $output = stream_get_contents($pipes[1]);
+	    $error = stream_get_contents($pipes[2]);
+
+	    // Close the pipes and the process
+	    fclose($pipes[1]);
+	    fclose($pipes[2]);
+	    $code = proc_close($process);
+	}
+	if($code != 0) {
+		throw new ErrorException("lz4 failed with error code $code and msg: $error");
+	}
+	$inCount = strlen($payload);
+	$outCount = strlen($output);
+	echo "Fed $inCount bites to lz4 decomp, got back $outCount bites\n";
+	return $output;
+}*/
+
+
+function engine_decrypt($printPath, $blockPass, $payload) {
+	;
+}
+
+
+function engine_isBlockEncrypted($header) {
+	if(($header & 128) != 0) {
+		return true;
+	}
+	return false;
+}
+
+function engine_isBlockCompressed($header) {
+	if(($header & 2) != 0) {
+		return true;
+	}
+	return false;
+}
+
+
+	
+
+function engine_getEclHeader($path) {
+	$f = fopen($path, "r");
+	$bites = fread($f, 48);
+	if($bites === false) {
+		throw new ErrorException("Unable to read file $path");
+	}
+	//$foo = array();
+	$foo['epoch'] = unpack("P", substr($bites, 0));
+	$b1 = implode(unpack("H*", strrev(substr($bites, 8, 4))));
+	$b2 = implode(unpack("H*", strrev(substr($bites, 12, 2))));
+	$b3 = implode(unpack("H*", strrev(substr($bites, 14, 2))));
+	$b4 = implode(unpack("H*", substr($bites, 16, 8)));
+	$b4a = str_split($b4, 4);
+	$b4b = implode(array_slice($b4a,1));
+	$guid = "$b1-$b2-$b3-$b4a[0]-$b4b";	
+	$foo['guid'] = $guid;
+	$foo['hclOffset'] = unpack("V", substr($bites, 24))[1];
+	$foo['metaSize'] = unpack("V", substr($bites, 28))[1];
+ 	$foo['eclVers'] = unpack("V", substr($bites, 32))[1];
+	$foo['diskCount'] = unpack("V", substr($bites, 36))[1];
+	$foo['vmNameSize'] = unpack("V", substr($bites, 40))[1];
+	$foo['virtType'] = unpack("V", substr($bites, 44))[1];
+	return (object) $foo;
+}
+
+/*
+ * Give me an ECL, and I'll give you meta
+ */
+function engine_getMetaInfo($path) {
+	$header = engine_getEclHeader($path);
+	$offset = $header->vmNameSize + ($header->diskCount * 12) + 48;
+	//echo "Offset will be $offset\n";
+	$f = fopen($path, "r");
+	fseek($f, $offset);
+	$info = fread($f, $header->metaSize);
+	if($info == false) {
+		throw new ErrorException("Unable to read metadata at path $path");
+	}
+	return $info;
+}
+
+
+function engine_getMetaInfoDecoded($eclFile) {
+	global $metaConverter;
+
+	$meta = engine_getMetaInfo($eclFile);
+	$jason = shell_exec("echo $meta |$metaConverter");
+	$xm = json_decode($jason);
+	return $xm;
+}
+
+function engine_getMetaInfoEncoded($jsonText) {
+	global $metaConverter;
+	$rando = createUuid();
+        $tmpPath = "/tmp/$rando.json";
+        file_put_contents($tmpPath, $jsonText); 
+	try {
+		$cmd = "cat $tmpPath |$metaConverter -j";
+		echo "$cmd\n";
+		$encoded = managedRun($cmd);
+		if(empty($encoded->stdErr) == false) {
+			throw new ErrorException($encoded->stdErr);
+		}
+		return $encoded->stdOut;
+	} finally {
+		unlink($tmpPath);
+	}	
+}
+
+	
+?>

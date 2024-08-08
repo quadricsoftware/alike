@@ -1,0 +1,156 @@
+#!/usr/bin/php -q
+<?php
+/* 
+ * Stops NFS and cleans out ALL instaboot structures 
+ */
+
+
+include_once("/usr/local/sbin/common_lib");
+include_once("/usr/local/sbin/xen_common");
+include_once("/usr/local/sbin/insta_common");
+include_once("/usr/local/sbin/abd_common");
+
+$me = pathinfo(__FILE__, PATHINFO_FILENAME);
+
+if(count($argv) < 2){
+	usage();
+        return 0;
+}
+$mode = $argv[1];
+
+if($mode != "pause" && $mode != "suspend" && $mode != "kill" && $mode != "halt" && $mode != "clean") {
+	usage();
+	exit(-1);
+}
+
+function usage(){
+	echo "Usage: [pause|suspend|halt|kill|clean]\n";
+	echo "pause - Attempt to pause any VM running from the local NFS SR\n";
+	echo "suspend - Attempt to suspend any VM running from the local NFS SR\n";
+	echo "\tVMs that do not have XenTools installed will be paused instead.\n";
+	echo "\tNOTE- The suspend operation can take quite a bit of time to complete.\n";
+	echo "halt - Attempt force shutdown any VM running from the local NFS SR\n";
+	echo "kill - Shutdown any VM running on the local SR, and delete ALL local temp data.\n";
+	echo "clean - If nothing is running or booted, clean out local temp area\n";
+	echo "\n";
+}
+
+// Only way this is gonna work
+if(!amRoot()){
+        echo "This script must be run as root.\n";
+        return;
+}
+
+gen_log(LOG_INFO, "Instaboot cleanup initiated");
+if($mode == "kill" || $mode == "clean") {
+	$fail = false;
+	$sanity = listInstaVmHosts();
+	$county = count($sanity);
+	if($county > 0) {
+		gen_log(LOG_ERR, "$county VM(s) still deployed on our SR! Power off and delete them FIRST!");
+		$fail=true;
+	}
+	if($mode == "kill") {
+		$sanity = findNonInstas();
+		if(count($sanity) > 0){
+			foreach($sanity as $s){
+				foreach($s["vms"] as $vm){
+					gen_log(LOG_ERR, $vm["name"]." [".$vm["vm"] ."] on ".$s["host"] ." must be deleted first ");
+					$fail=true;
+				}
+			}
+		}
+	}
+	if($fail == true){ exit(-1); }
+	gen_log(LOG_INFO, "Wiping and removing");
+	wipeAndRemove($mode);
+	if($mode == "kill") {
+		exec("/usr/local/sbin/setupNfs");
+	}
+
+} else {
+
+	setStateForAllInstabootVms($mode);
+	setStateForAllNonInstabootVms($mode);
+	if($mode == "pause"){
+		gen_log(LOG_INFO, "Pausing of all VMs on SR complete.");
+	}else if($mode=="suspend"){
+		gen_log(LOG_INFO, "Suspending of all VMs on SR complete.");
+	}else if($mode == "halt"){
+		gen_log(LOG_INFO, "Halting of all VMs on SR complete.");
+	}
+        $hids = getPoolMasters();
+        foreach($hids as $hid){
+                echo shell_exec("/usr/local/sbin/instaAdmin unplugSrToHost $hid");
+        }
+	resetAllABDs();
+	exit(0);
+}
+
+function wipeAndRemove($mode){
+	global $reservedSrId;
+	global $nfsBase;
+	if($mode == "kill") {
+		gen_log(LOG_INFO, "Finding and unplugging instaboot SRs");
+		$hosts = getHosts();
+		foreach($hosts as $h) {
+			$hostName = $h->name;
+			$hostId = $h->hostID;
+			$hostUuid = $h->uuid;
+			if($h->type != 2){ continue; }
+			xen_connect($hostId);
+			if(hasInstaSr() == true) {
+				gen_log(LOG_DEBUG, "Unplugging SR for $hostName");
+				unplugInstaSr($hostId, $hostUuid);
+			}
+		}
+	}
+
+	// How much orphan data is there? Let the customer know.
+	$rez = shell_exec("du -hs $nfsBase/base/xen/$reservedSrId");
+	$rez = trim($rez);
+	$data = "0KB";
+	$rez = @preg_split("/\s+/", $rez);
+	if(empty($rez) == false) {
+		$data = $rez[0];
+	}
+	if($mode == "kill") {
+		gen_log(LOG_INFO, "Deleting $data of orphan VDI data");
+		shell_exec("rm -fr $nfsBase/base/xen/$reservedSrId");
+	} else {
+		deleteNonAbdStuff("$nfsBase/base/xen/$reservedSrId");
+	}
+}
+
+function deleteNonAbdStuff($theDir) {
+	$dir = new DirectoryIterator($theDir);
+	$excludes = listABDDisks();
+	$excludeCount = count($excludes);
+	$deletedCount = 0;
+	$deletedSize = 0;
+	foreach($dir as $f) {
+		if($f->isDir()) {
+			continue;
+		}
+		$shouldSkip = false;
+		foreach($excludes as $e) {
+			if($e == $f) {
+				$shouldSkip = true;
+				gen_log(LOG_DEBUG, "Skipping ABD VHD $f");
+				break;
+			}
+		}
+		if($shouldSkip) {
+			continue;
+		}
+		$deletedSize += $f->getSize();
+		gen_log(LOG_DEBUG, "Cleaning file $f");
+		unlink($f->getPathname());
+		$deletedCount++;
+	}	
+	gen_log(LOG_INFO, "SR cleanup deleted $deletedCount files totaling $deletedSize bytes");
+}
+
+
+
+?>
