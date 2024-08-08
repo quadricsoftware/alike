@@ -1,0 +1,11 @@
+[Unit]
+Description=Alike DBSync at shutdown
+#Before=shutdown.target reboot.target halt.target
+RequiresMountsFor=/mnt/ads_raw /mnt/ads
+#After=remote-fs-pre.target remote-fs.target
+[Service]
+ExecStart=/bin/true
+ExecStop=/usr/local/sbin/a2Shutdown
+RemainAfterExit=yes
+[Install]
+WantedBy=multi-user.target

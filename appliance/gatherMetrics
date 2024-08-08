@@ -1,0 +1,89 @@
+#!/usr/bin/php -q
+<?php
+
+// We need to kill ourselves and let our child live on for Docker
+$pid = pcntl_fork();
+if($pid) { exit(0); }
+
+@exec("mkdir -p /tmp/metrics");
+
+$GLOBALS["netLog"] = "/tmp/metrics/net_usage";
+$GLOBALS["netLogBak"] = "/tmp/metrics/net_usage_site0";
+
+
+$lastCpu=0;
+$lastIdle=0;
+$netStats = setupNet();
+$backupStats = $netStats;
+
+while (true){
+	doNetTick( $netStats, $backupStats);
+	doCpuTick();
+	sleep(1);
+}
+
+
+function doCpuTick(){
+        global $lastCpu, $lastIdle;
+        $cpu = explode(" ", trim(shell_exec("sed -n 's/^cpu\s//p' /proc/stat| tr -s \" \"") ) );
+        $idle = $cpu[3] + $cpu[4];
+        $time = array_sum($cpu);
+        $total = round((1.0 - ($idle - $lastIdle) / ($time- $lastCpu)) * 100, 2);
+        $lastCpu = $time;
+        $lastIdle = $idle;
+	$fn = "/tmp/metrics/cpu_usage";
+	file_put_contents($fn, $total);
+}
+
+function doNetTick(&$stats, &$backupStats){
+
+	$int = "eth0";
+	$rx = "/sys/class/net/$int/statistics/rx_bytes";
+	$tx = "/sys/class/net/$int/statistics/tx_bytes";
+
+	if(file_exists($rx)){
+		$net = new stdClass();
+		$net->rx = trim(file_get_contents($rx));
+		$net->tx = trim(file_get_contents($tx));
+
+		$back = new stdClass();
+		if(file_exists("/tmp/metrics/0_down.bandwidth") ){
+			$back->rx = trim(fgets(fopen("/tmp/metrics/0_up.bandwidth", 'r')));
+			$back->tx = trim(fgets(fopen("/tmp/metrics/0_down.bandwidth", 'r')));
+		}else{
+			$back->tx=0;
+			$back->rx=0;
+		}
+		sleep(1);
+
+		$net->rx = trim(file_get_contents($rx))  - $net->rx;
+		$net->tx = trim(file_get_contents($tx))  - $net->tx;
+
+		array_push($stats, $net);
+		array_shift($stats);
+		$j = json_encode($stats);
+		@file_put_contents($GLOBALS["netLog"], $j);
+
+		// now for the backups
+		array_push($backupStats, $back);
+		array_shift($backupStats);
+		$j = json_encode($backupStats);
+		@file_put_contents($GLOBALS["netLogBak"], $j);
+	}
+}
+function setupNet(){
+	$netStats = array();
+	$dummy = new stdClass();
+	$dummy->tx =0;
+	$dummy->rx =0;
+	for ($i=0; $i<30; $i++){ array_push($netStats, $dummy); }
+	$j = json_encode($netStats);
+	file_put_contents($GLOBALS["netLog"], $j);
+	file_put_contents($GLOBALS["netLogBak"], $j);
+	return $netStats;
+}
+
+
+
+
+?>

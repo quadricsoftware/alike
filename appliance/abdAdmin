@@ -1,0 +1,153 @@
+#!/usr/bin/php -q
+<?php
+
+include_once("abd_common");
+
+$me = pathinfo(__FILE__, PATHINFO_FILENAME);
+if($argc < 2){
+	usage();
+}
+
+
+if(!amRoot()){ die("This script must be run by root.\n"); }
+
+if($argv[1] != "import" && $argv[1] != "cull-all" && $argv[1] != "delete-idle" && $argv[1] != "provision" && $argv[1] != "scrub-orphans" && $argv[1] != "report" && $argv[1] != "abd" && $argv[1] != "run-diag"){
+	usage();
+}
+
+$jobId=null;
+$args = array();
+for($i=0; $i < $argc; $i++ ){
+	if($argv[$i] == "-j"){
+		if($argc > $i){
+			$jobId = $argv[$i+1];
+			break;
+		}	
+	}
+	array_push($args, $argv[$i]);
+}
+$argc = count($args);
+
+if($jobId != null){
+	$GLOBALS["__insta_job_id"] = $jobId;
+}
+
+$abdLockTimeout = 60;	// wait x seconds to get lock.  Lock can span provisioning of new ABD, so it can take a while
+
+// NB- exiting with anything but a 0 will mark the job as a failure by jobRunner
+try{
+
+	if($args[1] == "abd") {
+		if($argc < 4){
+			echo "Insufficient arguments.\n";
+			echo "abd [boot|halt|assign|assign-by-pool|unassign|scrub|forget|delete] <id>\n";
+			exit(1);
+		}
+		$v = $args[2];
+		$id = $args[3];
+		$vmid =0;
+
+
+		if($argc > 4){ $vmid = $args[4]; }
+
+		if($v == "delete"){ deleteABD($id); }
+		else if($v == "scrub"){ scrubABD($id); }
+		else if($v == "boot"){ bootABD($id); }
+		else if($v == "halt"){ haltABD($id, false); }
+		else if($v == "forget"){ forgetABD($id, false); }
+		else if($v == "assign"){ 
+			if($vmid ==0){
+				throw new Exception("No VMID provided to assign ABD $id");
+			}
+			$GLOBALS["__insta_vm_id"] = $vmid;
+			assignABD($id, $vmid); 
+		} else if($v == "assign-by-pool"){ 
+			if($vmid ==0){
+				throw new Exception("No VMID provided to assign ABD to pool: $id");
+			}
+			$GLOBALS["__insta_vm_id"] = $vmid;
+			assignABDbyPool($id, $vmid); 
+		}
+		else if($v == "unassign"){ unassignABD($id); }
+		else if($v == "unassign-by-vm"){ 
+			$GLOBALS["__insta_vm_id"] = $vmid;
+			unassignABDbyVm($id); 
+		} else{
+			gen_log(LOG_ERR_NOFAIL, "Unrecognized command: abd $v");
+		}
+	}
+	if($args[1] == "report") {
+		showABDReport();
+	}
+	if($args[1] == "scrub-orphans") {
+		scrubOrphanABDs();
+	}
+	if($args[1] == "provision") {
+		$poolID = $args[2];
+		$flock = qflock("/tmp/abd_fl_$poolID", $abdLockTimeout);
+		try{
+			echo "Got flock!\n";
+			$id = provisionABD($poolID, null);
+			unassignABD($id);
+		}finally{ 
+			qunflock($flock); 
+			echo "Returned flock!\n";
+		}
+	}
+	if($args[1] == "run-diag") {
+		$poolID = $args[2];
+		runABDDiag($poolID);
+	}
+
+	if($args[1] == "import") {
+		$hostId =0;
+		if($argc >2){ $hostId = $args[2]; }
+		if(!is_numeric($hostId)){ throw new Exception("HostID ($hostId) must be numeric!"); }
+		gen_log(LOG_INFO, "Importing to hostID $hostId");
+		importABD($hostId);
+
+	}
+	if($args[1] == "cull-all") {
+		$hostId =0;
+		if($argc >2){ $hostId = $args[2]; }
+		if(!is_numeric($hostId)){ throw new Exception("HostID ($hostId) must be numeric!"); }
+
+		echo "Now we will cull all ABDs and VHDs from our SR. HostID: $hostId\n";
+		cullABDs($hostId);
+	}
+	if($args[1] == "delete-idle") {
+		echo "Now we will shutdown and remove all idle ABDs \n";
+		$pid =0;	// 0 = all pools
+		if($argc >2){ $pid = $args[2]; }
+		deleteIdleABDs($pid);
+	}
+
+}catch(Exception $ex){
+	gen_log(LOG_ERR, $ex->getMessage());
+	exit(-1);
+}
+
+exit(0);
+
+
+function usage(){
+        echo "Usage: [import|provision|cull-all|delete-idle|scrub-orphans|report|run-diag|abd] <args>\n";
+	echo "\timport: hostID or 0 for all hosts. Imports ABD image to host/pool\n";
+	echo "\tprovision: <poolID> Spawns a new ABD from template, using Pool net settings\n";
+	echo "\tcull-all: <hostID> Removes all provisioned ABDs and deletes templates\n";
+	echo "\tdelete-idle: Deletes any Idle ABDs\n";
+	echo "\tscrub-orphans: cleans any orphaned ABD DB entries\n";
+	echo "\trun-diag: <poolID> Performs an ABD diag job, spawning an ABD if needed\n";
+	echo "\treport: gives an overview of pools and deployed ABDs\n";
+	echo "\tabd: [boot|halt|assign|assign-by-pool|unassign|scrub|forget|delete] <abdID> - perform action on a specific ABD\n";
+
+	echo "\t\tscrub- cleans any stray snapshot disks and preps the abd for the next job\n";
+	echo "\t\t[un]assign- Checks out/checks in ABD to a VM for a job\n";
+	echo "\t\tboot|halt- Starts or stops the ABD\n";
+	echo "\t\tdelete- Halts ABD, deletes ABD from Xen and DB\n";
+	echo "\t\tforget- Deletes ABD from DB (and returns IP if needed)\n";
+
+	
+        exit(1);
+}
+?>

@@ -1,0 +1,16 @@
+#!/usr/bin/php -q
+<?php
+
+include_once("/usr/local/sbin/shared_lib");
+include_once("/usr/local/sbin/common_lib");
+
+
+$cmd = array();
+$cmd["command"] = "refCheck";
+$cmd["site"] = $argv[1];
+$cmd["outputFile"] = "/tmp/json.json";
+
+$barf = issueJavaCmd($cmd, 0, 0, 0);
+echo $barf;
+
+?>

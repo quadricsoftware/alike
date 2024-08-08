@@ -1,0 +1,35 @@
+#!/usr/bin/php -q
+<?php
+
+include_once("/usr/local/sbin/common_lib");
+
+$mem = getMemory();
+if($argc > 1 && $argv[1] == "dbsize") {
+	$maxSize = 24576;
+	$minSize = 64;
+	$dbSetSize = "/home/alike/db_rd_size";
+	if(file_exists($dbSetSize)){
+		$static = trim(file_get_contents($dbSetSize));
+		if(is_numeric($static) && $static > $minSize && $static < $maxSize){  
+			echo $static;
+			exit(0);
+		}
+	}
+	
+	$dbSize = 96;
+	$gb = round($mem->total / 1024 /1024);
+
+	$unit = 11;
+	$rec = round($gb  / $unit);
+
+	if($rec > $dbSize ){ $dbSize = $rec; }
+
+	echo $dbSize;
+	exit(0);
+}
+
+// Java's memory thing
+
+echo $mem->total / 2;
+
+?>

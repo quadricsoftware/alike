@@ -1,0 +1,17 @@
+#!/usr/bin/php -q
+<?php
+
+include_once("/usr/local/sbin/common_lib");
+include_once("/usr/local/sbin/shared_lib");
+
+$myFile = "/tmp/engineStatus.out";
+$cmd = array();
+$cmd["command"] = "status";
+$cmd["site"] = "0";
+$cmd["outputFile"] = $myFile;
+
+issueJavaCmd($cmd, 0, 0, 0);
+echo file_get_contents($myFile);
+echo "\n";
+unlink($myFile);
+?>

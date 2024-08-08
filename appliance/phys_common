@@ -1,0 +1,189 @@
+<?php
+include_once("/usr/local/sbin/common_lib");
+include_once("/usr/local/sbin/shared_lib");
+
+
+## $lets should be an item from the result of getDriveLetters()
+function excludeDrivesIfNeeded($ip, $lets){
+        $excluders = getDriveExclusions($ip);
+        $dome = array();
+        foreach($lets as $l){
+                $c = strtoupper(rtrim($l->letter,":"));
+                if(in_array(strtolower($c), array_map('strtolower', $excluders))){
+			gen_log(LOG_DEBUG, "$c:\ is in the exclusions.conf list, skipping volume");
+                }else{
+                        array_push($dome, $l);
+                }
+        }
+        return $dome;
+}
+
+
+function getDriveExclusions($ip){
+	$excl = "exclusions.conf";
+	$cmd = "cmd /c type $excl";
+	$str = trim(agentRunCmd($ip, $cmd));
+	if(empty($str)){ return array(); }
+	$sep = " ";
+	if (strpos($str, ',') !== false){
+		$sep = ",";
+	}
+	$res = explode($sep, $str);
+	$res = array_filter($res);
+	return $res;
+}
+
+function getDriveLetters($ip){
+	$q =  "SELECT * FROM Win32_LogicalDisk";
+        $out= agentWmiCmd($ip, $q );
+        $inf = agentParseWmi($out);
+        $duh = array();
+	// if they only have 1 drive, it comes back as an object, not an array.
+	// If so, stuff it in an array
+        if(!is_array($inf)){
+                array_push($duh, $inf);
+        }else{
+                $duh= $inf;
+        }
+
+        $out = array();
+	foreach($duh as $i){
+		if($i->DriveType !=3){ continue; }
+		$tmp = new stdClass();
+		$tmp->letter = $i->DeviceID;
+		$tmp->size = $i->Size;
+		$tmp->fs = $i->FileSystem;
+		array_push($out, $tmp);
+	}
+	return $out;
+}
+
+function getPhysDisks($ip ){
+	$disks = array();
+	$q = "SELECT * FROM Win32_Diskdrive";
+        $out= agentWmiCmd($ip, $q  );
+        $inf = agentParseWmi($out );
+        if(is_array($inf)){
+                foreach($inf as $d){
+                        $tmp = new stdClass();
+                        $tmp->name = "";
+                        $tmp->description = "";
+			$tmp->uuid = $d->Index;
+                        $tmp->size = $d->Size;
+                        $tmp->bootable = false;
+                        $tmp->userdevice = $d->Index;
+                        $tmp->device = "";
+                        $tmp->type = 1;
+                        if($d->Index ==0){ $tmp->bootable = true; }
+                        array_push($disks, $tmp);
+                }
+        }else{
+                $tmp = new stdClass();
+                $tmp->position = $inf->Index;
+		$tmp->uuid = $inf->Index;
+                $tmp->size = $inf->Size;
+                $tmp->bootable = true;
+                array_push($disks, $tmp);
+        }
+
+        return $disks;
+}
+
+
+function getPhysVifs($ip){
+	$vifs = array();
+	$q = "SELECT * FROM Win32_NetworkAdapterConfiguration";
+        $out= agentWmiCmd($ip, $q  );
+        $inf = agentParseWmi($out );
+        foreach($inf as $n){
+                if(empty($n->DatabasePath)){ continue; }
+                $tmp = new stdClass();
+                $tmp->uuid = "";
+                $tmp->netuuid = "";
+                $tmp->netname = "";
+                $tmp->mac = $n->MACAddress;
+                $tmp->mtu = 1500;
+                if(!empty($n->MTU)){ $tmp->mtu = $n->MTU; }
+                array_push($vifs, $tmp);
+        }
+
+	return $vifs;
+}
+
+function getPhysMemory($ip ){
+	$q = "SELECT * FROM Win32_ComputerSystem";
+        $out= agentWmiCmd($ip, $q  );
+        $inf = agentParseWmi($out );
+        $memory = $inf->TotalPhysicalMemory;
+	return $memory;
+}
+
+function getPhysCpu($ip){
+	$q = "SELECT * FROM Win32_ComputerSystem";
+        $out= agentWmiCmd($ip, $q  );
+        $inf = agentParseWmi($out );
+        $num= $inf->NumberOfProcessors;
+	return $num;
+}
+
+function getPhysSpecificMeta($vm, $uuid, $meta){
+        // memory, cpus, name, vdis and vifs
+
+        $ip = $vm->ip;
+
+        //$q = "SELECT * FROM Win32_OperatingSystem";
+        //$out= agentWmiCmd($ip, $q  );
+        //$inf = agentParseWmi($out );
+        //$meta->osname = $inf->Caption;        // osDisplayName
+
+        $meta->numCPUs = getPhysCpu($ip);
+        $memory = getPhysMemory($ip);
+        $meta->memory = $memory;
+        $meta->memoryStaticMax = $memory;
+        $meta->memoryStaticMin = $memory;
+        $meta->memoryDynamicMax = $memory;
+        $meta->memoryDynamicMin = $memory;
+
+	$meta->hVMBootParams["firmware"] = "uefi";
+
+
+        $meta->VIFS = getPhysVifs($ip);
+        $meta->VBDS = getPhysDisks($ip);
+
+	$sb = hasSecureBoot($ip);
+	if($sb){
+		$meta->platform["secureboot"] = "true";
+	}else{
+		$meta->platform["secureboot"] = "false";
+	}
+
+	$meta->platform["videoram"] = "8";
+	$meta->platform["vga"] = "std";
+	$meta->platform["device_id"] = "0002";
+	$meta->platform["viridian_stimer"] = "true";
+	$meta->platform["viridian_crash_ctl"] = "true";
+	$meta->platform["viridian_apic_assist"] = "true";
+	$meta->platform["viridian_reference_tsc"] = "true";
+	$meta->platform["viridian_time_ref_count"] = "true";
+
+}
+
+//function bootMode($ip){
+//        $cmd = "powershell [System.IO.Path]::GetExtension((Get-WmiObject -Class Win32_OperatingSystem).BootDevice)";
+//        $out = trim(agentRunCmd($ip, $cmd));
+//	echo "BootMODE:$out\n";
+//	print_r($out);
+//}
+
+function hasSecureBoot($ip){
+        $cmd = "powershell Confirm-SecureBootUEFI";
+        $out = trim(agentRunCmd($ip, $cmd));
+        if(trim(strtolower($out)) == "true"){
+                return true;
+        }else{
+                return false;
+        }
+}
+
+
+?>

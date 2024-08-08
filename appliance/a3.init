@@ -1,0 +1,229 @@
+#!/usr/bin/php -q
+<?php
+
+echo "Starting A3 Node\n";
+
+$ADS="/mnt/ads";
+if (file_exists("$ADS/ads.dat") == false){
+	echo "No valid ADS found!\n";
+	echo "Please create/attach a valid ADS!\n";
+	exit(1);
+}
+$hasEnvs = false;	// older host scripts don't pass env variables (hostIP, etc)
+
+$hostBld = getenv('HOST_BLD');
+if($hostBld !== false || !empty($hostIP)){
+	if($hostBld >= 26){
+		$hasEnvs = true;
+	}
+}
+$useGanesha = false;
+if($hasEnvs){
+	$hostIP = getenv('HOST_IP');
+	if($hostIP === false || empty($hostIP)){
+		echo "HOST_IP could not be found!\n";
+		echo "Please enter your HOST_IP variable in the /home/alike/.env file!\n";
+		exit(1);
+	}
+	echo "Host IP is $hostIP\n";
+	
+	$ganesh = getenv('HOST_NFS');
+	echo "HOST_NFS is $ganesh\n";
+        if($ganesh == "1") {
+		echo "**GANESHA NFS WILL BE ENABLED**\n";
+                $useGanesha = true;
+        }
+
+}
+
+exec("rm -f /mnt/ads/docker.up");
+// make sure there's no previous mail settings
+exec("rm -f /etc/ssmtp/ssmtp.conf");
+
+$CHK="/mnt/ads/app.chk";
+$VAL = shell_exec("echo \$RANDOM | md5sum | head -c 20; echo;");
+file_put_contents($CHK, $VAL);
+
+echo "Setting kernel parameters\n";
+echo "Adding Debian specific fixup\n";
+exec("/sbin/sysctl fs.protected_regular=0");
+
+$def = "/home/alike/defaults";
+exec("cp -n $def/configs/nginx.conf /home/alike/configs/");
+exec("cp -n $def/certs/fullchain.pem /home/alike/certs/");
+exec("cp -n $def/certs/privkey.pem /home/alike/certs/");
+
+exec("chown alike.alike /home/alike/Alike/remoteDBs/");
+echo shell_exec("/etc/init.d/rsyslog start");
+echo shell_exec("/etc/init.d/ssh start");
+echo shell_exec("/etc/init.d/smbd start");
+echo shell_exec("/etc/init.d/nginx start");
+echo shell_exec("/etc/init.d/php7.4-fpm start");
+echo shell_exec("/etc/init.d/cron start");
+
+exec("mkdir -p /mnt/instaboot/sr");
+exec("mkdir -p /mnt/instaboot/base/xen");
+
+exec("mkdir -p /home/alike/Alike/agentShare/repCache");
+exec("chown alike.alike /home/alike/Alike/agentShare/repCache");
+
+exec("mkdir -p /tmp/wscache");
+exec("chown alike.alike /tmp/wscache");
+exec("mkdir -p /tmp/job_ctl");
+exec("chown alike.alike /tmp/job_ctl");
+
+//file_put_contents("/etc/exports", "/mnt/instaboot/sr 127.0.0.1(fsid=0,subtree_check,rw)");
+echo shell_exec("/etc/init.d/rpcbind start");
+$myFart = getenv('HOST_NFS');
+$myFart2 = getenv('HOST_IP');
+syslog(LOG_INFO, "Ganesha env is $myFart, host is $myFart2");
+if($useGanesha == false) {
+	syslog(LOG_INFO, "Using NFS kernel services");
+        $res = shell_exec("/etc/init.d/nfs-kernel-server start");
+        echo $res;
+        if(strpos($res, "no support in current kernel") !== false){
+                echo "Failed to load NFS kernel module!\n";
+                echo "Please ensure Docker host has NFS support configured correctly.\n";
+                exit(1);
+	}
+}
+
+echo "Restoring DBs from ADS\n";
+# clean out any random stale wal/shm files to prevent false malformed errors
+exec("rm -f /mnt/ads/prodDBs/*.db-wal");
+exec("rm -f /mnt/ads/prodDBs/*.db-shm");
+
+exec("cp -f /mnt/ads/prodDBs/* /home/alike/Alike/DBs/");
+exec("chown -R alike.alike /home/alike/Alike/DBs");
+exec("ln -sf /mnt/ads/cbtTemp /home/alike/Alike/cbtTemp");
+exec("chgrp -R alike /home/alike/logs");
+exec("chmod g+w /home/alike/logs");
+echo "Setting unix socket permissions\n";
+exec("chown alike /run/php");
+$id = setInstallID();
+echo "Alike InstallID: $id\n";
+
+if($hasEnvs){
+	echo "Setting Host IP to $hostIP\n";
+	setSetting("hostIP", $hostIP);
+}else{
+	echo "Older host scripts detected- hostIP will not be checked\n";
+}
+
+// do manager thing if needed
+echo "Importing settings to manager.db\n";
+$cmd = "su - alike -c '/usr/local/sbin/managerAdmin import'";
+runAndTail($cmd);
+exec("chown alike.alike /home/alike/Alike/DBs/manager.db");
+
+echo "Performing Alike Pre-Flight Checks, please wait\n";
+$cmd = "/usr/local/sbin/a2pfc pre";
+runAndTail($cmd);
+
+echo "Setting up NFS SR\n";
+exec("/usr/local/sbin/setupNfs");
+
+if($useGanesha) {
+	syslog(LOG_INFO, "Starting Ganesha NFS services");
+        //echo "STARTING GANESHA NFS SERVICE\n";
+        exec("mkdir /run/dbus");
+        exec("mkdir /var/run/ganesha");
+        echo shell_exec("sudo dbus-daemon --system --fork");
+        echo shell_exec("cd /home/alike/Alike/ganesha && sudo /home/alike/Alike/ganesha/ganesha.nfsd");
+}
+
+
+exec("mkdir -p /mnt/vms");
+exec("mkdir -p /mnt/hosts");
+exec("chmod 775 /mnt/vms");
+exec("chmod 775 /mnt/hosts");
+
+echo "Configuring scheduled tasks\n";
+exec("su - alike -c '/usr/local/sbin/frequentSchedTasks'");
+echo "Installing crontab\n";
+$ct = "/usr/local/sbin/alike_crontab";
+echo shell_exec("/usr/bin/crontab -u alike $ct");
+if(file_exists($ct)){ unlink($ct); }
+
+echo "Starting Alike services...";
+exec("/usr/local/sbin/startAlike --no-bks");
+exec("chmod 755 /run/php");
+echo "Alike Service Startup complete.\n";
+
+$emergMode = getSetting("noXenStartup");
+
+echo "Xen Start Mode: $emergMode\n";
+
+if($emergMode == 1){
+        echo "EMERGENCY STARTUP.  Skipping Alike SR operations.\n";
+        echo "Please note- all restore jobs will be unavailable in this mode.\n";
+        echo "However, RestoreFS and VHD copies will function.\n\n";
+
+}else{
+        echo "Setting up post service start tasks...\n";
+        $cmd = "/usr/local/sbin/a2pfc post";
+        runAndTail($cmd);
+        echo "Cleaning out any old ABDs.\n";
+        echo shell_exec("/usr/local/sbin/abdAdmin delete-idle");        // Clean any old ABDs to prevent... problems
+}
+
+echo "Listening for events.\n";
+exec("touch /mnt/ads/docker.up");
+echo "Starting job schedules\n";
+exec("echo 1 > /tmp/sched_svc_status");
+echo "Enabling web UI\n";
+exec("cp -f /home/alike/Alike/docroot/redirect.html /home/alike/Alike/docroot/index.html");
+
+echo "A3 Node startup complete.\n";
+
+exit(0);
+
+function getSetting($set){
+        $db = "/home/alike/Alike/DBs/nimbusdb.db";
+        $dbc = new PDO("sqlite:$db");
+
+        $sql = "select val from settings where name= ?";
+        $stmt = $dbc->prepare($sql);
+        $stmt->execute(array($set ));
+        $val= $stmt->fetchColumn();
+	return $val;
+}
+function setSetting($key, $val){
+        $db = "/home/alike/Alike/DBs/nimbusdb.db";
+        $dbc = new PDO("sqlite:$db");
+        $sql = "INSERT or REPLACE INTO settings values(?,?)";
+        $st = $dbc->prepare($sql);
+        $res = $st->execute(array($key, $val) );
+}
+
+
+function setInstallID(){
+	$id = getSetting("installID");
+	if(empty($id)){
+		echo "Failed to find any/valid installID in nimbusDB!\n";
+		exit(1);
+	}
+        file_put_contents("/home/alike/Alike/inst.id",$id);
+        file_put_contents("/mnt/ads/guid.id",$id);
+	return $id;
+}
+
+function runAndTail($cmd){
+    $desc = array(
+        0 => array("pipe", "r"),  // stdin
+        1 => array("pipe", "w"),  // stdout
+        2 => array("pipe", "w")   // stderr
+    );
+    $proc = proc_open($cmd, $desc, $pipes);
+    if (is_resource($proc)) {
+        while (($line = fgets($pipes[1])) !== false) {
+            echo $line;
+            flush();
+        }
+        fclose($pipes[1]);
+        proc_close($proc);
+    }
+}
+
+?>
+

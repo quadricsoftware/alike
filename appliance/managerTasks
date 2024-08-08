@@ -1,0 +1,86 @@
+#!/usr/bin/php -q
+<?php
+include_once("/usr/local/sbin/manager_lib");
+include_once("/usr/local/sbin/common_lib");
+
+
+// grab these on startup
+notifyExpirations();
+getGraphStats();
+syncAlerts();
+syncSub();
+syncAllJobs();
+
+
+// We need to kill ourselves and let our child live on, since Docker is a bit crazy
+$pid = pcntl_fork();
+if($pid) { exit(0); }
+
+
+$jobPollSec = getSettingMgr("jobPollSec");
+$fullSyncSec = getSettingMgr("dbSyncSec");
+
+if(empty($jobPollSec)){
+	$jobPollSec = 5;
+	setSettingMgr("jobPollSec", 5);
+}
+if(empty($fullSyncSec)){
+	$fullSyncSec = 30;
+	setSettingMgr("dbSyncSec", 30);
+}
+
+$i=0;
+while(true){
+	if($i % 300 == 0){
+		$jobPollSec = getSettingMgr("jobPollSec");
+		$fullSyncSec = getSettingMgr("dbSyncSec");
+		syncSub();
+	}
+	if($i % 3600 == 0){
+		try{
+			getGraphStats();
+                }catch(Exception $ex){
+                        addAlarmMgr("Failed to getGraphStats.  Error: ". $ex->getMessage());
+                }
+	}
+	
+	if($i % $fullSyncSec == 0){
+		syncAllA3s();
+	}else if($i % $jobPollSec ==0){
+		syncAllJobs();
+		try{
+			syncAlerts();
+                }catch(Exception $ex){
+                        addAlarmMgr("Failed to syncAlerts.  Error: ". $ex->getMessage());
+                }
+	}
+	
+	sleep(1);
+	$i++;
+}
+
+
+function syncAllJobs(){
+	$a3s = getA3sDB();
+	foreach($a3s as $a){
+                try{
+                        syncJobs($a);
+                }catch(Exception $ex){
+                        addAlarmMgr("Failed to syncJobs with $a->name [$a->id].  Error: ". $ex->getMessage());
+                }
+	}
+}
+
+function syncAllA3s(){
+	$a3s = getA3sDB();
+	foreach($a3s as $a){
+                try{
+                        syncA3($a);
+                }catch(Exception $ex){
+                        addAlarmMgr("Failed to syncA3 with $a->name [$a->id].  Error: ". $ex->getMessage());
+                }
+	}
+}
+
+
+?>

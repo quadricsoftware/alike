@@ -1,0 +1,1643 @@
+<?php
+
+include_once("/usr/local/sbin/common_lib");
+include_once("/usr/local/sbin/ws_lib");
+include('/home/alike/Alike/docroot/config.inc');
+
+function getMgrDB(){
+	$dbFile= "/home/alike/Alike/DBs/manager.db";
+	$init =false;
+	if(!file_exists($dbFile)){ $init=true; }
+
+	$db = new PDO("sqlite:$dbFile");
+	$db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+	$db->exec('PRAGMA journal_mode = wal;');
+	
+
+	if($init){ 
+		makeTables($db); 
+		setDefaults();
+	}	// only update tables on fresh start.  We can run this on startup to upgrade tables from updates
+
+	return $db;
+}
+
+function makeTables($db){
+
+	// schedules -- not needed
+//	$sql = "CREATE TABLE IF NOT EXISTS schedules ( id INTEGER PRIMARY KEY, a3id INTEGER, scheduleID INTEGER, name TEXT, timestamp INTEGER, lastran INTEGER, jobType INTEGER, scheduleType INTEGER, jobCategory INTEGER, interval INTEGER, occurances INTEGER, runMin INTEGER, runHour INTEGER, state INTEGER, days INTEGER)";
+//	$db->exec($sql);
+
+	//	source is the a3id it came from, or 0 for the manager itself	
+	$sql = "CREATE TABLE IF NOT EXISTS alerts ( id INTEGER PRIMARY KEY, source INTEGER, type INTEGER, timestamp INTEGER, priority INTEGER, message TEXT)";
+	$db->exec($sql);
+	$sql = "CREATE UNIQUE INDEX IF NOT EXISTS alert_index ON alerts (source, timestamp, message)";
+	$db->exec($sql);
+
+	$sql = "CREATE TABLE IF NOT EXISTS jobs ( id INTEGER PRIMARY KEY, a3id INTEGER, jobID INTEGER, name TEXT,status INTEGER, timeBegin INTEGER, timeEnd INTEGER, progress INTEGER, type INTEGER, totalSize INTEGER, finalSize INTEGER, originalSize INTEGER)";
+	$db->exec($sql);
+
+	$sql = "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs on jobs (a3id, jobID)";
+	$db->exec($sql);
+
+	$sql = "CREATE TABLE IF NOT EXISTS vms ( id INTEGER PRIMARY KEY, a3id INTEGER, guid TEXT, name TEXT, powerState INTEGER, hostUUID TEXT, poolID TEXT, ipaddress TEXT, type INTEGER, state INTEGER, totalSize INTEGER, authProfile TEXT, accessIP TEXT, maxOnsite INTEGER, maxOffsite INTEGER, lastJobResult INTEGER, lastJobID INTEGER, lastSuccess INTEGER)";
+	$db->exec($sql);
+
+	$sql = "CREATE UNIQUE INDEX IF NOT EXISTS idx_vms on vms (guid)";
+	$db->exec($sql);
+
+	// id|guid|poolid|name|ip|username|password|agent|type|cpu|memory|os|role|licensed
+	$sql = "CREATE TABLE IF NOT EXISTS hosts ( id INTEGER PRIMARY KEY, guid TEXT, poolid TEXT, name TEXT, ip TEXT, username TEXT, password TEXT, agent TEXT, type INTEGER, cpu INTEGER, memory INTEGER, os TEXT, role INTEGER, licensed INTEGER)";
+	$db->exec($sql);
+
+	$sql = "CREATE UNIQUE INDEX IF NOT EXISTS idx_hosts on hosts (guid)";
+	$db->exec($sql);
+
+	$sql = "CREATE TABLE IF NOT EXISTS a3_host (a3id INTEGER, hostid INTEGER)";
+	$db->exec($sql);
+	$sql = "CREATE UNIQUE INDEX IF NOT EXISTS idx_a3_host on a3_host (a3id, hostid)";
+	$db->exec($sql);
+
+	$sql = "CREATE TABLE IF NOT EXISTS a3s ( id INTEGER PRIMARY KEY, guid TEXT, ip TEXT, password TEXT,  name TEXT, status INTEGER, lastSeen INTEGER, cpus INTEGER, memory INTEGER, licenses INTEGER, build INTEGER, adsSize INTEGER, adsFree INTEGER, odsSize INTEGER, odsFree INTEGER, cpuFree INTEGER, memFree INTEGER, numJobs INTEGER, numAlerts INTEGER)";
+	$db->exec($sql);
+
+	$sql = "CREATE UNIQUE INDEX IF NOT EXISTS idx_a3s on a3s (guid)";
+	$db->exec($sql);
+
+	$sql = "CREATE TABLE IF NOT EXISTS settings (key TEXT, val TEXT )";
+	$db->exec($sql);
+	$sql = "CREATE UNIQUE INDEX IF NOT EXISTS idx_settings on settings (key)";
+	$db->exec($sql);
+}
+
+function setDefaults(){
+	$s=[];
+	$s["jobPollSec"] = 10;
+	$s["dbSyncSec"] = 60;
+	$s["wsTimeout"] = 15;
+	$s["sessionTimeout"] = 1200;
+	$s["numVersions"] = 5;
+	$s["numVersionsOffsite"] = 5;
+	$s["uiPass"] = "alike";
+	$s["allowFuzzyHCA"] = true;
+	$sql = "INSERT INTO settings (key, val) SELECT ?, ?  WHERE NOT EXISTS ( SELECT 1 FROM settings WHERE key = ? );";
+	foreach($s as $k => $v){
+		dbSet("manager", $sql, array($k, $v));
+	}
+}
+
+//////////////////////////////////////// Begin Host stuff //////////////////////////////////
+function getHostMgr($id){
+        $sql = "SELECT * from hosts where id=?";
+	return dbGetOne("manager", $sql, array($id) );
+}
+function getHostByGuid($guid){
+        $sql = "SELECT * from hosts where guid=?";
+	return dbGetOne("manager", $sql, array($guid) );
+}
+
+function getHostsDB(){
+        $sql = "SELECT * from hosts order by type, poolid desc, role desc";
+	return dbGet("manager", $sql);
+}
+// add a pool of hosts
+function addHosts($hosts, $a3s){
+	foreach($hosts as $h){
+		addHost($h, $a3s);
+	}
+	return "Host added successfully";
+}
+function addHost($h, $a3s){
+	if(haveHostMgr( $h->uuid)){ return "Host already known"; }	// we already have this host
+
+	$agent = $h->username;	// just to disentangle this one for now
+
+	$isLicensed =0;
+	if($h->isLicensed ===1 || $h->isLicensed === "licensed"){ $isLicensed = 1; }
+
+	// id|guid|poolid|name|ip|username|password|agent|type|cpu|memory|os|role|licensed
+	$sql = "INSERT INTO hosts values(NULL,?,?,?,?,?,?,?,?,?,?,?,?,?)";
+	$hid = dbSet("manager", $sql, array( $h->uuid, $h->poolID, $h->nativeName, $h->name, $h->username, $h->password, $agent, $h->type, $h->numCPU, $h->totalMem, $h->osName, $h->role, $isLicensed ));
+
+	$hl = getHostMgr($hid);
+	addHostNimbus($hl);
+	return "Host added successfully";
+}
+
+function editHostMgr($h, $a3s){
+        if(!haveHostMgr($h->uuid)){ return "Host not found!"; }     // we already have this host
+
+        // id|guid|poolid|name|ip|username|password|agent|type|cpu|memory|os|role|licensed
+        $sql = "UPDATE hosts set ip=?, username=?, password=? where guid=?";
+        dbSet("manager", $sql, array( $h->name, $h->username, $h->password, $h->uuid) );
+
+	$h = getHostByGuid($h->uuid);
+
+	// drop our lookups, then remake them
+        $sql = "DELETE from  a3_host where hostid=?";
+	dbSet("manager", $sql, array($h->id) );
+
+        $sql = "INSERT into a3_host values(?, ?)";
+
+        if(!is_array($a3s)){
+                        editHostNimbus($h, $a3s);
+                        dbSet("manager", $sql, array($a3s, $h->id) );
+        }else{
+                foreach($a3s as $a3id){
+                        editHostNimbus($h, $a3id);
+                        dbSet("manager", $sql, array($a3id, $h->id) );
+                }
+        }
+        return "Host updated successfully";
+}
+
+// kills the remote hosts on the a3s, then removes the host entry, and all lookups
+function delHostMgr($guid){
+	$h = getHostByGuid($guid);
+	$a3s = getA3sForHost($guid);
+	foreach($a3s as $a){ delHostNimbus($guid, $a->id); }	// make sure to remove them remotely first
+        $sql = "DELETE from hosts where guid=?";
+        dbSet("manager", $sql, array($guid));
+	$sql = "DELETE from a3_host where hostid=?";	// delHostNimbus already did this, but I guess it's harmless to ensure they're all scrubbed
+        dbSet("manager", $sql, array($h->id));
+}
+
+function delHostNimbus($guid, $a3id){
+
+	delHost($guid);
+
+	$h = getHostByGuid($guid);
+	$sql = "DELETE from a3_host where hostid=? and a3id=?";
+        dbSet("manager", $sql, array($h->id, $a3id ));
+	return $res;
+}
+function addHostNimbus($h){
+
+	doAddHost($h);
+	$sql = "INSERT or REPLACE into a3_host VALUES(?,?)";
+        return dbset("manager", $sql, array($a3id, $h->id));
+}
+function editHostNimbus($h, $a3id){
+	editHost($h);
+	return $res;
+}
+
+function getA3sForHost($guid){
+        $sql = "SELECT a.* from a3s a, hosts h, a3_host l where a.id=l.a3id and h.id=l.hostid and h.guid=?";
+	return dbGet("manager", $sql, array($guid) );
+}
+function setHostLicense($guid, $set){
+	$state =0;
+	if($set == 1 || $set == true){ $state = 1; }
+        $sql = "update hosts set licensed = ? where guid=?";
+        dbSet("manager", $sql, array($state, $guid));
+
+	$mode = getNodeMode();
+        if($mode == 2){
+                $h = getHostByGuid($guid);
+		$a3 = getLocalA3();
+                editHostNimbus($h, $a3->id);
+        }
+}
+
+////////////////////////////////// End host stuff ///////////////////////////////
+
+// get and set settings is defined in common_lib, so we conflict.  change names
+function setSettingMgr($key, $val){
+	$sql = "INSERT or REPLACE INTO settings values(?,?)";
+	return dbSet("manager", $sql, array($key, $val) );
+}
+function getSettingMgr($key){
+	$sql = "SELECT val from settings where key=?";
+	return dbGetColumn("manager", $sql, array($key) );
+}
+function getAllSettings(){
+        $sql = "SELECT * from settings";
+        $set =  dbGet("manager", $sql);
+	$set = array_column($set, 'val', 'key');
+        return $set;
+}
+function saveSettings($sets){
+	$sql = "INSERT or REPLACE INTO settings values(?,?)";
+	foreach($sets as $k => $v){
+		dbSet("manager", $sql, array($k, $v) );
+	}
+}
+////////////////////////////////// GFS Stuff /////////////////////////
+
+// The UI gives us stuff we need to convert before we use
+function convertWsGfs($bad){
+	$good = new stdClass();
+	$good->gfsId = $bad->id;
+	$good->name = $bad->name;
+	$good->instances = array();
+	//daily
+	$g = new stdClass();
+	$g->gfsId = $bad->id;
+	$g->card = 1;
+	$g->versions = $bad->daily;
+	$g->policy = 1;
+	array_push($good->instances, $g);
+	//weekly
+	$g = new stdClass();
+	$g->gfsId = $bad->id;
+	$g->card = $bad->weeklyDay;
+	$g->versions = $bad->weekly;
+	$g->policy = 2;
+	array_push($good->instances, $g);
+	//monthly
+	$g = new stdClass();
+	$g->gfsId = $bad->id;
+	$g->card = $bad->yearlyMonth;
+	$g->versions = $bad->yearly;
+	$g->policy = 5;
+	array_push($good->instances, $g);
+	//yearly
+	$g = new stdClass();
+	$g->gfsId = $bad->id;
+
+	$which = 3;
+	if($bad->strict == "true"){ $which = 4; }
+	$g->card = $bad->monthlyIsEndDay;
+	$g->versions = $bad->monthly;
+	$g->policy = $which;
+	array_push($good->instances, $g);
+
+	return $good;
+}
+
+
+
+
+/////////////////////////////////// End GFS Stuff ///////////////////////
+
+function addA3($a3){
+	$sql = "INSERT or REPLACE INTO a3s values(NULL,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
+	return dbSet("manager", $sql, array($a3->guid, $a3->ip, $a3->password, $a3->name, $a3->status, $a3->lastSeen, $a3->cpus, $a3->memory, $a3->licenses, $a3->build, $a3->adsSize, $a3->adsFree, $a3->odsSize, $a3->odsFree, $a3->cpuFree, $a3->memFree, $a3->numJobs, $a3->numAlerts) );
+}
+
+function delA3($a3id){
+	$sql = "DELETE from a3s where id=?";
+	dbSet("manager", $sql, array($a3id));
+
+	// remove this a3's junk from our dbs
+	$sql = "delete from jobs where a3id not in (select id from a3s)";
+	dbSet("manager", $sql);
+	$sql = "delete from vms where a3id not in (select id from a3s) and type != 10";
+	dbSet("manager", $sql);
+}
+
+function updateA3($id, $ip, $pass){
+	$sql = "UPDATE a3s set ip=?, password=? where id=?";
+	dbSet("manager", $sql, array($ip, $pass, $id) );
+}
+
+function setA3Name($a3id, $name){
+	$sql = "UPDATE a3s set name=? where id=?";
+	dbSet("manager", $sql, array($name, $a3id) );
+}
+
+
+function updateA3Stats($a3){
+	$sql = "UPDATE a3s set status=?, lastSeen=?, cpus=?, memory=?, memFree=?, licenses=?, build=?, adsSize=?, adsFree=?, odsSize=?, odsFree=?, cpuFree=?, numJobs=?, numAlerts=? where id=?";
+	dbSet("manager", $sql, array($a3->status, $a3->lastSeen,$a3->cpus, $a3->memory, $a3->memFree,  $a3->licenses, $a3->build, $a3->adsSize, $a3->adsFree, $a3->odsSize, $a3->odsFree, $a3->cpuFree, $a3->numJobs, $a3->numAlerts, $a3->id) );
+}
+
+// for fullstack ppl only
+function getLocalA3(){
+        $sql = "SELECT * from a3s limit 1";
+	return dbGetOne("manager", $sql);
+}
+
+function getA3($id){
+        if($id == -1){ return getLocalA3(); }
+
+        $sql = "SELECT * from a3s where id=?";
+        return dbGetOne("manager", $sql, array($id));
+}
+function getA3ByGuid($guid){
+        $sql = "SELECT * from a3s where guid=?";
+        return dbGetOne("manager", $sql, array($guid));
+}
+
+function getA3sDB(){
+        $sql = "SELECT * from a3s";
+        $a3s =  dbGet("manager", $sql);
+	foreach($a3s as $a){
+		$a->numAlerts = countA3Alerts($a->id);
+	}
+        return $a3s;
+}
+function getA3Tokens(){
+        $sql = "SELECT id,ip,password from a3s";
+	return dbGet("manager", $sql);
+}
+
+
+function searchVMsDB($q){
+        $sql = "SELECT v.*, a.name as a3Name, a.id as a3id from vms v, a3s a where v.a3id=a.id and (v.name LIKE ? or v.guid LIKE ? or a.guid LIKE ?) order by v.name";
+        return dbGet("manager", $sql, array("%$q%", "%$q%", "%$q%"));
+}
+
+function getVMsPageDB($offset, $limit=20){
+
+	$sql = "SELECT COUNT(*) FROM vms";
+	$totalNum = dbGetColumn("manager", $sql);
+
+	$out = new stdClass();
+        $sql = "SELECT v.*, a.name as a3Name, a.id as a3id from vms v, a3s a where v.a3id=a.id order by v.name LIMIT ? OFFSET ?";
+        $out->vms = dbGet("manager", $sql, array($limit, $offset));
+	$out->total = $totalNum;
+        return $out;
+}
+
+function getAllAgentsDB(){
+        $sql = "SELECT v.*, a.name as a3Name, a.id as a3id from vms v, a3s a where v.a3id=a.id  and v.type=10 and v.authProfile != '' order by v.name";
+	return dbGet("manager", $sql);
+}
+
+function getAllVMsDB(){
+        $sql = "SELECT v.*, a.name as a3Name, a.id as a3id from vms v, a3s a where v.a3id=a.id order by v.name";
+	return dbGet("manager", $sql);
+}
+function totalVMCount($onlyProtected=false){
+        $sql = "SELECT count(*) from vms ";
+	if($onlyProtected){
+		$sql = "SELECT count(*) from vms where lastJobID >0";
+	}
+	return dbGetColumn("manager", $sql);
+}
+function totalVMSize(){
+        $sql = "SELECT SUM(totalSize) from vms ";
+	return dbGetColumn("manager", $sql);
+}
+function getVMDB($uuid){
+        $sql = "SELECT v.*, a.name as a3Name, a.id as a3id from vms v, a3s a where v.a3id=a.id and v.guid = ?";
+	return dbGetOne("manager", $sql, array($uuid));
+}
+
+
+// a helper for the syncVMsForA3
+function haveVmMgr($guid){
+	$sql = "SELECT count(*) from vms where guid= ?";
+	$cnt = dbGetColumn("manager", $sql, array($guid));
+	if($cnt > 0){ return true; }
+	return false;
+}
+
+function syncVMsForA3($a3, $vms){
+        $db = getMgrDB();
+        $db->query("BEGIN TRANSACTION");
+        $sql = "DELETE from vms where a3id=? and type != 10";
+        $st = $db->prepare($sql);
+        $st->execute(array($a3->id ));
+
+        foreach ($vms as $v){
+		$type = $v->type;
+		//$type = $v->isHidden;
+                if(!is_object($v)){
+                        echo "not an object?\n";
+                        continue;
+                }
+		if(empty($v->name)){ $v->name = $v->VMName; }	// this means the VM entry has no vminfo entry and is probably an orphan
+		if($type == 10){ 
+			$sql = "SELECT a3id from vms where guid= :guid";
+			$st = $db->prepare($sql);
+			$st->bindParam(':guid', $guid, PDO::PARAM_STR);
+			$st->execute();
+			$owner = $st->fetchColumn();	// this gets the agent owner
+
+			if(!empty($owner) && $owner != $a3->id){ 
+				continue; 
+			}	// skip a3s that don't own this agent
+
+			// this A3 owns the agent, so accept it's agent info
+			$sql = "UPDATE vms set authProfile = ?, totalSize=?, accessIP=?, lastJobResult=? where guid=?";
+			$st = $db->prepare($sql);
+			$res = $st->execute(array($v->authProfile,$v->size, $v->accessIP, $v->numBackups, $v->uuid));
+			continue;
+		}
+//		if($v->lastJobID > 0){
+//echo "Updating $v->name ($type) vmname: $v->numBackups\n";
+			// this is mainly driven from tm_vminfo, so clobbering is ok?
+			$sql = "INSERT or REPLACE INTO vms values(NULL,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
+			$st = $db->prepare($sql);
+			$args = array($a3->id, $v->uuid, $v->name, $v->powerState, $v->hostUUID, $v->poolID, $v->ipaddress, $type, $v->powerState, $v->size, $v->authProfile, $v->accessIP, $v->maxVersions, $v->maxVersionsOffsite, $v->numBackups, 0, 0);
+
+			$res = $st->execute($args);
+			if($res === false){
+				print_r($db->errorInfo() );
+			}
+
+
+//		}else{
+//			if(!haveVmMgr( $v->uuid)){
+//				// this VM is new, and we know it but don't have a backup, so insert it (could be clobbered by someone else)
+//				$sql = "INSERT INTO vms values(NULL,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
+//				$st = $db->prepare($sql);
+//				$res = $st->execute(array($a3->id, $v->uuid, $v->name, $v->powerState, $v->hostUUID, $v->poolID, $v->ipaddress, $v->type, $v->state, $v->totalSize, $v->authProfile,$v->accessIP, $v->maxVersions, $v->maxVersionsOffsite, 0, 0, 0));
+//			}
+//		}
+
+        }
+        $db->query("COMMIT");
+}
+
+
+function deleteJobMgr($jobID, $a3id){
+        $sql = "DELETE from jobs where jobID=? and a3id=?";
+        dbSet("manager", $sql, array($jobID, $a3id ));
+
+	deleteJob($jobID);
+}
+
+function getJobsDB($a3id){
+        $sql = "SELECT j.*, a.name as a3Name from jobs j, a3s a where j.a3id=? and a.id = j.a3id";
+        return dbGet("manager", $sql, array($a3id ));
+}
+
+function getLatestJobId($a3id){
+//        $sql = "SELECT MAX(jobID) FROM jobs where a3id=?";
+//        $sql = "SELECT MAX(jobid) AS last_highest_jobid FROM jobs WHERE a3id = ? and jobid < (  SELECT MIN(jobid) FROM jobs WHERE status = 2)";
+	$sql = "SELECT COALESCE((SELECT MAX(jobID) FROM jobs WHERE a3id= ? and jobID < ( SELECT MIN(jobID) FROM jobs WHERE status = 2 or status = 3 )),(SELECT MAX(jobID) FROM jobs where a3id=? )) AS jobID;";
+        return dbGetColumn("manager", $sql, array($a3id, $a3id ));
+}
+
+function syncJobsForA3($a3id, $jobs){
+        $db = getMgrDB();
+        $db->query("BEGIN TRANSACTION");
+        foreach ($jobs as $j){
+                if(!is_object($j)){
+                        echo "not an object?\n";
+                        continue;
+                }
+
+		// NB: there are a few commandeered fields (in the nimbusDB):
+		//      target - used for VHD restore paths in restore jobs
+		//      username - used for job progress %
+		//      password - used for "Quick" jobs names so they include the VM in question (overriding the Schedule name in the UI)
+
+		$name = $j->name;
+		if(!empty($j->password)){ $name = $j->password; }	// use the "Quick" job's name instead of the schedule name
+
+		$sql = "INSERT or REPLACE INTO jobs values(NULL,?,?,?,?,?,?,?,?,?,?,?)";
+                $st = $db->prepare($sql);
+                $st->execute(array($a3id, $j->jobID, $name, $j->status, $j->timeBegin, $j->timeEnd, $j->progress, $j->type, $j->totalSize, $j->finalSize, $j->originalSize ));
+        }
+        $db->query("COMMIT");
+}
+
+// pulls in hosts from remote A3.  Should only happen on initial add of existing A3
+function syncHostsForA3($a3id, $hosts){
+
+        $db = getMgrDB();
+        $db->query("BEGIN TRANSACTION");
+
+        foreach ($hosts as $h){
+                if(!is_object($h)){
+                        echo "not an object?\n";
+                        continue;
+                }
+		if(haveHostMgr($h->uuid)){ continue; }
+		$agent = $h->username;
+		// id|guid|poolid|name|ip|username|password|agent|type|cpu|memory|os|role|licensed
+		$sql = "INSERT INTO hosts values(NULL,?,?,?,?,?,?,?,?,?,?,?,?,?)";
+		$st = $db->prepare($sql);
+		$lic = true;
+		$res = $st->execute(array($h->uuid,$h->poolID, $h->nativeName, $h->name, $h->username, $h->password,$agent, $h->type, $h->numCPU, $h->totalMem, $h->osName, $h->role, $lic ));
+		$hid = $db->lastInsertId();
+		$sql = "INSERT OR REPLACE INTO a3_host values(?,?)";
+		$st = $db->prepare($sql);
+		$st->execute(array($a3id, $hid) );
+        }
+        $db->query("COMMIT");
+}
+
+
+// a helper for the syncVMsForA3
+function haveHostMgr($guid){
+	$sql = "SELECT count(*) from hosts where guid= :guid";
+	$cnt = dbGetColumn("manager", $sql, array($guid) );
+	if($cnt > 0){ return true; }
+	return false;
+}
+
+
+function getSchedulesForA3($a3id){
+	throw new Exception("getSchedulesForA3 depreciated");
+}
+function getSchedulesDB(){
+	throw new Exception("getSchedulesDB depreciated");
+}
+
+function syncSchedulesForA3($a3id, $scheds){
+	throw new Exception("syncSchedulesForA3 depreciated");
+}
+
+function getGraphStats(){
+	$a3s = getA3sDB();
+	$out = new stdClass();
+	$out->dates= [];
+	$out->dedup=[];
+	$out->protected=[];
+	$out->deltas=[];
+//	foreach($a3s as $a3){
+//		$res = getRemoteWS("jobgraph", $a3);
+//		if($res->result != "success"){
+//			$msg = "Error retrieving stats from A3 ($a3->name): $res->message";
+//			addAlarmMgr($msg);
+//			continue;
+//		}
+		// get it from our local DB now
+		$res = getDashStats(30);
+
+		// add the results
+		for($i=0; $i < count($res->protected); $i++ ){
+			if(isset($out->protected[$i])){ $out->protected[$i] += $res->protected[$i]; }
+			else{ $out->protected[$i] = $res->protected[$i]; }
+		}
+		for($i=0; $i < count($res->deltas); $i++ ){
+			if(isset($out->deltas[$i])){ $out->deltas[$i] += $res->deltas[$i]; }
+			else{ $out->deltas[$i] = $res->deltas[$i]; }
+		}
+		for($i=0; $i < count($res->dedup); $i++ ){
+			if(isset($out->dedup[$i])){ $out->dedup[$i] += $res->dedup[$i]; }
+			else{ $out->dedup[$i] = $res->dedup[$i]; }
+		}
+		for($i=0; $i < count($res->dates); $i++ ){
+			if(!isset($out->dates[$i])){ $out->dates[$i] = $res->dates[$i]; }
+		}
+//	}
+	file_put_contents("/tmp/dash.stats", json_encode($out));
+}
+
+
+function getRemoteFile($url, $token){
+        $timeoutSec = 1;
+	$url ="$url?manager-token=$token";
+	$context = stream_context_create([ 'http' => [ 'header' => 'Accept-Encoding: gzip, deflate', 'timeout' => $timeoutSec], "ssl" => [ "verify_peer" => false, "verify_peer_name" => false, ]  ]);
+echo "$url\n";
+	return file_get_contents($url, false, $context);
+}
+
+
+function postRemoteFile($url, $token, $o, $fileName){
+//	ob_start("ob_gzhandler");
+
+        $url ="$url&manager-token=$token";
+        $data = array('data' => $o );
+        $options = array(
+            'http' => [
+                'method'  => 'POST',
+                'timeout'  => 1,
+                'header'  => "Content-type: application/x-www-form-urlencoded\r\n". "Accept-Encoding: gzip, deflate\r\n",
+                'content' => http_build_query($data)
+            ],
+                'ssl'  => ['verify_peer' => false, 'verify_peer_name' => false ],
+        );
+        $context  = stream_context_create($options);
+	$remoteStream = fopen($url, 'rb', false, $context);
+
+	if ($remoteStream !== false) {
+		$responseHeaders = $http_response_header;
+		$remoteFileSize = false;
+		foreach ($responseHeaders as $header) {
+			if (strpos($header, 'Content-Length:') === 0) {
+				$remoteFileSize = (int)trim(substr($header, strlen('Content-Length:')));
+				break;
+			}
+		}
+
+
+	    if ($remoteFileSize !== false) {
+		header('Content-Type: application/octet-stream');
+		header('Content-Transfer-Encoding: Binary');
+		header('Content-Length: ' . $remoteFileSize);
+		header('Content-Disposition: attachment; filename="' . $fileName . '"');
+
+		while (!feof($remoteStream)) {
+		    echo fread($remoteStream, 8192); // Read and output in chunks (adjust chunk size as needed)
+		    ob_flush();
+		    flush();
+		}
+		fclose($remoteStream);
+		exit();
+	    } else {
+		throw new Exception("Failed to get remote filesize. Check Node/A3 logs");
+	    }
+	} else {
+		throw new Exception("Failed to connect to remote A3 for download.  Check remote A3 logs $url");
+	}
+}
+
+function postRemoteFileMonolithic($url, $token, $o){
+        $url ="$url?manager-token=$token";
+        $data = array('data' => $o );
+        $options = array(
+            'http' => [
+                'method'  => 'POST',
+                'timeout'  => 1,
+                'header'  => "Content-type: application/x-www-form-urlencoded\r\n". "Accept-Encoding: gzip, deflate\r\n",
+                'content' => http_build_query($data)
+            ],
+                'ssl'  => ['verify_peer' => false, 'verify_peer_name' => false ],
+        );
+        $context  = stream_context_create($options);
+	return file_get_contents($url, false, $context);
+}
+
+
+
+
+function getRemoteWS($call, $a3){
+	$cparts = explode("/", $call);
+	$req = array_shift($cparts);
+	$token = getA3Token($a3); 
+        $url = "https://$a3->ip/ws_remote.php?manager-token=$token&req=$req";
+	foreach($cparts as $p){
+		$url .="&$p";
+	}
+        $timeoutSec = getSettingMgr("wsTimeout");
+	if(!is_numeric($timeoutSec)){ $timeoutSec = 15; }
+	$context = stream_context_create([ 'http' => [ 'header' => 'Accept-Encoding: gzip, deflate', 'timeout' => $timeoutSec], "ssl" => [ "verify_peer" => false, "verify_peer_name" => false, ]  ]);
+
+	set_error_handler("parseWsFailure");
+	try{
+
+		$result = processNimbusRequest($call, null, null);
+
+//		$result = doRemoteWs($url, $context);
+		return parseWsResult($result, $url);
+	}catch(Exception $ex){
+		$err = new stdClass();
+		$err->result  = "error";
+		$err->message = $ex->getMessage();
+		return $err;
+	}finally{
+		restore_error_handler();
+	}
+}
+
+function doRemoteWs($url, $context){
+	$result = @file_get_contents($url, false, $context);
+	return $result;
+}
+
+function parseWsFailure($errno, $errstr, $errfile, $errline){
+	$errstr = trim($errstr);
+	$errstr = str_replace("&amp;", "&", $errstr);
+	$orig = $errstr;
+
+	$ip = "";
+	$failure = "unknownAPI";
+	$parts = explode('):', $errstr);
+	$pt = '/req=([^&)]+)[&)]/';
+	$pt = '/[?&]req=([^&)]+)(?=&|\)|&|$)/';
+	$ipPat = '/\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/';
+	if(count($parts) == 2){
+		preg_match($ipPat, $parts[0], $matches);
+		preg_match($pt, $parts[0], $strip);
+		$errstr = $parts[1];
+	}else{
+		preg_match($ipPat, $errstr, $matches);
+		preg_match($pt, $errstr, $strip);
+	}
+	if(isset($matches[0])){ $ip = $matches[0]; }
+	if(isset($strip[1])){
+//	    $failure = urldecode($strip[1]); // Decode the URL encoded value
+		$failure = $strip[1];
+	}else{
+		$failure = $orig;
+	}
+
+
+	$endPos = strpos($errstr, 'HTTP request failed!', 0);
+	if ($endPos !== false) {
+		$errstr = substr($errstr, $endPos + strlen("HTTP request failed!"));
+	}
+
+	$msg = "Error with remote A3 ($ip) WS: $errstr ($errno)";
+	if ($ip == "127.0.0.1") {
+		$msg = "Error with internal API: [$failure] $errstr (code: $errno) orig: $orig";
+	}
+	$err = new stdClass();
+        $err->result  = "error";
+	$err->message = $msg;
+
+	addAlarmMgr($msg);
+	throw new Exception($msg);
+
+//	echo json_encode($err);	
+//	exit();
+}
+function parseWsResult($result, $url){
+	preg_match('#^[^/]+//[^/]+#', $url, $ourmatch);
+	$guy = $ourmatch[0];
+	$err = new stdClass();
+        $err->result  = "error";
+        if(empty($result)){
+                $err->message = "Network failure reaching remote server. [$url]";
+                return $err;
+        }
+        $result = @gzdecode($result);
+        if($result === false){
+                $err->message = "Failed to decode WS response (invalid compression)";
+                return $err;
+        }
+        $out = @json_decode($result);
+        if($out == null){
+                $err->message = "Failed to decode WS response (invalid format)";
+                return $err;
+        }
+        return $out;
+
+}
+
+function postRemoteWS($call, $a3, $o=null){
+	$cparts = explode("/", $call);
+	$req = array_shift($cparts);
+	$token = getA3Token($a3); 
+        $url = "https://$a3->ip/ws_remote.php?manager-token=$token&req=$req";
+	foreach($cparts as $p){
+		$url .="&$p";
+	}
+	
+
+        $timeoutSec = getSettingMgr("wsTimeout");
+        $data = array('data' => $o );
+        $options = array(
+            'http' => [
+                'method'  => 'POST',
+                'timeout'  => $timeoutSec,
+                'header'  => "Content-type: application/x-www-form-urlencoded\r\n". "Accept-Encoding: gzip, deflate\r\n",
+                'content' => http_build_query($data)
+            ],
+                'ssl'  => ['verify_peer' => false, 'verify_peer_name' => false ],
+        );
+        $context  = stream_context_create($options);
+	set_error_handler("parseWsFailure");
+        try{
+                $result = doRemoteWs($url, $context);
+                return parseWsResult($result, $url);
+        }catch(Exception $ex){
+                $err = new stdClass();
+                $err->result  = "error";
+                $err->message = $ex->getMessage();
+                return $err;
+        }finally{
+                restore_error_handler();
+        }
+
+//        $result = file_get_contents($url, false, $context);
+//	restore_error_handler();
+//	return parseWsResult($result, $url);
+}
+
+function setRemoteSetting($a3id, $set, $val){
+	setSettingSync($set, $val);
+}
+function syncGlobalSettings(){
+
+	$global_settings =["numVersions", "numVersionsOffsite","uiPass", "allowFuzzyHCA", "managerIP","smtpToAddress","debugLevel"];
+
+	$sets=[];
+	foreach($global_settings as $set){
+		$sets[$set] = getSettingMgr($set);
+	}
+	$a3s = getA3sDB();
+
+		$us = getLocalA3();
+		// we need to double save a few for rehydration on fullstack only
+		$sets = [];
+		$sets["sessionTimeout"] = getSettingMgr("sessionTimeout");
+		$sets["wsTimeout"] = getSettingMgr("wsTimeout");
+		$sets["debugLevel"] = getSettingMgr("debugLevel");
+		$sets["dbSyncSec"] = getSettingMgr("dbSyncSec");
+		$sets["jobPollSec"] = getSettingMgr("jobPollSec");
+		$sets["managerIP"] = getSettingMgr("managerIP");
+	 saveAllSettings($sets);
+}
+
+
+function getJobsMgr($limit = 25, $offset=0){
+	// we need to fix this so it can paginate etc
+	$out = new stdClass();
+        $sql = "SELECT j.*,CASE WHEN j.timeEnd = 0 THEN strftime('%s', 'now') - j.timeBegin ELSE j.timeEnd - j.timeBegin END as timeElapsed, a.name as a3Name from jobs j, a3s a where a.id = j.a3id order by timeBegin desc limit ? offset ?";
+        $out->jobs = dbGet("manager", $sql, array($limit, $offset));
+
+        $sql = "SELECT count(*) as total from jobs j, a3s a where a.id = j.a3id";
+	$out->total = dbGetColumn("manager", $sql);
+        return $out;
+}
+function getActiveJobsMgr(){
+//        $sql = "SELECT * from jobs where status=2 or status=3";
+        $sql = "SELECT j.*,CASE WHEN j.timeEnd = 0 THEN strftime('%s', 'now') - j.timeBegin ELSE j.timeEnd - j.timeBegin END as timeElapsed, a.name as a3Name from jobs j, a3s a where a.id = j.a3id and j.status =2 or j.status=3 order by timeBegin desc";
+	return dbGet("manager", $sql);
+}
+function searchJobs($q, $limit = 25, $offset=0){
+	// we need to fix this so it can paginate etc
+        $sql = "SELECT j.*,CASE WHEN j.timeEnd = 0 THEN strftime('%s', 'now') - j.timeBegin ELSE j.timeEnd - j.timeBegin END as timeElapsed, a.name as a3Name from jobs j, a3s a where a.id = j.a3id and (j.jobID LIKE '%?%' or a3Name LIKE '%?%' or j.name LIKE '%?%') order by timeBegin desc limit ? offset ?";
+        return dbGet("manager", $sql, array($q, $q, $q, $limit, $offset));
+}
+
+// password should already be hashed
+function doAddA3($guid, $ip, $pass, $name){
+	$a3 = new stdClass();
+	$a3->guid = $guid;
+	$a3->ip = $ip;
+	$a3->password = $pass;
+	$a3->name = $name;
+	$a3->status=0;
+	$a3->lastSeen=0;
+	$a3->cpus=0;
+	$a3->memory=0;
+	$a3->licenses=0;
+	$a3->build=0;
+	$a3->adsSize=0;
+	$a3->adsFree=0;
+	$a3->odsSize=null;
+	$a3->odsFree=0;
+	$a3->cpuFree=0;
+	$a3->memFree=0;
+	$a3->numJobs=0;
+	$a3->numAlerts=0;
+	$id = addA3($a3);
+	return $id;
+}
+// password should already be hashed
+function doEditA3($id, $ip, $pass){
+	updateA3($id, $ip, $pass);
+}
+
+
+// password should already be hashed
+function testA3($ip, $pass){
+
+	// a3 test is different from all other WS calls b/c we don't have an A3 yet, so we can't make our 
+	// normal auth token.  
+	$url = "https://$ip/ws_remote.php?req=authTest&manager-token=$pass";
+
+        $timeoutSec = getSettingMgr("wsTimeout");
+	if(!is_numeric($timeoutSec)){ $timeoutSec = 15; }
+
+        $context = stream_context_create([ 'http' => [ 'header' => 'Accept-Encoding: gzip, deflate', 'timeout' => $timeoutSec], "ssl" => [ "verify_peer" => false, "verify_peer_name" => false, ]  ]);
+
+        set_error_handler("parseWsFailure");
+        $result = @file_get_contents($url, false, $context);
+        restore_error_handler();
+        $res = parseWsResult($result, $url);
+
+	if($res->result == "error"){
+		return $res;
+	}
+	$out = new stdClass();
+	$out->result = "success";
+	$out->guid = $res->a3guid;
+	$out->name = $res->a3Name;
+	$out->nodeMode = $res->nodeMode;
+	return $out;
+}
+
+
+
+
+
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////
+function syncA3ById($a3id){
+	$guy = getA3($a3id);
+	$token = getA3Token($guy);
+	syncA3($a3id, $token, $guy->ip);
+}
+
+function syncA3($a3){
+        syncA3Info($a3);
+        syncJobs($a3);
+        syncVms($a3);
+
+	// sync hosts meta for 'owned' hosts?
+	$hosts = getHosts();
+	foreach($hosts as $hr){
+		// id|guid|poolid|name|ip|username|password|agent|type|cpu|memory|os|role|licensed
+		$sql = "UPDATE hosts set os=?, memory=?,cpu=?,name=? WHERE guid=? ";
+		dbSet("manager",$sql, array( $hr->osName, $hr->totalMem, $hr->numCPU, $hr->nativeName, $hr->uuid ));
+	}
+}
+
+function syncA3Info($a3loco){
+//        $res= getRemoteWS("a3-status", $a3loco);
+//	if($res->result != "success"){ 
+////		echo "Failed to get A3 info: $a3loco->ip\n";
+////		echo "Err: $res->message\n";
+//		return;
+//	}
+	$s = (object)getStatsForMgr();
+	$a3 = new stdClass();
+	$a3->id = $a3loco->id;
+	$a3->status = $s->status;
+//	$a3->name = $s->name;
+	$a3->memory = $s->memory;
+	$a3->lastSeen = time();
+	$a3->cpus = $s->cpus;
+	$a3->licenses = 0;
+	$a3->build = $s->build;
+	$a3->adsSize = $s->adsSize;
+	$a3->memFree = $s->memFree;
+	$a3->adsFree = $s->adsFree;
+	$a3->odsSize = $s->adsSize;
+	$a3->odsFree = $s->adsFree;
+	$a3->cpuFree = $s->cpuFree;
+	$a3->numJobs = count($s->runningJobs);
+	$a3->numAlerts = countA3Alerts($a3->id); // count($s->alerts);
+	updateA3Stats($a3);
+}
+function syncHosts($a3){
+	$hosts = getHosts();
+        syncHostsForA3($a3->id, $hosts);
+}
+function syncJobs($a3){
+	$id = getLatestJobId($a3->id);
+	$jobs  =array();
+	
+	if(is_numeric($id)){
+                $jobs =getJobsFromId($id); // this gets all jobs since $id
+                $hot = getActiveJobs();
+                foreach($hot as $j){
+                        if($j->status == 2 || $j->status ==3){
+                                $prog = calcJobProgress($j->jobID);
+                                updateJobProgress($j->jobID, $prog);
+                                $j->stage = $prog;
+                        }
+                }
+                // this puke just cleans out any duplicates
+                $combo = array_merge($jobs, $hot);
+                $barf = [];
+                foreach($combo as $c){
+                        $id = $c->jobID;
+                        if(!isset($barf[$id])){
+                                $barf[$id] = $c;
+                        }
+                }
+                $jobs =  array_values($barf);
+
+	}else{
+		$jobs =  getJobs(9000, null);
+	}
+        syncJobsForA3($a3->id, $jobs);
+}
+function syncVms($a3){
+	$vms = getAllVMsForMgr();
+        syncVMsForA3($a3, $vms);
+}
+
+function checkAuthOld($a){
+	$r = new stdClass();
+
+	$ourUser = getSettingMgr("uiUser");	
+	$ourPass = getSettingMgr("uiPass");	
+	
+	if(empty($ourUser)){
+		$ourUser = "alike";
+		setSettingMgr("uiUser", $ourUser);
+	}
+	if(empty($ourPass)){
+		$ourPass = "manager";
+		setSettingMgr("uiPass", $ourPass);
+	}
+
+	if($a->user == $ourUser && $a->pass == $ourPass){
+		$r->result = "success";
+		$r->message = "Local authentication successful";
+		$r->session = session_id();
+		$r->status = "Local Authentication";
+
+	}else{
+		$r->result = "error";
+		$r->message = "Local authentication failed!";
+		$r->session = "";
+
+	}
+	return $r;
+
+}
+function checkAuth($user, $pass){
+	;
+}
+
+function clearProxy(){
+        setSettingMgr("proxy", "");
+        if(getNodeMode() ==2){
+		setSetting("proxy", "");
+	}
+}
+
+// types: socks5, socks4, http
+// port: usually 1080 and 3128
+function setProxy($type, $ip, $port, $user, $pass){
+        $o = new stdClass();
+        $o->type = $type;
+        $o->ip = $ip;
+        $o->port = $port;
+        $o->user = $user;
+        $o->pass = $pass;
+        $p = json_encode($o);
+        setSettingMgr("proxy", $p);
+        if(getNodeMode() ==2){
+		setSetting("proxy", $p);
+	}
+}
+
+function doWebGet($url){
+        $ch = curl_init($url);
+	$p= json_decode(getSettingMgr("proxy"));
+	if(!empty($p)){
+		$purl = $p->type ."://". $p->ip .":". $p->port;
+		curl_setopt($ch, CURLOPT_PROXY, $purl);
+		if(!empty($p->user) && !empty($p->pass)){
+			$auth = $p->user .":". $p->pass;
+			curl_setopt($ch, CURLOPT_PROXYUSERPWD, $auth);
+		}
+	}
+        curl_setopt($ch, CURLOPT_POST, true);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+	curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+	curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
+        $result = curl_exec($ch);
+        if ($result === FALSE) {
+                $res = new stdClass();
+                $res->result = "error";
+                $res->message = "Webservice encountered an error ($url): ".  curl_error($ch);
+                curl_close($ch);
+                return $res;
+        }
+        curl_close($ch);
+        return json_decode($result);
+}
+
+function doWebPost($url, $o){
+        $data = array('data' => $o);
+        $ch = curl_init($url);
+	$p= json_decode(getSettingMgr("proxy"));
+	if(!empty($p)){
+		$purl = $p->type ."://". $p->ip .":". $p->port;
+		curl_setopt($ch, CURLOPT_PROXY, $purl);
+		if(!empty($p->user) && !empty($p->pass)){
+			$auth = $p->user .":". $p->pass;
+			curl_setopt($ch, CURLOPT_PROXYUSERPWD, $auth);
+		}
+	}
+        curl_setopt($ch, CURLOPT_POST, true);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query($data));
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+	curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+	curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
+        $result = curl_exec($ch);
+        if ($result === FALSE) {
+                $res = new stdClass();
+                $res->result = "error";
+                $res->message = "Webservice encountered an error ($url): ".  curl_error($ch);
+                curl_close($ch);
+                return json_encode($res);
+        }
+        curl_close($ch);
+        return $result;
+}
+
+
+function proxySubCall($guid, $url, $o){
+	$a3 = getA3ByGuid($guid);
+	$out = new stdClass();
+	$out->result = "success";
+	if(!is_object($a3)){
+		$out->result = "error";
+		$out->message = "A3 not known ($guid)";
+		return $out;
+	}
+	$o = base64_encode(serialize($o) );
+	$out->data = json_decode(doWebPost($url, $o) );
+	return $out;
+}
+
+function proxySubSync($guid, $o){
+	$url = "https://www.alikebackup.com/a3Broker.php?get_license_info=1";
+	return proxySubCall($guid, $url, $o);
+}
+function proxySubEmail($guid, $email){
+	$o = new stdClass();
+        $o->machineID = $guid;
+        $o->message = $email;
+	$o = json_encode($o);
+	$url = "https://www.alikebackup.com/a3Broker.php?client_email=2";
+	return proxySubCall($guid, $url, $o);
+}
+function proxySubMspUsage($guid, $o){
+	$url = "https://www.alikebackup.com/a3Broker.php?a3_sub_usage=1";
+	return proxySubCall($gui, $url, $o);
+}
+function proxyA3SettingBackup($guid, $o){
+	$url = "https://www.alikebackup.com/a3Broker.php?a3_settings_bak=1";
+	return proxySubCall($gui, $url, $o);
+}
+
+function proxySubUpdateCheck(){
+	$cache = "/tmp/update_check.cache";
+	if(file_exists($cache) && filemtime($cache) > (time() - 3600) ){
+		return json_decode(file_get_contents($cache));
+	}
+	$url = "https://www.alikebackup.com/a3Broker.php?update_check";
+	$res = doWebGet($url);
+	file_put_contents($cache, json_encode($res));
+	return $res;
+}
+
+
+function getAllAlerts($id=0){
+	if($id > 0){
+		$sql = "SELECT a.*, a3.name as sourceName from alerts a, a3s a3 where a.source=a3.id  and a3.id=? order by timestamp desc";
+		return dbGet("manager", $sql, array($id) );
+	}else{
+		$sql = "SELECT a.*, COALESCE(a3.name, 'Manager') AS sourceName FROM alerts a LEFT JOIN a3s a3 ON a.source = a3.id order by a.timestamp desc";
+		return dbGet("manager", $sql );
+	}
+}
+
+function syncAlerts(){
+	$alerts = getAlerts(false);
+        $db = getMgrDB();
+        $db->query("BEGIN TRANSACTION");
+        foreach ($alerts as $a){
+                if(!is_object($a)){
+                        echo "not an object?\n";
+                        continue;
+                }
+		// id INTEGER PRIMARY KEY, source INTEGER, type INTEGER, timestamp INTEGER, priority INTEGER, message TEXT
+
+                $sql = "INSERT or REPLACE INTO alerts values(NULL,?,?,?,?,?)";
+                $st = $db->prepare($sql);
+                $st->execute(array( $a->a3id, 0, $a->timestamp, $a->status, $a->description ));
+        }
+        $db->query("COMMIT");
+
+	dismissAlert(0);
+}
+
+function addAlarmMgr($msg, $lvl=1){
+	trimAlarms();
+	$sql = "INSERT or REPLACE INTO alerts values(NULL,?,?,?,?,?)";
+	dbSet("manager",$sql, array( 0, 0, time(), $lvl, $msg ));
+}
+
+// to prevent snowing, trim alerts over a max amont
+function trimAlarms(){
+	// it will always have 1 more than the max value (our insert happens after)
+	$max = 20;	// TODO: make a setting
+
+	$sql = "SELECT count(*) from alerts where source=0 ";
+	$num = dbGetColumn("manager", $sql);
+	if($num > $max){
+		$diff = $num - $max;
+		$sql = "DELETE FROM alerts WHERE id in ( SELECT id FROM alerts ORDER BY id ASC LIMIT $diff) ";
+		dbSet("manager", $sql);
+	}
+}
+
+function countA3Alerts($id){
+	$sql = "SELECT count(*) from alerts where source=?";
+        return dbGetColumn("manager", $sql, array($id));
+}
+
+function dismissAllAlertsMgr(){
+	$sql = "DELETE from alerts";
+	dbSet("manager", $sql);
+}
+
+
+function dismissAllAlertsRemote(){
+	$a3s = getA3sDB();
+	$all = [];
+	$res = new stdClass();
+	$res->result = "success";
+	$res->message = "OK";
+	dismissAlert(0);
+	return $res;
+}
+function dismissAlertMgr($id ){
+	$sql = "DELETE from alerts where id=?";
+	dbSet("manager", $sql, array($id));
+	return;
+
+	dismissAlert($id);
+	return $res;
+}
+
+// called (via api) by anyone who needs to check licensing permissions
+function licenseCheckMgr($d){
+	//     [source] => vm
+	//    [host] => host
+	//    [pool] => pool
+	//    [action] => backup, vault, replicate
+	//    [a3id] => 047AF5C2-61BB-43F5-B898-CD6C52C4FC2B
+
+	// if a source is given, then check agent license
+	// backup, replicate, instaboot, vault
+
+	$r = array();
+	$r["result"] = "success";
+
+	// free for all now
+	$r["status"] = "allowed";
+	$r["message"] = "Enjoy Alike";
+	return $r;
+
+	$p = "denied";	// or allowed
+	$msg = "Checking plan.";
+
+	$sub = getSubInfoMgr();
+
+	if($sub->edition == -1){
+		$r["status"] = "error";
+		$r["message"] = "No active plan found.  Read only mode enabled.";
+		return $r;
+	}
+
+	if($d->action == "replicate" || $d->action == "vault"){
+		if($sub->edition < 2){
+			$r["status"] = $p;
+			$r["message"] = "Alike DR Edition required";
+			return $r;
+		}
+		$r["status"] = "allowed";
+		$r["message"] = "Enjoy your $d->action";
+		return $r;
+	}
+
+	if(!empty($d->pool)){
+		try{
+			$sql = "SELECT COUNT (*) AS total, COUNT (CASE WHEN licensed = 1 THEN 1 END) AS licensed FROM hosts where poolid=?";
+			$pool = dbGetOne("manager", $sql, array($d->pool) );
+			if(!is_object($pool)){ $msg = "Pool not found in database"; }
+			if($pool->total ==0){ $msg = "Pool ($d->pool) not found in database"; }
+			if($pool->total == $pool->licensed){ $p = "allowed"; $msg = "Whole pool is fully licensed";}
+		}catch(Exception $ex){
+			$msg = $ex->getMessage();
+		}
+	}else if(!empty($d->host)){
+		$sql = "SELECT licensed FROM hosts where guid=?";
+		$res = dbGetColumn("manager", $sql, array($d->host));
+		if($res == 1){ $p = "allowed"; $msg = "Host is fully licensed";}
+		else if($res == 0){ $p = "denied"; $msg = "Host is not licensed";}
+		else{ $msg = "Host ($d->host) could not be found in database"; }
+	}else if(!empty($d->source)){
+		// do some agent license check?
+		// search for guid in vm table
+		$sql = "SELECT * FROM vms where guid=?";
+		$res = dbGetOne("manager", $sql, array($d->source));
+		if($res->poolID == "licensed"){ 
+			$p = "allowed"; 
+			$msg = "Agent is licensed";
+		}else if(empty($res) ){
+			$msg = "Agent not found";
+		}else{
+			$msg = "Agent not licensed";
+		}
+	}
+	
+	$r["status"] = $p;
+	$r["message"] = $msg;
+	return $r;
+}
+
+// we need to set the remote a3's vm.hostID field to that a3's guid
+// if the agent is licensed, set the a3's vm.poolID to 'licensed'
+function reAssignAgent($vmuuid, $a3id){
+	// update local vms entry to change a3id
+	$sql = "UPDATE vms set a3id=? where guid=?";	
+	dbSet("manager", $sql, array($a3id, $vmuuid));
+
+	$owner = getA3($a3id);
+	$guy = getVMDB($vmuuid);
+	$guy->hostID = $owner->guid;
+	$guy->poolID = "licensed";
+
+	syncAgentToA3s($guy);
+
+}
+function syncAgentToA3s($guy){
+	$owner = getA3($guy->a3id);
+	$guy->hostID = $owner->guid;
+
+	updateVMAgent($guy);
+
+}
+
+function notifyExpirations(){
+;
+}
+
+////////////////////////////////////////////// Sub and Licensing stuff below ///////////////////////////////////
+function syncSub(){
+        $mode = getNodeMode();
+        if($mode == 1){
+                gen_log(LOG_WARNING,"Headless nodes should not call syncSub!");
+                return;
+        }
+        $id = getInstallID();
+        $bld = getA3Build();
+        $rev = getA3Rev();
+	$ip = "";
+	if($mode == 0){
+		$ip = getSettingMgr("managerIP");
+	}else{
+		$ip = getSetting("hostIP");
+	}
+
+	// no more SB
+	$sess = -1;
+        checkSbState($sess);
+
+        return 0;
+}
+
+function getAgentCount(){
+        $agents = new stdClass;
+	$agents->total =0;
+	$agents->licensed =0;
+	// get all the agents and all the licenesed agents
+	$sql = "SELECT COUNT(*) AS total, SUM(CASE WHEN poolID = 'licensed' THEN 1 ELSE 0 END) AS licensed FROM vms where type=10;";
+	return dbGetOne("manager", $sql);
+}
+
+function getUsedSocketCount(){
+        $socks =0;
+	$sql ="select ifnull(sum(cpu), 0) from hosts where licensed=1";
+	return dbGetColumn("manager", $sql);
+}
+
+function getSubInfoMgr(){
+        $lic = new stdClass();
+        $lic->sockets=0;
+        $lic->agents=0;
+        $lic->type=0;
+        $lic->edition=2;       // read only mode
+
+	return $lic;
+}
+function isOfflineSub(){
+        return true;
+}
+
+
+function checkSbState($sess){
+        $sbFile = "/tmp/sb_sess.conf";
+
+        $amConnected=false;
+        $cmd = "sudo /usr/local/sbin/tunnelWraper status";
+        $output=null;
+        $ret=null;
+        exec($cmd, $output, $ret);
+        if($ret ==0){
+                $amConnected = true;
+                print_r($output);
+        }else{
+//              echo "No support session connected\n";
+        }
+
+        // No session was defined.
+        if(isset($sess) && $sess == -1){
+                if($amConnected){       // close out existing session
+                        syslog(LOG_INFO,"Closing expired remote support session");
+                        echo "Closing expired SB\n";
+                        $cmd = "sudo /usr/local/sbin/tunnelWraper down";
+                        exec($cmd);
+                        exec("rm -f $sbFile");
+                }
+        }else if(isset($sess)){
+                if($amConnected ==false){
+                        syslog(LOG_INFO,"Connecting new remote support session");
+                        echo "Starting new SB\n";
+                        $sb =  base64_decode($sess);
+                        file_put_contents($sbFile, $sb);
+                        $cmd = "sudo /usr/local/sbin/tunnelWraper up";
+                        exec($cmd);
+                }
+        }
+}
+
+
+function deleteAgentMgr($guid){
+        $out = new stdClass();
+        $out->result = "success";
+
+	$guy = getVMDB($guid);
+	if($guy->lastJobResult > 0){
+		$out->result = "error";
+		$out->message = "Cannot delete agent with backups";
+		return $out;
+	}
+
+        $sql = "delete from vms WHERE guid=?";
+        dbSet("manager", $sql, array($guid));
+
+	deleteAgent($guid);
+
+        $out->message = "Agent delete successfully!";
+        return $out;
+}
+
+
+function licenseAgent($guid){
+	;
+}
+function unlicenseAgent($guid){
+      ;
+}
+
+// this actually registers new agents
+// it is called only by A3 nodes (which could be ourself for a fullstack)	agent/register
+// it makes the guid and returns it.
+// It expects the calling A3 to have tested the agent and provided us some details already
+function registerAgent($v, $a3){
+        $out = new stdClass();
+        $out->result = "success";
+        $out->message = "Agent registered successfully";
+
+        $avail = getAvailableAgents();
+	if($avail <= 0){
+		$out->result = "error";
+		$out->message = "No available Agent licenses";
+		return $out;	
+	}
+	if(empty($a3)){
+		$out->result = "error";
+		$out->message = "No such A3: ". print_r($v, true);
+		return $out;
+	}
+	if(empty($v->ip) || empty($v->name) || empty($v->authP)){
+		$out->result = "error";
+		$out->message = "Missing required agent information ". print_r($v, true);
+		return $out;
+	}
+
+	$have = dbGetColumn("manager", "select id from vms where accessIP=? and type=10", array($v->ip) );
+	if(is_numeric($have) && $have > 0){
+		$out->result = "error";
+		$out->message = "Registered agent with IP ($v->ip) already exists! ";
+		return $out;
+	}
+
+
+	$guid = makeGuid();
+	$out->guid = $guid;	// this will be handed back to the agent for them to put in the guid.id file
+
+	$authP = $v->authP;	// mebbe we are given the authP?
+	
+	$sql = "INSERT into vms VALUES(NULL,?,?,?,2,'','licensed',?,10,2,?,?,?,'','',0,0,0)";
+	dbSet("manager", $sql, array($a3->id, $guid, $v->name, $v->ip, $v->size, $authP, $v->ip ));
+
+	reAssignAgent($guid, $a3->id);
+	addAlarmMgr("New Agent [$v->ip] registered ($guid)");
+	
+	// We need to 
+	//	-check code provided (against some agent code in the db)?
+	//	-check we have free agent licenses
+	//	-create a guid for them?
+	//	-We need: IP  
+
+	return $out;
+}
+
+function processClientApi($call, $dat){
+
+//	echo "Call $call\nDat:";
+//	print_r($dat);
+
+        $a3s = getA3sDB();
+	$out = array();
+
+	// /ws/api/joblog?id=80771
+
+        // get VMs (only with backups, or query string)		/vms
+        // get backups for VM (by guid)				/vm?uuid=asdfsdf
+        // get hosts		- DONE
+        // get schedules	- DONE
+        // get jobs (limit, status?)
+        // get joblog (id)	- DONE				/joblog?id=123123
+
+	if($call == "hosts"){
+		$all = getHostsDB();
+		foreach($all as $h){
+			$tmp = new stdClass();
+			$tmp->id = $h->id;
+			$tmp->guid = $h->guid;
+			$tmp->name = $h->name;
+			$tmp->ip = $h->ip;
+			$tmp->type = $h->type;
+			$tmp->cpu = $h->cpu;
+			$tmp->memory = $h->memory;
+			$tmp->os = $h->os;
+			$tmp->licensed = $h->licensed;
+			array_push($out, $tmp);
+		}
+	}else if($call == "vms"){
+		$vms = getAllVMsWithBackups();
+		foreach($vms as $vm){ array_push($out, $vm); }
+	}else if($call == "vm"){
+		if(!isset($dat["uuid"]) && !isset($dat["guid"])){ 
+			return "Error: VM GUID missing";
+		}
+		$uuid = $dat["uuid"];
+		if(!isset($dat["uuid"])){ $uuid = $dat["guid"]; }
+		$backs = getVersionsByDay($uuid);
+		if(empty($backs->VmVersions)){
+			array_push($out, "No backups found for $uuid"); 
+			return $out;
+		}
+		foreach($backs->VmVersions as $back){ 
+			unset($back->Disks);
+			unset($back->action);
+			unset($back->delta);
+			unset($back->version);
+			array_push($out, $back); 
+		}
+	}else if($call == "schedules"){
+                foreach($a3s as $a){
+                        try{
+                                $scheds =  getAllSchedules(true);
+                                foreach($scheds as $s){ 
+					$t = intval($s->jobType);
+					if($t > 50 ){ continue; }
+					$tmp = new stdClass();
+					$tmp->id = $s->scheduleID;
+					$tmp->name = $s->name;
+					$tmp->type = "Backup";
+					$tmp->lastRan = date("g:ia [M dS]", $s->lastran);
+					if($s->jobType == 5){ $tmp->type = "Replication"; }
+					else if($s->jobType == 1){ $tmp->type = "Restore"; }
+					$tmp->scheduleType = "Manual";
+					if($s->scheduleType == 0){ $tmp->scheduleType = "Daily"; }
+					else if($s->scheduleType == 1){ $tmp->scheduleType = "Monthly"; }
+					$tmp->concurrent = $s->numConcurrent;
+					$tmp->startTime = "$s->runHour:$s->runMin";
+					$tmp->vms = array();
+					foreach($s->VMs as $v){
+						$o = new stdClass();
+						$o->name = $v->VMName;
+						$o->guid = $v->uuid;
+						$o->poolID = $v->poolID;
+						$o->type = $v->virtTech;
+						$o->size = $v->totalSize;
+						array_push($tmp->vms, $o); 
+					}
+					$tmp->isCBT =0;
+					if($s->Options->doCBT){	$tmp->isCBT = 1; }
+					$tmp->isQHB =0;
+					if($s->Options->QHB){	$tmp->isQHB = 1; }
+					array_push($out, $tmp); 
+				}
+                        }catch(Exception $ex){
+                                print_r($ex->getMessage());
+                        }
+                }
+        }else if($call == "jobs"){
+		$out = getActiveJobsMgr();
+        }else if($call == "joblog"){
+		if(!isset($dat["id"])){ 
+			return "Error: Joblog ID missing";
+		}
+		$jobID = $dat["id"];
+		try{
+                $Job= getJob($jobID);
+                // new method to calc the total job progress
+                $prog = calcJobProgress($jobID);
+                updateJobProgress($jobID, $prog);
+                $entries = getJoblogDetails($jobID, 0);
+                $protectedSize= getJobSizeTotal($jobID);
+
+
+		array_push($out, "Total Job Protected size: $protectedSize");
+		array_push($out, "VMs in job:");
+		foreach($Job->vmsInJob as $guy){ 
+			array_push($out, "[$guy->VMID] $guy->VMName  [$guy->UUID]");
+		}
+		array_push($out, "System Entries:");
+		foreach($entries->systemEntries as $l){ 
+			$st = getJobLogStatusStr($l->status);
+			array_push($out, date("g:i:sa [M dS]", $l->timestamp) ." [$st] - $l->description");
+		}
+		
+		foreach($entries->vmEntries as $vm){ 
+			array_push($out, "VM Section: $vm->name [$vm->id]");
+			foreach($vm->entries as $l){
+				$st = getJobLogStatusStr($l->status);
+				array_push($out, date("g:i:sa [M dS]", $l->timestamp) ." [$st] - $l->description");
+			}
+		}
+		}catch(Exception $ex){
+			echo "Could not get joblog info for jobID $jobID: ". $ex->getMessage();
+		}
+	}
+
+	return $out;
+
+}
+
+?>

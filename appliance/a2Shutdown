@@ -1,0 +1,8 @@
+#!/usr/bin/php -q
+<?php
+syslog(LOG_NOTICE,"Running a2Shutdown scripts");
+exec("/usr/local/sbin/stopAlike");
+exec("/usr/local/sbin/dbSyncer --unsafe");
+exec("/usr/local/sbin/dsUnmount");
+
+?>

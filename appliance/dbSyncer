@@ -1,0 +1,317 @@
+#!/usr/bin/php -q
+<?php
+
+include_once("/usr/local/sbin/common_lib");
+
+if(file_exists("/mnt/ads/read_only")) { exit(0); }
+if(file_exists("/mnt/ads/noDS")) { exit(0); }
+
+if(amRoot()){
+	die("Please do not run this as root.  It will break many things.\n");
+}
+
+$GLOBALS["AH"]="/home/alike";
+$GLOBALS["script_path"]= "/use/local/sbin";
+
+if($argc == 1) {
+	echo "dbSyncer requires arguments\n";
+	syslog(LOG_ERR, "No arguments given to dbSyncer");
+	exit(0);
+}
+
+if(strpos(join($argv, " "), "--test") !== false) {
+	testWal($argv[2]);
+	exit(0);
+}
+
+if(strpos(join($argv, " "), "--actual") !== false) {
+	applyAll();
+	exec("sync");
+	exit(0);
+}
+
+$BACKUP_MODE = false;
+if(strpos(join($argv, " "), "--backup") !== false) {
+	$BACKUP_MODE = true;
+	applyAll();
+	exec("sync");
+	exit(0);
+}
+
+
+// Applies all dbs, but coalesces db sync requests together to prevent spamming
+if(strpos(join($argv, " "), "-a") !== false) {
+	
+	$fn = "/tmp/wal_coalesce";
+	$fp = @fopen($fn, "w");
+	if(! $fp) {
+		$msg = "Failed to open lock file: $fn";
+		syslog(LOG_WARNING, $msg);
+		return false;
+	} 
+	flock($fp, LOCK_EX);
+	$pnum = getProcessNum();
+	$pnumNew = $pnum;
+	$count = 0;
+	while($pnum != -1 && $pnum == $pnumNew)  {
+		flock($fp, LOCK_UN);
+		sleep(1);
+		flock($fp, LOCK_EX);
+		$pnumNew = getProcessNum();
+		$count++;
+		if($count > 100) {
+			syslog(LOG_INFO, "Still waiting on coalesced db sync after 100 seconds");
+			$count = 0;
+		}
+	}
+	$pnum = $pnumNew;
+	if($pnum == -1) {
+		//syslog(LOG_DEBUG, "dbSyncer triggering real sync--bus is leaving");
+		exec("/usr/local/sbin/dbSyncer --actual > /dev/null 2>/dev/null &");
+		flock($fp, LOCK_UN);
+		exit(0);
+	}
+	flock($fp, LOCK_UN);
+	//syslog(LOG_DEBUG, "dbSyncer coalesced with another instance");
+	while($pnum == $pnumNew)  {
+		sleep(1);
+		$pnumNew = getProcessNum();
+	}
+	//syslog(LOG_DEBUG, "dbSyncer child instance is finished");
+	exit(0);
+		
+}
+
+if(strpos(join($argv, " "), "--unsafe") !== false) {
+	$GLOBALS["unsafe"]=true;
+	if(onlyOneProcess()) {
+		applyAll();
+	}
+	exit(0);
+}
+
+applyWal($argv[1]);
+exec("sync");
+
+
+function getProcessNum() {
+	$foo = <<<EOD
+ps aux |grep "[d]bSyncer --actual" | awk '{print $2}'
+EOD;
+	$res = trim(shell_exec($foo));
+
+	if(is_numeric($res)) {
+			return $res;
+	}
+	return -1;
+}
+
+function onlyOneProcess()  {
+	$fn = "/tmp/wal-locker-all";
+	$fp = null;
+	$hasLogged = false;
+	$oldm = umask(0);
+	$fp = @fopen($fn, "w");
+	umask($oldm);
+	if(! $fp) {
+		$msg = "Failed to open lock file: $fn";
+		syslog(LOG_WARNING, $msg);
+		return false;
+	} 
+	if(flock($fp, LOCK_EX |LOCK_NB) == false) {
+		syslog(LOG_INFO,"dbSyncer --unsafe will not run; it's already running");
+		return false;
+	}
+	return true;
+}
+
+function applyAll() {
+	applyWal("/home/alike/Alike/DBs/nimbusdb.db");
+	applyWal("/home/alike/Alike/DBs/nimbusjobs.db");
+	applyWal("/home/alike/Alike/DBs/gfs.db");
+	//applyWal("/home/alike/Alike/DBs/cache.db");
+}
+
+function getDBReal($dbFile){
+	$db = new PDO("sqlite:$dbFile");
+	$db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+	
+	return $db;
+}
+
+
+function testWal($dbFile) {
+	$db = getDbReal($dbFile);
+	$db->exec("PRAGMA journal_mode=WAL;");
+	$db->exec("PRAGMA wal_autocheckpoint=0");
+	$db->exec("BEGIN TRANSACTION");
+	$db->exec("CREATE TABLE IF NOT EXISTS tempy (id INTEGER)");
+	$db->exec("INSERT INTO tempy VALUES(1)");
+	$db->exec("COMMIT");
+	echo "Lingering with open connection...\n";
+	Sleep(30);
+	echo "DONE\n\n";
+	//$db->exec("DROP TABLE TEMPY");
+}
+
+function saneExec($db, $statement) {
+	$rez = $db->exec($statement);
+	if($rez === false) {
+		throw $db->errorInfo();
+	}
+	return $rez;
+}
+
+function applyWal($dbFile){
+	global $BACKUP_MODE;
+	$destDbPath = "/home/alike/Alike/ADS/prodDBs/" . basename($dbFile);
+	if($BACKUP_MODE) {
+		$destDbPath = "/home/alike/Alike/remoteDBs/" . basename($dbFile);
+	}
+	$walFile = $dbFile . "-wal";
+	if(checkFileUnchangedQuick($dbFile, $destDbPath) && file_exists($walFile) == false) {
+		// No-op
+		return;
+	}
+
+	$fn = "/tmp/wal-locker" . basename($dbFile);
+	$fp = null;
+	$hasLogged = false;
+	while(! $fp) {
+		$oldm = umask(0);
+		$fp = @fopen($fn, "w");
+		umask($oldm);
+		if($fp) {
+			break;
+		}
+		$msg = "Failed to open lock file: $fn";
+		if($hasLogged == false) {
+			syslog(LOG_WARNING, $msg);
+			$hasLogged = true;
+		}
+		if(isset($GLOBALS["unsafe"])) {
+			return;
+		}
+		sleep(10);
+	} 
+	
+	$hasLogged = false;
+	$count = 0;
+	while(flock($fp, LOCK_EX |LOCK_NB) == false) {
+		if($hasLogged == false) {
+			syslog(LOG_WARNING, "dbSyncer handler waiting for lock file");
+			$hasLogged = true;
+		}
+		sleep(1);
+		if($count++ > 3 && isset($GLOBALS["unsafe"])) {
+			syslog(LOG_WARNING, "dySyncer unsafe mode tmieout waiting for lock file");
+			return;
+		}
+	}
+	if(isADSMounted() ==  false){
+		syslog(LOG_WARNING, "ADS not mounted, no sync will occur");
+		return;
+	}
+	$walFile = $dbFile . "-wal";
+	$destDbPathTemp = $destDbPath . ".tmp";
+	while(file_exists($dbFile) == false) {
+		if(isset($GLOBALS["unsafe"])) {
+			syslog(LOG_WARNING, "dbSyncer unsafe returning due to missing DB $dbFile");
+			return;
+		}
+		$foo = "dbSyncer $dbFile does not exist";
+		echo $foo;
+		syslog(LOG_ERR, $foo);
+		sleep(10);
+	}
+	$count = 0;
+	while(true) {
+		if($count++ > 3 && isset($GLOBALS["unsafe"])) {
+			syslog(LOG_WARNING, "Cannot finish copy and unsafe mode is enabled. Returning now\n");
+			return;
+		}
+		
+		try {
+			$descriptorspec = array(
+				0 => array("pipe", "r"),  // stdin is a pipe that the child will read from
+				1 => array("file", '/tmp/swrapper_out.log', "w"),  // stdout is a pipe that the child will write to
+				2 => array("pipe", "w") // stderr
+			);
+			$res = trim(shell_exec("sqlite3 $dbFile 'pragma wal_checkpoint(TRUNCATE);'"));
+			if(substr($res,0,1) !== "0"){
+				throw new Exception("Unable to trunacate WAL ($res)");
+			}
+			
+			$process = proc_open("sqlite3 $dbFile", $descriptorspec, $pipes);
+			if(is_resource($process) == false) {
+					syslog(LOG_ERR, "Cannot open sqlite3");
+					continue;
+				}
+			try {
+				//echo "Executing checkpoint on $dbFile\n";
+				fwrite($pipes[0], "pragma wal_checkpoint;\n");
+				//fwrite($pipes[0], "pragma locking_mode=exclusive;\n");
+				fwrite($pipes[0], "begin transaction exclusive;\n");
+				fwrite($pipes[0], "create table if not exists locko (id INTEGER);\n");
+				fwrite($pipes[0], "replace into locko VALUES(1);\n");
+				fflush($pipes[0]);
+				//echo "DATABASE SHOULD BE LOCKED\n";
+				//Sleep(20);	
+				if(copy($dbFile, $destDbPathTemp) == false)  {
+					throw new Exception(error_get_last());
+				}
+				//syslog(LOG_INFO, "$dbFile mirrored successfully");
+
+				//echo "Copy success!\n";
+				//fwrite($pipes[0], "drop table locko;\n");
+				fwrite($pipes[0], "rollback transaction;\n");
+				fwrite($pipes[0], ".q\n");
+				
+				$errors = stream_get_contents($pipes[2]);
+				if(empty($errors) == false) {
+					echo $errors;
+					throw new Exception($errors);
+				}
+				if(rename($destDbPathTemp, $destDbPath) == false) {
+					throw new Exception(error_get_last());
+				}
+				break;
+			} finally {
+				fclose($pipes[0]);
+				fclose($pipes[2]);
+				proc_close($process);
+			}
+		} catch (Exception $e) {
+			$msg = $e->getMessage();
+			if(strpos($msg,"database is locked") !==false){
+				$msg = "Database is currently locked by another process.";
+			}
+			$myThing = "Unable to apply database log for ". basename($dbFile)." due to {$msg}";
+			if($count > 50) {
+				syslog(LOG_ERR, $myThing);
+			} else if($count > 10) {
+				syslog(LOG_WARNING, $myThing);
+			} else {
+				syslog(LOG_INFO, $myThing);
+			}
+		}
+		Sleep(1);
+		
+	}
+}
+
+function checkFileUnchangedQuick($file1, $file2) {
+	$stat1 = stat($file1);
+	if(!$stat1) return false;
+	$stat2 = stat($file2);
+	if(!$stat2) return false;
+	if($stat1['mtime'] > $stat2['mtime']) {
+		return false;
+	}
+	if($stat1['size'] == $stat2['size']) {
+		return true;
+	}
+	return false;
+}
+
+?>

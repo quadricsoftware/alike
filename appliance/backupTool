@@ -1,0 +1,1908 @@
+#!/usr/bin/php -q
+<?php
+
+include_once("engine_common");
+include_once("hv_common");
+include_once("phys_common");
+include_once("xen_common");
+include_once("abd_common");
+
+$me = pathinfo(__FILE__, PATHINFO_FILENAME);
+
+$overrideCbt = false;
+
+if($argc < 2){ usage(); }
+
+$jobId=null;
+$vmId=null;
+
+// Parse our arguments
+$args = array();
+for($i=0; $i < $argc; $i++ ){
+	if($argv[$i] == "-j"){
+		if($argc > $i){
+			$i++;
+			$jobId = $argv[$i];
+		}	
+	}
+	else if($argv[$i] == "-v"){
+		if($argc > $i){
+			$i++;
+			$vmId = $argv[$i];
+		}	
+	}
+}
+echo "I got VMID: $vmId, Job: $jobId\n";
+if(!is_numeric($jobId) || !is_numeric($vmId)){
+	usage();
+	exit();
+}
+$GLOBALS["__insta_job_id"] = $jobId;
+$GLOBALS["__insta_vm_id"] = $vmId;
+
+function usage(){
+        echo "Usage: -v <vmID> -j <jobID>\n";
+        exit();
+}
+
+
+// Now that setup is done, let's do the actual work
+try{
+	$res = doBackup($vmId, $jobId);
+	exit($res);
+}catch(Exception $ex){
+	gen_log(LOG_ERR_NOFAIL, $ex->getMessage() );
+	exit(1);
+}
+
+
+// make sure the ADS is mounted and connect to your preferred hypervisor/agent
+function checkEnv($vm){
+	if(!file_exists("/tmp/jads.status")){
+		throw new Exception("ADS is not mounted, or in an inconsistent state.  Backups can't run until this is resolved. (jads.status)");
+	}
+	if($vm->type ==2){ 					// Xen
+		connectXapiByPool($vm->poolID);
+		gen_log(LOG_DEBUG, "Connected to Xen $vm->poolID");
+		$res = licenseCheck(null, null, $vm->poolID, "backup");
+
+		$hoster = "";
+		$mid = getPoolMasters($vm->poolID);
+		if(count($mid) ==1){
+			$master = getHost($mid[0]);
+			$hoster = "Connected to Xen: $master->poolName [$master->nativeName ($master->name) - $master->osName] ";
+			gen_log(LOG_DEBUG, $hoster);
+		}
+
+		// licensing problem
+		if($res->status == "error"){ throw new Exception("Licensing error: $res->message"); }
+
+		if($res->status == "allowed"){
+			gen_log(LOG_DEBUG, "License check success- The whole Xen pool is licensed.");
+			return;
+		}
+
+		// not all hosts in pool are licensed.  see if they're running on a licensed host
+		$homer = getHomeHostXen($vm->uuid );
+		if($homer == null){
+			// vm isn't homed or running, check if pool is fully licensed
+			throw new Exception("Licensing error- VM is not running/homed on a licensed host.");
+		}
+		$h = getHostByUuid($homer);
+		$res = licenseCheck(null, $h->uuid, null, "backup");
+		if($res->status == "allowed"){
+			gen_log(LOG_DEBUG, "License check success- VM is running/homed on licened host: $h->nativeName.");
+			return; 
+		}
+		throw new Exception("Licensing error- VM is on an unlicened host.  Please license $h->nativeName or migrate this system to proceed.");
+	
+	} else if($vm->type ==10){ 				// Physical
+
+		$res = licenseCheck($vm->uuid, null, null, "backup");
+
+		// licensing problem
+		if($res->status == "error"){ throw new Exception("Licensing error: $res->message"); }
+
+		if($res->status != "allowed"){
+			throw new Exception("Agent is not licensed!  Please license this system to proceed.");
+		}
+		$ip = $vm->accessIP;
+		gen_log(LOG_DEBUG, "Connecting to QS Agent $ip");
+		$st = agentStatus($ip);	// check our HV host
+		if(empty($st) || !is_object($st)){
+			throw new Exception("Failed to connect to remote system agent! ($ip)");
+		}
+
+		recordAgent($vm->VMID, $st);
+	} else{ 						// HV
+		$h = getHost($vm->hostID);
+		$res = licenseCheck(null, $h->uuid, null, "backup");
+print_r($res);
+		// licensing problem
+		if($res->status == "error"){ throw new Exception("Licensing error: $res->message"); }
+
+		if($res->status != "allowed"){
+			throw new Exception("Licensing error for host: $h->nativeName. ". $res->message);
+		}
+		gen_log(LOG_DEBUG, "License check success- VM was found on licened host: $h->nativeName.");
+		$hostIP = $h->name;
+		gen_log(LOG_DEBUG, "Connected to Hyper-v host agent $hostIP ");
+		$st = agentStatus($hostIP);	// check our HV host
+		if(empty($st) || !is_object($st)){
+			throw new Exception("Failed to connect to HV host agent! ($hostIP)");
+		}
+		$vers = explode(" ",$st->version)[0];
+		gen_log(LOG_INFO, "Connected to Host Agent [$vers] on $hostIP");
+//		recordAgent($vm->hostID, $st, true);
+	}
+}
+
+function doBackup($vmId, $jobId){
+
+	$ret = 0;
+
+	$snapTime = time();
+	$vmUuid = getVMUuid($vmId);
+	$vm = getVm($vmUuid);
+	if(!is_object($vm)){ $vm = getVmSimple($vmUuid); }
+	$j = getJob($jobId);
+
+	if(!isVMinJob($vm, $j)){
+		throw new Exception("VM ($vm->name) is not a part of this job($j->name)!");
+	}
+
+	checkEnv($vm); // Check for ADS status and connect to host/agent/etc.  Also sets up XAPI connection if needed
+
+	$vmMeta = getVMMeta($vm);	// get meta depending on the platform
+	try{
+		if(array_key_exists("QHB", $j->Options) && $j->Options["QHB"] ==1 || $vm->type == 10 ){ 
+			doAgentBackup($vm, $j, $vmMeta, $snapTime);
+		}else{
+			doVisorBackup($vm, $j, $vmMeta, $snapTime);
+		}
+
+		if(checkForCancel($j->jobID) ){ 
+			gen_log(LOG_WARNING,"Backup of $vm->name was cancelled successfully.");
+			return 1;
+		}
+
+		gen_log(LOG_DEBUG,"Writing meta files for commit.");
+		writeMetaFiles($j, $vm, $snapTime, $vmMeta);	// makes .meta and .blob files
+		$timer = time() - $snapTime;
+		gen_log(LOG_INFO,"Committing data for $vm->name to ADS");
+		if(commitBackup($j, $vm, $timer )){
+			if($j->type ==5){
+				gen_log(LOG_INFO,"Replication data acquisition of $vm->name Complete.");
+			}else{
+				gen_log(LOG_INFO,"Backup of $vm->name Complete.");
+			}
+		}else{
+			gen_log(LOG_WARNING,"Backup of $vm->name Completed with errors.");
+			$ret= 1;
+		}
+	}catch(Exception $ex){
+		gen_log(LOG_ERR_NOFAIL,"Caught Error: ". $ex->getMessage());
+		 $stackTrace = $ex->getTraceAsString();
+		gen_log(LOG_DEBUG, $stackTrace);
+		exec("rm /tmp/job_ctl/$j->jobID.$vm->VMID.*");	// clean out any of our runners, just in case
+		$ret= 1;
+	}finally{
+		$st = "[Complete]";
+		if($ret ==1){ $st = " [Failed]"; }
+		else if(isset($GLOBALS["hasWarnings"]) && $GLOBALS["hasWarnings"] ==1){ $st = " [Complete, with warnings]"; $logState =2; }
+	}
+	return $ret;
+}
+
+function writeMetaFiles($j, $vm, $ts, $vmMeta){
+	try{
+		$workDir = "/home/alike/Alike/agentShare/jobs/$j->jobID/$vm->VMID";	// <-- this should exist
+		exec("mkdir -p $workDir");
+		$jsMeta = json_encode($vmMeta,JSON_NUMERIC_CHECK );
+		$meta =trim(engine_getMetaInfoEncoded($jsMeta));
+		file_put_contents("$workDir/vmmeta.blob", $meta );
+		$barf = "$vm->uuid\n$vm->type\n$ts\n$vm->name";	// basic metainfo for engine's use
+		file_put_contents("$workDir/vmmeta.info", $barf);
+		file_put_contents("$workDir/dev.num", count($vmMeta->VBDS));
+	}catch(Exception $ex){
+		throw new Exception("Failed to generate meta binary. Error: ". $ex->getMessage());
+	}	
+}
+
+function getDriveForLetters($l, $ip){
+	$out = [];
+	foreach($l as $guy){
+                $cmd = "powershell Get-Partition -DriveLetter '".$guy->letter."' | Get-Disk | Select-Object -ExpandProperty Number";
+                $drv = trim(agentRunCmdWithRetry($ip, $cmd));
+                $let = substr($guy->letter,0,1);
+                $out[$let] = $drv;
+                gen_log(LOG_DEBUG,"$let resides on physicalDrive$drv");
+	}
+	return $out;
+}
+
+function getVolSize($let, $ip){
+	$bytes ="";
+	try{
+		$cmd = "powershell Get-Partition -DriveLetter '".$let."' | Get-Disk | Select-Object -ExpandProperty Size";
+		$bytes = trim(agentRunCmdWithRetry($ip, $cmd));
+		gen_log(LOG_DEBUG,"$let size is: $bytes ($cmd)");
+	}catch(Exception $ex){
+		gen_log(LOG_DEBUG,"Exception getting $let size: ". $ex->getMessage());
+	}
+	return $bytes;
+}
+
+function doAgentBackup($vm, $j, &$vmMeta, $snapTime){
+	global $overrideCbt;
+	gen_log(LOG_INFO, "Running Agent  backup of: $vm->name");
+	$ip = $vm->ip;
+	if(empty($ip)){
+		if(!empty($vm->accessIP) ){
+			echo "I've got an access IP: $vm->accessIP\n";
+		}else{
+			$vminfo = getVmInfo($vm->uuid);
+			$ip = $vminfo->ipaddress;
+		}
+	}
+	$workDir = "/home/alike/Alike/agentShare/jobs/$j->jobID/$vm->VMID";	// <-- this should exist
+	$st = checkAgentStatus($ip);
+	recordAgent($vm->VMID, $st);
+	// make all folders for the job/vi to run on the agent
+	prepAgentForVM($ip, $vm, $j);
+
+	$let = getDriveLetters($ip);
+	$let = excludeDrivesIfNeeded($ip, $let); # excludes volumes that are in exclusions.conf
+	$volDriveMap = getDriveForLetters($let, $ip);
+	$vols = "";
+	foreach($let as $l){
+		$vols .= "$l->letter ";
+	}
+	$vols = rtrim($vols,",");
+	$vz = doVssSnap($ip, $vols, $j->jobID, $vm->VMID);
+
+	$vmMeta->VBDS= array();
+
+	$start = time();	// for the UI's throughput stat (recorded in the finally)
+	// Block size is hardcoded for Q-Hybrid jobs somewhere, somehow.
+      	// But we take it as a parameter to agentCbtPre. So we should find out where it's hardcoded later.
+     	$myBs = (1024 * 1024);
+///////////////////////////
+	
+	try{
+		$volNum=0;
+		doAgentMunge($ip, $j->jobID, $vm->VMID, 0, "device0", $volNum, $volNum, "Processing System Partition");
+		agentDeleteFile($ip, "jobs\\$j->jobID\\$vm->VMID\\result.0");	// we're special and double munge the same disk
+
+		$volNum=0;
+		foreach($vz as $v => $k){
+			$let = substr($v,0,1);
+			
+			$oldVolNum = $volNum;
+			
+			$stateMd5 = "BAD";
+			if($vm->virtTech == 10 || $overrideCbt == true) {
+				$stateMd5 = agentCbtPre($ip, $j->jobID, $vm->VMID, $k, $volNum, "$let:", $snapTime, $myBs);
+			}
+
+			$bsize = getVolSize($let, $ip);
+			$sz = "";
+			if(!empty($bsize)){
+				$purty = bytesToString($bsize);
+				$sz = " [$purty]";
+			}
+			$marker = "/tmp/job_ctl/$j->jobID.$vm->VMID.$volNum";
+			touch($marker);
+			$pid = pcntl_fork();
+			if($pid ==0) {
+				$vmsg = "Processing Volume $volNum $sz";
+				showTaskProgress($ip, $j->jobID, $vm->VMID,0, $volNum, $vmsg, $bsize );
+				exit(0);
+			}
+			try{
+				$drvNum = $volDriveMap[$let];
+				if(!is_numeric($drvNum) ){ throw new Exception("Could not map drive letter ($let) to physical drive ($drvNum) "); }
+				doAgentMunge($ip, $j->jobID, $vm->VMID, 0, $k, $drvNum, $volNum);
+				$volFileRem = "jobs\\$j->jobID\\$vm->VMID\\$volNum.meta";
+				$res = trim(agentFileGetContents($ip, $volFileRem ));
+				$tmp = explode(",",$res);
+				$volSize = $tmp[1];
+				gen_log(LOG_DEBUG, "$volNum.meta local: $volFileRem [res: $res] Size: $volSize");
+				if(!is_numeric($volSize)){ throw new Exception("Failed to get volume size from agent ($volNum.meta)"); }
+				pcntl_waitpid($pid, $status, WNOHANG);
+			}finally{
+				$volNum++;
+				unlink($marker);
+				if(posix_getpgid($pid)){ 
+					sleep(3);
+					posix_kill($pid,0); 
+				}
+				gen_log(LOG_DEBUG, "Progress pid $pid should now be done.");
+				$d = new stdClass();
+
+				$d->bootable =1;
+				$d->uuid ="";
+				$d->size =$volSize;
+				$d->name ="Disk $volNum";
+				$d->description ="";
+				$d->userdevice =$volNum;
+				$d->device ="";
+				$d->type =1;
+				$d->devicetype =1;
+				array_push($vmMeta->VBDS, $d);
+			}
+			if($vm->virtTech == 10 || $overrideCbt == true) {
+				agentCbtPost($ip, $vm->VMID, $oldVolNum, $stateMd5, $myBs);
+			}
+
+		}
+	}finally{
+		$totalTime = time() - $start;
+		$jobTimeFile = "/tmp/job_ctl/". $j->jobID .".proctime";
+		incrementFileLocked($jobTimeFile, $totalTime);
+		//pull down all needed files from the agent so we can commit
+		postAgentBackup($ip, $vm, $j);
+	}
+}
+
+function doAgentMunge($ip, $jobID, $vmID, $bs, $deviceStr, $diskNum, $volNum){
+	// -P paranoid
+	$bs = 1024;	// QHB always needs 1024
+	// sysPart -- -B prevents CODA from being appended to HCL
+	$args = "-q -m -k $bs -H 6 -w 6 -c -d $deviceStr -j $jobID -v $vmID -M $diskNum -B 0 -D $diskNum -x -p chroot -x";	
+	if(strpos($deviceStr, "VolumeShadow") !== false){
+		if($volNum ==0){
+			// boot disk/vol (0/0)
+			$args = "-q -m -k $bs -H 6 -w 6 -c -d $deviceStr -j $jobID -v $vmID -M $diskNum -D $volNum -x -p chroot";	
+		}else{
+			// all other vols (skips MBR)
+			$args = "-q -m -k $bs -H 6 -w 6 -c -d $deviceStr -j $jobID -v $vmID -M $diskNum -D $volNum -x -B 1 -p chroot";	
+		}
+	}
+
+	$cmd = "QSQHBAgent.exe $args";
+	gen_log(LOG_DEBUG, "Munging volume: $cmd");
+	//sleep(500000);
+	agentRunPreship($ip, $cmd, true);
+
+	checkAgentResults($ip, $volNum, $jobID, $vmID);
+}
+function doAgentMungeVHD($ip, $jobID, $vmID, $bs, $vhdPath, $diskNum ){
+	// justBorn adds a -b to speed things up?
+	$vhdPath = str_replace('\\','\\\\\\\\',$vhdPath);
+        $args = '-q -z -m -k '.$bs.' -H 6 -w 6 -c -j '.$jobID.' -v '.$vmID.' -M '.$diskNum.' -D '.$diskNum.' -x -p chroot -x -d \\\\\"'.$vhdPath.'\\\\\"';  // -P paranoid
+        $cmd = "QSQHBAgent.exe $args";
+        gen_log(LOG_DEBUG, "Munging VHD: $cmd");
+        agentRunPreship($ip, $cmd, true);
+	checkAgentResults($ip, $diskNum, $jobID, $vmID);
+}
+
+function checkAbdResults($ip, $disk ){
+	$cmd = "cat /tmp/result.$disk";
+	$res = runAbdCmd($ip, $cmd);
+	if(substr($res, 0, 1) != "0"){
+		gen_log(LOG_DEBUG, "Error raw (disk $disk): $res");
+		throw new Exception("(ABD Results) Error:". substr($res,2) );
+	}
+        gen_log(LOG_DEBUG, "Munge results: $res");
+}
+
+
+function checkAgentResults($ip, $vol, $jobID, $vmID){
+	$file = "jobs\\$jobID\\$vmID\\result.$vol";
+	$pidFile = "jobs\\$jobID\\$vmID\\pid.$vol";
+	$pidRes = agentFileGetContents($ip, $pidFile);
+	$tries = 10;
+	while(empty($pidRes)) {
+		if($tries ==0) { throw new Exception("Failed to acquire backup pid for volume $vol after 60 seconds." ); }
+
+                gen_log(LOG_DEBUG, "Pid still blank, sleeping ($pidFile)");
+                sleep(6);
+                $pidRes = agentFileGetContents($ip, $pidFile);
+                $tries--;
+	}
+	$pid = trim($pidRes);
+	gen_log(LOG_DEBUG, "PID file found at $pidFile, and it has \"$pid\" as its contents");
+	while(true) {
+		try {
+			$rez = agentRunCmdWithRetry($ip, "powershell try { Get-Process -Id $pid -ErrorAction Stop | Out-Null; Write-Host 'Process is running.' } catch { Write-Host 'Error: \$_' }");
+			if(stripos($rez, "process is running") !== false) {
+				//gen_log(LOG_DEBUG, "Pid $pid is running bro, according to $rez");
+				;
+			} else {
+				gen_log(LOG_DEBUG, "pid $pid no longer active");
+				break;
+			}
+		}catch(Exception $ex){ 
+			// Eat the exception
+			;
+		}
+		sleep(10);
+	}
+	// Give minger the opportunity to kick out the result file
+	sleep(1);
+	$res = agentFileGetContents($ip, $file);
+	$tries = 10;
+	while(substr($res, 0, 1) == "2"){
+		if($tries ==0) { throw new Exception("Backup result still \"in process\" for volume $vol after 60 seconds, though process has exited." ); }
+		gen_log(LOG_DEBUG, "Munge still \"in process\", waiting...");
+		sleep(6);
+                $res = agentFileGetContents($ip, $file);
+                $tries--;
+	}
+
+	if(substr($res, 0, 1) != "0"){
+		throw new Exception("Error:". substr($res,2) );
+	}
+        gen_log(LOG_DEBUG, "Munge results: $res");
+}
+
+
+function doVssSnap($ip, $vols, $jobID, $vmID){
+        if(agentFileBinExists($ip, "snap.ps1") == false){
+                throw new Exception("Remote agent is missing required installatin file (snap.ps1). Has it been removed by antivirus?");
+        }
+
+	$args = "$vols";
+	$cmd = "vsssnap.cmd $args";
+	$msg ="Taking VSS snapshot... ";
+        $veid = addJobLog($msg,3, $jobID, $vmID);
+	$res = agentRunPreship($ip, $cmd);
+	sleep(1);	// give vsstool a second to do things and write a result file
+	//$pre = "jobs\\$jobID\\$vmID";
+	$pre = "";
+
+	/* $resultFile = "$pre\\VSSTool.result";
+	$res = agentFileGetContents($ip, $resultFile);
+	if(empty($res)){
+		gen_log(LOG_DEBUG, "VssTool result file is empty ($res).  Waiting for it to catch up.");
+		sleep(10);
+		$res = agentFileGetContents($ip, $resultFile);
+	}
+
+	while(substr($res, 0, 1) == "2"){
+		sleep(1);	// in progress
+		$res = agentFileGetContents($ip, $resultFile);
+	}
+	if(substr($res, 0, 1) != "0"){
+		throw new Exception("Error:". substr($res,2) );
+	} */
+        gen_log(LOG_DEBUG, "Vss result status: $res");
+	if(stripos($res, "successfully") === false) {
+           throw new ErrorException("VSS snapshot failed with $res");
+      	}
+	
+
+	$dat = "vssTool.dat";
+	$failCount = 0;
+	while(agentFileExists($ip, $dat) == false){
+		if($failCount > 10) {
+			throw new Exception("VSS snapshot did not generate output!"); 
+		}
+		gen_log(LOG_DEBUG, "Sleeping on vssTool.dat discovery");
+		sleep(10);
+		$failCount++;
+	}
+	$meat = agentFileGetContents($ip, $dat);
+	$lines = array_filter(explode(PHP_EOL,$meat));
+	$vols= [];
+	foreach($lines as $l){
+		$bits = explode(",", $l);
+		$last = explode("\\",$bits[1]);
+		$vols[$bits[0]] = trim(end($last));
+	}
+        updateJobLog("$msg complete",0, $veid);
+	return $vols;
+
+}
+function prepAgentForVM($ip, $vm, $j, $isHV=false){
+
+        addJobLog("Prepping the QSI folder (new) for $vm->name", 4, $j->jobID, $vm->VMID);
+        // copy over the munge.conf file to the QSI
+	$as ="/home/alike/Alike/agentShare";
+        $mungeconf= "$as/munge.conf";
+
+	// create the job/vm folder for the agent
+        $vjUgly = "chroot\\jobs\\$j->jobID\\$vm->VMID";
+        $out = agentRunCmdWithRetry($ip, "cmd /c mkdir $vjUgly");
+
+        $vj = "chroot/jobs/$j->jobID/$vm->VMID";
+        $mft = "$vj/munge.conf";
+        $out = agentUploadFile($ip, $mungeconf, "$mft");
+        addJobLog("Uploaded  $mungeconf to $mft ($out)", 4, $j->jobID, $vm->VMID);
+
+        $jf = "$as/jobs/$j->jobID/$vm->VMID";
+	if(!is_dir($jf)){
+		gen_log(LOG_DEBUG, "No job folder exists! ($jf)");
+		exec("mkdir $jf");
+	}
+        $files = scandir($jf."/");
+        foreach($files as $file) {
+                if($file == "." || $file == ".."){ continue; }
+                $ff = "$jf/$file";
+                $df = "$vj/$file";
+                $out = agentUploadFile($ip, $ff, $df);
+                addJobLog("Uploaded  $ff to $file ($out)", 4, $j->jobID, $vm->VMID);
+        }
+}
+function postAgentBackup($ip, $vm, $j, $isHV=false){
+
+	sleep(2);	// we sleep for 2 seconds to allow the progress threads to do their final lap.  If we clean the job dir under their feet, they hang
+
+        // copy anything we need from the remote QSI folder 
+	$as ="/home/alike/Alike/agentShare";
+        $vmqsi = "chroot\\\\jobs\\\\$j->jobID\\\\$vm->VMID";
+        if($isHV){
+                $hvPath = getHVQSIPath($vm->VMID);
+                $vmqsi = "chroot\\$hvPath\\jobs\\$j->jobID\\$vm->VMID";
+        }else{
+		$rezzy = agentRunPreship($ip,"deletesnap.cmd");
+		gen_log(LOG_DEBUG, "Invoked deletesnap cleanup cmd with res $rezzy");
+	}
+        $localPath = "$as/jobs/$j->jobID/$vm->VMID";
+        exec("mkdir -p $localPath");	// this is completely unnecessary
+
+        $remoteFiles = agentListFiles($ip, $vmqsi);
+        foreach($remoteFiles as $f){
+                $local = "$localPath/$f";
+                $remote = "$vmqsi/$f";
+		$st = time();
+                $res = agentDownloadFile($ip, $remote, $local);
+		$sz  = bytesToString(filesize($local));
+		$ttime = time() - $st;
+		gen_log(LOG_DEBUG, "Downloaded file from agent: $f ($sz, $ttime sec) to path $local");
+        }
+	$myLogDirPlace = "$as/logs/$vm->VMID";
+	//gen_log(LOG_DEBUG, "Hey everyone. myLogDirPlace is $myLogDirPlace");
+	myCheckAndMakeDirReal("/home/alike/Alike/agentShare/logs");
+	myCheckAndMakeDirReal($myLogDirPlace);
+	gen_log(LOG_DEBUG, "Copying log files from $localPath to $myLogDirPlace");
+	$cmd = "cp $localPath/*.log $myLogDirPlace";
+	exec($cmd);
+
+	agentDeleteFolder($ip, "jobs\\$j->jobID\\$vm->VMID");
+        addJobLog("Post wrapup the QSI folder for $vm->name ($vmqsi -> $localPath)", 4, $j->jobID, $vm->VMID);
+}
+
+
+function checkAgentStatus($ip){
+	echo "Getting Agent status on $ip\n";
+	$st = agentStatus($ip);
+        if(empty($st)){
+                throw new Exception("Failed to connect to remote agent ($ip)");
+        }
+
+	echo "Status: $st->version\n";
+	if(strpos($st->version, "Status") !== false){
+		throw new Exception("Failed to connect to remote Agent!");
+	}
+	$vers = explode(" ",$st->version)[0];
+	gen_log(LOG_INFO, "Connected successfully to Agent [$vers] on $ip");
+	return $st;
+}
+
+function doVisorBackup($vm, $j, &$vmMeta, $snapTime){
+	if($j->type ==5){
+		gen_log(LOG_INFO, "Acquiring state data for: $vm->name");
+	}else{
+		gen_log(LOG_INFO, "Running Hypervisor backup of: $vm->name");
+	}
+	if($vm->type == 10){ return doAgentBackup($vm, $j); }	// avoid physical backups
+
+	if($vm->type ==2){
+		doVisorBackupXen($vm, $j, $vmMeta, $snapTime);
+	}else if($vm->type ==3){
+		doVisorBackupHV($vm, $j, $vmMeta, $snapTime);
+	}
+}
+
+function doVisorBackupXen($vm, $j, &$vmMeta, $snapTime){
+	// check for CBT support if enabled?
+	$abdID=0;
+	$snapExists=false;
+	try{
+		$vmDisks = getDisksXen($vm->uuid, false);
+		$numDisks = count($vmDisks);
+		if($numDisks == 0){ throw new Exception("Found 0 Disks to protect!"); }
+		$bs = getSetting("blockSize");
+		$kbFreePerDisk = checkMemRequired($bs);
+
+
+		$abdID = assignABDbyPool($vm->poolID, $vm->VMID);
+		gen_log(LOG_DEBUG, "Assigned ABD $abdID");
+		echo "Got ABD: $abdID\n";
+		$abd= getABDsFromDB($abdID);
+
+		checkAndMoveABD($abd->uuid, $vm->uuid);
+		validateABD($abd);
+                try{
+                        prepAbdForJob($abd->ip);
+                }catch(Exception $ex){
+                        deleteVmXen($abd->uuid, true);
+			$id = $abd->ID;
+			$abd = null;
+                        forgetABD($id);
+                        gen_log(LOG_DEBUG, "ABD Error: ". $ex->getMessage());
+                        throw new Exception("ABD $id had errors.  Cleaned and removed for good measure.");
+                }
+		$mem = getVmMemory($abd->uuid);
+		$mb = $mem / 1048576;
+		gen_log(LOG_DEBUG, "ABD Memory: $mb MB, $numDisks disks to protect" );
+
+
+		$disks= snapshotVmXen($vm, $abd, $j, $snapTime);	// handles drive exclusion
+		$snapExists=$disks->snapUuid;
+
+		$vmMeta->VBDS = array();
+
+		$i=0;
+		
+		sleep(2);
+
+		// to munge disks concurrently, we use the same locking system that jobRunner uses
+		// get a lock file, and the children will decrement the value.  when its 0, then we're done
+		$fl = getJobLockFile($j->jobID."-".$vm->VMID."_lck");
+                exec("echo 0 > $fl");
+                $fp = fopen($fl, "r+");
+		$pids = array();
+
+		$start = time();
+		foreach($disks->disksToMunge as $d){
+			$tries = 5;
+			// sometimes disks are slow to show up on the ABDs.  Give it a little bit and try again
+			while(!checkDeviceExists($abd->ip, $d->device)){ 
+				gen_log(LOG_WARNING,"Device $d->device (disk $i) not present on ABD.  Retrying.");
+				if($tries ==0){ throw new Exception("ABD missing snapshot data for disk $i ($d->device)"); }
+				sleep(5);
+				$tries--;	
+			}
+
+			$freeMem = getFreeKb($abd->ip);
+			gen_log(LOG_DEBUG,"Checking for sufficient memory on ABD (have: $freeMem, need: $kbFreePerDisk KB) for Disk $i using BS $bs KB");
+			$waiting = false;
+			while($freeMem < $kbFreePerDisk){
+				$missing = $kbFreePerDisk - $freeMem;
+				if($waiting == false){
+					gen_log(LOG_WARNING,"Low ABD memory is causing disks to be processed single-file. Consider increasing your ABD ram to improve backup performance.");
+					gen_log(LOG_INFO,"Waiting for $missing KB memory to be available on ABD to munge disk $i (have: $freeMem KB, need: $kbFreePerDisk KB)");
+					$waiting=true;
+				}
+				sleep(1);
+				$freeMem = getFreeKb($abd->ip);
+			}
+			gen_log(LOG_DEBUG,"$freeMem KB Memory available on ABD for disk $i, proceeding.");
+
+			incrementLocked($fp,$fl);
+			$pid = pcntl_fork();
+			if($pid ==0) { mungeDiskXen($abd, $d, $j, $vm, $i, $bs); }	// this guy exits when complete
+			array_push($pids, $pid);
+
+			// add some junk so our meta.blob is happy
+			$d->userdevice -=1; 	// we slide all of our devices down by 1 to compensate for the ABDs boot disk
+			$d->bootable =1;
+			$d->uuid =$d->vdi_uuid;
+			$d->name =$d->name_label;
+			$d->description ="";
+			array_push($vmMeta->VBDS, $d);
+			$i++;
+			sleep(3);	// just to help the drives display in the right order
+		}
+		$nv = readLocked($fp,$fl);
+		gen_log(LOG_DEBUG,"Num processors: $nv");
+
+                while($nv > 0){
+                        sleep(1);
+                        $nv = readLocked($fp,$fl);
+                        if(checkForCancel($j->jobID) ){
+				gen_log(LOG_WARNING,"Detected cancel request for job.  Issuing stop to workers");
+				sleep(2);
+				putAwayWet($abd);
+				break;
+                        }
+                }
+
+		foreach($pids as $p){  pcntl_waitpid($p,$status, WNOHANG); }	// un-zombify our children
+
+		$totalTime = time() - $start;
+		$jobTimeFile = "/tmp/job_ctl/". $j->jobID .".proctime";
+		incrementFileLocked($jobTimeFile, $totalTime);
+
+		gen_log(LOG_DEBUG,"Completed locked loop. Processing time: $totalTime seconds");
+		$cmd = "\"mkdir -p /mnt/ADS/logs/$vm->VMID/\"";
+		runAbdCmd($abd->ip, $cmd);
+		$cmd = "\"mv /tmp/logs/* /mnt/ADS/logs/$vm->VMID/\"";
+		runAbdCmd($abd->ip, $cmd);
+
+		// do this after we cleanup the snapshots
+		$i=0;
+		foreach($disks->disksToMunge as $d){
+			gen_log(LOG_DEBUG, "Unplugging & destroying temp ABD VBD: $d->vbd_uuid");
+			unplugVBD($d->vbd_uuid);                // clean while we work
+			deleteVBD($d->vbd_uuid);
+		}
+		if(!empty($disks->extraVdis)){
+			gen_log(LOG_DEBUG, "Removing ".count($disks->extraVdis) ." temp GFS2 VDIs");
+			foreach($disks->extraVdis as $d){
+				$res = deleteVDI($d);
+				gen_log(LOG_DEBUG, "Cleaned temp GFS2 vdi: $d (res: $res)");
+			}
+		}
+
+		if($disks->isCBT == false){
+			deleteSnapshotXen($disks->snapUuid, true);	// kill the snapshot abd its vbd/vdis
+			$snapExists=false;
+			gen_log(LOG_DEBUG, "Removed all snapshot data");
+		}
+
+		// skip all this if we cancelled
+		if(checkForCancel($j->jobID) ){ return; }
+
+		foreach($disks->disksToMunge as $d){
+			gen_log(LOG_DEBUG,"Checking results for disk $i [$d->device]");
+			checkAbdResults($abd->ip, $i );
+			$i++;
+		}
+
+		if($disks->isCBT){ rotateCbtSnapshots($disks, $vm); }
+	}catch(Exception $ex){
+		gen_log(LOG_DEBUG,"Caught exception, will re-throw:". $ex->getMessage() );
+		// if this exception happened before snap cleanup, do so now
+		if($snapExists){
+			gen_log(LOG_DEBUG,"Cleaning up orphaned snapshot ($snapExists)");
+			deleteSnapshotXen($snapExists, true);	// kill the snapshot abd its vbd/vdis
+		}
+
+		throw new Exception($ex->getMessage());
+	}finally{
+                if(isset($abd) && $abd != null){  
+                        try{
+                                detachDisksFromABD($abd->uuid);
+                        }finally{
+                                unassignABD($abdID);    // method don't care if id==0
+                        }
+                }
+        }
+}
+
+// This is in a "thread", so exceptions, etc don't propagte
+function mungeDiskXen($abd, $d, $j, $vm, $i, $bs){
+	$marker = "/tmp/job_ctl/$j->jobID.$vm->VMID.$i";
+	touch($marker);
+	gen_log(LOG_DEBUG, "Munging ($bs KB) $d->device (Disk $i, $d->name_label) $abd->ip ". $d->vbd_uuid ." Type: $d->type");
+	$pid = pcntl_fork();
+	if($pid ==0) {
+		$msg = "Processing Disk $i [".bytesToString($d->size)."]";
+		if($d->type ==2){ $msg = "Processing VM Memory State [".bytesToString($d->size)."]"; }
+		showTaskProgress($abd->ip, $j->jobID, $vm->VMID,1, $i, $msg, $d->size );
+		exit(0);
+	}
+	try{
+		doABDMunge($abd->ip, $j->jobID, $vm->VMID, $bs, $d->device, $i);
+		pcntl_waitpid($pid, $status, WNOHANG);
+	}catch(Exception $ex){
+		gen_log(LOG_ERR_NOFAIL, "Error processing Disk $i: ". $ex->getMessage());
+	}finally{
+		unlink($marker);
+		if(posix_getpgid($pid)){
+			sleep(3);
+			posix_kill($pid,0);
+		}
+		gen_log(LOG_DEBUG, "Progress pid $pid should now be done.");
+
+		$fl = getJobLockFile($j->jobID."-".$vm->VMID."_lck");
+		if(file_exists($fl)){
+			$fp = fopen($fl, "r+") or die("Couldnt open lock file");
+			decrementLocked($fp, $fl);
+			fclose($fp);
+		}
+	}
+	exit(0);	// we are called as a child pid so exit
+}
+
+function snapshotVmXen($vm, $abd, $j, $snapTime){
+	// make sure our ABD is not junked up
+	$abdDisks = getDisksXen($abd->uuid, false);
+	if(count($abdDisks) != 1){
+		throw new Exception("ABD $abd->ID has an unexpected number of disks: ".count($abdDisks).".  This is usually a temporary error, please try again.");
+	}
+	if(array_key_exists("doCBT",$j->Options) && $j->Options["doCBT"] == 1){
+		return snapshotVmCbtXen($vm, $abd, $j, $snapTime);
+	}else if(array_key_exists("snapshotType",$j->Options) && $j->Options["snapshotType"] == 2){
+		return snapshotVmWithMemoryXen($vm, $abd, $j, $snapTime);
+	}
+	return snapshotVmStdXen($vm, $abd, $j, $snapTime);
+}
+
+function snapshotVmCbtXen($vm, $abd, $j, $snapTime){
+	$out = new stdClass();
+	$out->oldCbtSnap = null;
+
+	// check if we are a baseline or there's a previous version
+	$base = "/home/alike/Alike/agentShare";
+	$cbtGo = "$base/jobs/$j->jobID/$vm->VMID/cbt.HCV";
+	$cache = "/home/alike/Alike/remoteDBs/cbtCache";
+	if(!is_dir($cache)){ exec("mkdir $cache"); }
+
+	if(!file_exists($cbtGo)){
+		gen_log(LOG_WARNING, "CBT baseline will be established. (No CBT (HCV) found)");
+	}else{
+		// get our last snap's name from our cache (vetted by preJob)
+		$hcvFile = "$cache/".$vm->VMID.".HCV";
+		$prevSnapName = trim(file_get_contents($hcvFile));
+		// find our previous version, if it exists
+		$res =trim(xen_call("snapshot-list name-label=$prevSnapName"));
+		$inf = json_decode(parse_xen_result($res), true);
+		if(empty($inf)){
+			gen_log(LOG_INFO, "No previous CBT snapshot found.  This will be a full baseline backup");
+		}else{
+			$sn = $inf[0];
+			$out->oldCbtSnap = $sn["uuid"];
+		}
+	}
+	if ($out->oldCbtSnap == null){
+		$prefix =  "AlikeCBT_". $vm->VMID . "_";
+		gen_log(LOG_DEBUG, "We're a baseline, so let's scrub any old cbt snapshots ($prefix)");
+		findAndScrubCbts($vm->uuid, $prefix);
+	}
+	// after backup, data_destroy current snap VDIs, detach from snapshot (dumb xen) and add vdi to snap xenstore-data
+	$installID = getInstallID();
+	$out->cbtSnapName =  "AlikeCBT_". $vm->VMID . "_". $snapTime;
+	$out->isCBT = true;
+
+	$workDir = "/home/alike/Alike/agentShare/jobs/$j->jobID/$vm->VMID";	// <-- this should exist
+
+	// toggleCBT enable_cbt for each VDI 
+	$vmDisks = getDisksXen($vm->uuid, false);
+	foreach($vmDisks as $d){ 
+		$has = trim(xen_call("vdi-param-get param-name=cbt-enabled uuid=$d->vdi_uuid")); 
+		gen_log(LOG_DEBUG, "Xen says cbt-enabled status on vdi $d->vdi_uuid is $has");
+		if($has != "true"){
+			$res = trim(xen_call("vdi-enable-cbt uuid=$d->vdi_uuid")); 
+			gen_log(LOG_DEBUG, "Enabling CBT on VDI $d->vdi_uuid (res: $res)");
+		}else{
+			gen_log(LOG_DEBUG, "CBT enabled on vdi $d->vdi_uuid");
+		}
+	}
+
+	// take new snapshot
+	gen_log(LOG_DEBUG, "Performing a CBT snapshot");
+	$out->snapUuid = takeSnapshotXen($vm->uuid, $out->cbtSnapName);     	// take snap of ABD w/ disks
+	$snapDisks = getDisksXen($out->snapUuid,false, true);                	// find the new snap disks
+	// we need to calculate CBT before attaching the VDIs to the ABD (thanks Xen)
+
+        $doGFS = false; // we need to detect GFS SRs here
+        if(empty($snapDisks)){
+                throw new Exception("No disks found to protect!");
+        }else{
+                foreach($snapDisks as $d){
+                        if(isSrGfs($d->vdi_uuid) == true){
+                                gen_log(LOG_INFO, "Detected GFS2 SR.  Using compatibility options for snapshot.");
+                                $doGFS=true;
+                                break;
+                        }
+                }
+                if($doGFS == false){
+                        gen_log(LOG_DEBUG, "No GFS SR found.  Using standard snapshot approach");
+                }
+        }
+	
+	if ($out->oldCbtSnap != null){
+		gen_log(LOG_INFO, "Found previous CBT snapshot ($out->oldCbtSnap) [$prevSnapName].");
+		$oldVdis = getCbtSnapVdis($out->oldCbtSnap);		// array of previous snap's VDIs
+
+		// check the snap's xenstore-data for a vdi list
+gen_log(LOG_DEBUG, "Last Snap vdis (from meta): ". print_r($oldVdis, true));
+		$bs = getSetting("blockSize");
+		$i=0;
+		foreach($oldVdis as $oldDisk){
+			$hasCbt = trim(xen_call("vdi-param-get param-name=cbt-enabled uuid=$oldDisk")); 
+			if($hasCbt != "true"){
+				gen_log(LOG_INFO, "Xen did not enable CBT on previous backup for disk $i.  Recreating now."); 
+			}else{
+				try{
+					$file = "$workDir/$i.xcl";
+					generateCbtForVdi($snapDisks[$i], $oldDisk, $file, $bs);
+				}catch(Exception $ex){  
+					$msg = "Error calculating CBT: ". $ex->getMessage();
+					$badVdi = "SR_BACKEND_FAILURE_44";
+					if(strpos($msg, $badVdi) !== false){
+						$msg = "Xen required a CBT re-baseline (SR_BACKEND_FAILURE_44) for this disk.";
+						gen_log(LOG_INFO, $msg ); 
+					}else if(strpos($msg, "SR_BACKEND_FAILURE_460") !== false){
+						$msg = "Xen requires a CBT re-baseline (SR_BACKEND_FAILURE_460) for this disk.";
+						gen_log(LOG_INFO, $msg ); 
+					}else{
+						gen_log(LOG_WARNING, $msg ); 
+					}
+				}
+			}
+			$i++;
+		}
+	}
+	gen_log(LOG_DEBUG, "Finished calculating changed data.");
+
+        $disks->extraVdis = attachDisksToVmXen($abd->uuid, $snapDisks, true, $doGFS);  		// attach snap disks to ABD
+        gen_log(LOG_DEBUG, "Attached ". count($snapDisks) ." snap disks to ABD for processing:". print_r($snapDisks, true));
+        $out->disksToMunge = getDisksXen($abd->uuid, true);
+        for($i=0; $i < count($out->disksToMunge); $i++){
+                if($out->disksToMunge[$i]->userdevice ==0){
+                        unset($out->disksToMunge[$i]);				// remove the ABD sys drive from the munge list
+                }
+        }
+	return $out;
+}
+
+// we directly snap the VM (checkpoint)
+function snapshotVmWithMemoryXen($vm, $abd, $j, $snapTime){
+	gen_log(LOG_INFO, "Performing a Disk and Memory snapshot");
+	$out = new stdClass();
+	$out->isCBT = false;
+	$out->disksToMunge = array();
+	if(getVmPowerStateXen($vm->uuid) != "running"){
+		gen_log(LOG_WARNING, "Cannot perform disk and memory backup on a VM that is not running.  Reverting to standard snapshot.");
+		return snapshotVmStdXen($vm, $abd, $j);
+	}
+	$vmDisks = getDisksXen($vm->uuid,false, false);                // find the snap disks
+        if(empty($vmDisks)){
+                throw new Exception("No disks found to protect!");
+        }else{
+                foreach($vmDisks as $d){
+                        if(isSrGfs($d->vdi_uuid) == true){
+				gen_log(LOG_WARNING, "Found VDI on GFS2 SR");
+				throw new Exception("Disk & Memory backup not supported on GFS2 SRs at this time."); 
+                        }
+                }
+        }
+
+	$snapName = "Alike_".$j->jobID."_".$vm->VMID."_".time();
+	$out->snapUuid = takeCheckpointXen($vm->uuid, $snapName);     // take snap of ABD w/ disks
+	gen_log(LOG_DEBUG, "Snapshot successful ($out->snapUuid)");
+	$snapDisks = getDisksXen($out->snapUuid,false, true);                // find the snap disks
+
+	$out->extraVdis = attachDisksToVmXen($abd->uuid, $snapDisks, true);  // attach snap disks to ABD
+
+	$memVdi = trim(xen_call("vm-param-get param-name=suspend-VDI-uuid uuid=\"$out->snapUuid\"")) ;
+	$memSize = trim(xen_call("vdi-param-get param-name=virtual-size uuid=\"$memVdi\"")) ;
+gen_log(LOG_DEBUG, "memory vdi:$memVdi, size: $memSize ");
+	attachDiskToVmXen($abd->uuid,$memVdi, true, 10);
+	
+	gen_log(LOG_DEBUG, "Attached ". count($snapDisks) ." snap disks to ABD for processing:". print_r($snapDisks, true));
+	$out->disksToMunge = getDisksXen($abd->uuid, true);
+	for($i=0; $i < count($out->disksToMunge); $i++){
+		if($out->disksToMunge[$i]->userdevice ==0){ 
+			unset($out->disksToMunge[$i]);
+			continue;
+		}
+		if($out->disksToMunge[$i]->vdi_uuid == $memVdi){
+			$out->disksToMunge[$i]->type =2;
+		}
+	}
+	foreach($out->disksToMunge as $d){
+		if($d->vdi_uuid == $memVdi){
+			$d->type = 2;
+			$d->devicetype = 2;
+gen_log(LOG_DEBUG, "FOUND MEM VDI", print_r($d, true));
+		}
+	}
+//print_r($out->disksToMunge);
+	gen_log(LOG_DEBUG, "Disks to munge:  ". count($out->disksToMunge) .":". print_r($out->disksToMunge, true));
+
+	return $out;
+}
+function snapshotVmStdXen($vm, $abd, $j){
+	$out = new stdClass();
+	$out->isCBT = false;
+	gen_log(LOG_DEBUG, "Performing a Regular snapshot");
+
+	$targDisks = getDisksXen($vm->uuid, false);
+	if(empty($targDisks)){ throw new Exception("No disks found to protect!"); }
+
+	$num = print_r($targDisks, true);
+	gen_log(LOG_DEBUG, "Getting disks from target  -> $num");
+
+	//  if drive exclusion- remove from this array!
+	$driveExclude = getDriveExcludes($vm, $j);
+        if(!empty($driveExclude)){
+                $newTarg = array();
+                for($i=0;$i <count($targDisks); $i++){
+                        if(!in_array($i, $driveExclude)){
+                                gen_log(LOG_DEBUG, "Excluding disk $i  [ ". $targDisks[$i]->name_label ." ]");
+                        }else{
+                                array_push($newTarg, $targDisks[$i]);
+                                gen_log(LOG_DEBUG, "Includng disk $i  [ ". $targDisks[$i]->name_label ." ]");
+                        }
+                }
+                $targDisks = $newTarg;
+        }
+
+	$doGFS = false;	// we need to detect GFS SRs here
+
+	if(empty($targDisks)){
+		throw new Exception("No disks found to protect!");
+	}else{
+		foreach($targDisks as $d){
+			if(isSrGfs($d->vdi_uuid) == true){ 
+				gen_log(LOG_INFO, "Detected GFS2 SR.  Using compatibility options for snapshot.");
+				$doGFS=true;
+				break;
+			}
+		}
+		if($doGFS == false){
+			gen_log(LOG_DEBUG, "No GFS SR found.  Using standard snapshot approach");
+		}
+	}
+
+	$tmpUuid =makeBlankVmXen($vm->name."_".$j->jobID."_snap");
+	hideVmXen($tmpUuid);
+	$out->extraVdis = array();
+	try{
+		gen_log(LOG_DEBUG, "Attaching disks to shadow VM ($tmpUuid)");
+		$res = attachDisksToVmXen($tmpUuid, $targDisks, true);        // pin the actual disks to the ABD
+		$snapName = "Alike_".$j->jobID."_".$vm->VMID."_".time();
+		$vmsg = "Taking hypervisor snapshot";
+		$veid = addJobLog($vmsg." [In progress]",3, $j->jobID, $vm->VMID);
+		$out->snapUuid = takeSnapshotXen($tmpUuid, $snapName);     // take snap of ABD w/ disks
+		updateJobLog("$vmsg [Complete]",0, $veid);	// always update the top line job entry 
+		gen_log(LOG_DEBUG, "Took snapshot $snapName, $out->snapUuid ");
+		detachDisksFromVmXen($tmpUuid);                 // gently remove the pointers to the original disks on the shadow vm
+gen_log(LOG_DEBUG, "Removed original disks from shadow VM ");
+		$snapDisks = getDisksXen($out->snapUuid,false, true);                // find the snap disks
+		$out->extraVdis = attachDisksToVmXen($abd->uuid, $snapDisks, true, $doGFS);  // attach snap disks to ABD
+
+		gen_log(LOG_DEBUG, "Attached ". count($snapDisks) ." snap disks to ABD for processing:". print_r($snapDisks, true));
+	}finally{
+		deleteVmXen($tmpUuid);
+		gen_log(LOG_DEBUG, "Deleted shadow VM ($tmpUuid)");
+	}
+	
+	$out->disksToMunge = getDisksXen($abd->uuid, true);
+	for($i=0; $i < count($out->disksToMunge); $i++){
+		if($out->disksToMunge[$i]->userdevice ==0){ 
+			unset($out->disksToMunge[$i]);
+		}
+	}
+	gen_log(LOG_DEBUG, "Disks to munge:  ". count($out->disksToMunge) .":". print_r($out->disksToMunge, true));
+
+	return $out;
+}
+function getDriveExcludes($vm, $j){
+	$out = array();
+	if(array_key_exists("vmVolume",$j->Options)){
+		foreach($j->Options["vmVolume"] as $vk){
+			$bits = explode("|", $vk);
+			if($bits[0] == $vm->VMID){
+				array_push($out, $bits[1]);	
+			}
+		}
+	}
+	return $out;
+}
+
+function doABDMunge($ip, $jobID, $vmID, $bs, $deviceStr, $diskNum ){
+
+        $args = "-q -m -k $bs -H 6 -w 6 -c -j $jobID -v $vmID -D $diskNum -x -d $deviceStr -p /mnt/ADS/";      // -P paranoid
+
+        $cmd = "/usr/bin/munger $args";
+        gen_log(LOG_DEBUG, "Munging $deviceStr: $cmd");
+
+	$res = runAbdCmd($ip, $cmd);
+        gen_log(LOG_DEBUG, "Munge output: $res");
+
+	sleep(2);
+	
+	try{
+		checkAbdResults($ip, $diskNum );
+	}catch(Exception $ex){
+		if(checkForCancel($jobID)){ return; }
+
+		$str = $ex->getMessage();
+		if(strpos($str, "In Process")  !== false){
+			gen_log(LOG_DEBUG, "Disk $diskNum process returned prematurely, but is still running. " );
+		}else{
+			gen_log(LOG_WARNING, "Disk $diskNum reported a potential issue: $str" );
+		}
+	}
+
+}
+
+function doVisorBackupHV($vm, $j, &$vmMeta, $snapTime){
+	$ip = $vm->hostName;	// the host IP for the agent.  Has been vetted already by checkEnv()
+
+	gen_log(LOG_DEBUG, "Prepping Agent for job");
+	prepAgentForVM($ip, $vm, $j, true);
+
+	// watch out for CBT
+
+	// 2. take snapshot (checkpoint)
+	$snapName = "Alike_".$j->jobID."_".$snapTime;
+	gen_log(LOG_INFO, "Creating checkpoint of VM (name: $snapName)");
+	snapshotVmHV($ip, $vm->uuid, $snapName);
+	$vhds = getSnapshotVhdsHV($ip, $vm->uuid, $snapName);
+
+	if(count($vhds) == 0){ throw new Exception("Found 0 VHDs to protect!"); }
+
+	$isCBT = generateCBTforHV($ip, $snapName, $vhds, $vm, $j);	//-> loop over disks run QSCBT.exe remotely
+
+	// 4. puke numDisks & meta to job folder
+	$msg =  "Got ". count($vhds)." VHDs to process.";
+	gen_log(LOG_INFO, "$msg");
+
+	// 5. loop over vhds and munge
+	$bs = getSetting("blockSize");
+	$diskNum =0;
+	$start = time();
+	foreach($vhds as $v){
+		$pid = pcntl_fork();
+		$marker = "/tmp/job_ctl/$j->jobID.$vm->VMID.$diskNum";
+		touch($marker);
+		if($pid ==0) {
+			$msg = "Processing Disk $diskNum [".bytesToString($vmMeta->VBDS[$diskNum]->size)."]";
+			showTaskProgress($ip, $j->jobID, $vm->VMID,0, $diskNum, $msg, $vmMeta->VBDS[$diskNum]->size );
+			exit(0);
+		}
+		try{
+			doAgentMungeVHD($ip, $j->jobID, $vm->VMID, $bs, $v, $diskNum );	// this will throw on any problem.
+			pcntl_waitpid($pid, $status, WNOHANG);
+		}finally{
+			unlink($marker);
+			if(posix_getpgid($pid)){ 
+				sleep(3);
+				gen_log(LOG_DEBUG, "Killing progress pid: $pid");
+				posix_kill($pid,0);
+			}
+			gen_log(LOG_DEBUG, "Progress pid $pid should now be done.");
+		}
+		$diskNum++;
+
+	}
+
+	$totalTime = time() - $start;
+	$jobTimeFile = "/tmp/job_ctl/". $j->jobID .".proctime";
+	incrementFileLocked($jobTimeFile, $totalTime);
+
+	// 6. delete snapshot
+	gen_log(LOG_INFO, "Removing checkpoint ($snapName)");
+	if($isCBT == false){
+		$res = deleteSnapshotHV($ip, $vm->uuid, $snapName);
+	}else{
+		try{
+			gen_log(LOG_DEBUG, "Doing CBT shuffle");
+			$cache = "/home/alike/Alike/remoteDBs/cbtCache";
+			$hcvFile = "$cache/".$vm->VMID.".HCV";
+			$prev = file_get_contents($hcvFile);
+			file_put_contents($hcvFile, $snapName);
+			if(!empty($prev)){
+				$res = deleteSnapshotHV($ip, $vm->uuid, $prev);
+			}
+		}catch(Exception $ex){
+			gen_log(LOG_WARNING, "Error cleaning old snapshot: $prev". $ex->getMessage() );
+		}
+	}
+
+	// 7. write marker file for backup
+	postAgentBackup($ip, $vm, $j);
+}
+
+function generateCBTforHV($ip, $snapName, $vhds, $vm, $j){
+	if(!array_key_exists("doCBT",$j->Options) || $j->Options["doCBT"] != 1){
+		return false;	// no CBT
+	}
+	$base = "/home/alike/Alike/agentShare";
+	$cbtGo = "$base/jobs/$j->jobID/$vm->VMID/cbt.HCV";
+	if(!file_exists($cbtGo)){
+		gen_log(LOG_WARNING, "CBT baseline will be established. (No CBT (HCV) found)");
+		// this allows the CBT baseline to be made, but won't allow skips for this run
+		return true;
+	}
+
+	$cache = "/home/alike/Alike/remoteDBs/cbtCache";
+	if(!is_dir($cache)){ exec("mkdir $cache"); }
+	$hcvFile = "$cache/".$vm->VMID.".HCV";
+	if(!file_exists($hcvFile)){ 
+		file_put_contents($hcvFile, $snapName);		// this is our first run (baseline)
+		return true; 
+	}
+	$prevSnapName = trim(file_get_contents($hcvFile));
+	$prevVhds = getSnapshotVhdsHV($ip, $vm->uuid, $prevSnapName);
+	if(empty($prevVhds)){
+		gen_log(LOG_WARNING, "Could not find expected previous CBT checkpoint: $prevSnapName. Re-generating baseline.");
+		return true;
+	}
+	$bs = getSetting("blockSize");
+	$i=0;
+	foreach($vhds as $v){
+		if(!isset($prevVhds[$i])){ continue; }
+		$cmd = "QSCBT.exe -b $bs -e -o \"chroot\\jobs\\$j->jobID\\$vm->VMID\\$i".".xcl\"";
+		$cmd .= " -X \"$v\" \"".$prevVhds[$i] ."\"";
+gen_log(LOG_DEBUG, "Running $cmd");
+		agentRunCmd($ip, $cmd);
+	}
+	return true;
+}
+
+function isVMinJob($vm, $j){
+	foreach($j->vmsInJob as $guy){
+		if($vm->uuid == $guy->UUID){ return true; }
+	}
+	return false;
+}
+
+// this is for when there's no db entry for the VM's ip... should we even bother?
+function detectIPforVM($vm){
+	if($vm->type ==2){
+		return getIPforVmXen($vm->uuid);
+	}else{
+		return getIPforVmHv($vm->uuid);
+	}
+}
+
+function getVMMeta($vm){
+	$meta = getVMMetaTemplate($vm->uuid, $vm->name);
+
+	if($vm->type ==3){
+		getHVSpecificMeta($vm, $vm->uuid, $meta);
+	}else if($vm->type ==2){
+		if(!vmExistsXen($vm->uuid)){
+			throw new Exception("Could not find VM $vm->name (guid: $vm->uuid) in pool!");
+		}
+		getXenSpecificMeta($vm, $vm->uuid, $meta);
+	}else{
+		getPhysSpecificMeta($vm, $vm->uuid, $meta);
+	}
+	return $meta;
+}
+
+
+// handles the progress stuff for a munge
+function showTaskProgress($ip, $jobID, $vmID,$type, $devNum, $vmsg, $size=0){
+
+	$veid = addJobLog($vmsg.", In progress",3, $jobID, $vmID);
+
+	$file = "jobs\\\\$jobID\\\\$vmID\\\\job.$jobID.$devNum";
+	// 0 = QHB, 1 = ABD
+	if($type==1){ 
+		$file = "/tmp/job.$jobID.$devNum"; 
+		initProgress($ip, $file);
+	}
+        // now we loop on that task progress and poop it to the joblog
+
+	$doneFile = "/tmp/job_ctl/$jobID.$vmID.$devNum";
+	$errCount=0;
+	$maxErrors=20;
+        while (true){
+                sleep(2);
+		$prog = "init";
+		if(!file_exists($doneFile)){ 
+			updateJobLog($vmsg.": 100%",0, $veid);
+			exit(); 
+		}
+
+		if($type ==1){
+			$prog = trim(runAbdCmd($ip, "cat $file"));
+		}else{
+			$prog = round(trim(agentFileGetContents($ip, $file)),2);
+		}
+		if(empty($prog)){
+			if(checkForCancel($jobID)){	// Cancels can cause it to look like an error.  avoid this
+				updateJobLog($vmsg." (cancelled): $prog%",2, $veid);
+				return false;
+			}
+			$errCount++;
+gen_log(LOG_DEBUG, "progress thread for disk $devNum got blank progress (seq errors: $errCount/$maxErrors)");
+			if($errCount >= $maxErrors){ 
+				updateJobLog($vmsg.": -- Error getting progress ",2, $veid);
+				return;
+			}
+			usleep(3572441);
+			$prog=0;
+		}else{
+			$errCount=0;	// reset so only maxErrors in a row kills us
+		}
+//echo "Disk $devNum Prog: $prog\r";
+                $state = 3;
+                if($prog == 100){ $state = 0; }
+                updateJobLog($vmsg.": $prog%",$state, $veid);
+
+		updateProgTmpFile($jobID, $vmID, $devNum, $prog, $size);
+
+                if($prog >= 100){ break; }
+                if(checkForCancel($jobID)){
+                	// cancel stuff
+                        updateJobLog($vmsg." (cancelled): $prog%",2, $veid);
+                        return false;
+                }
+        }
+gen_log(LOG_DEBUG, "progress thread $devNum complete!");
+}
+
+
+function commitBackup($j, $vm, $timer ){
+	$path = "/home/alike/Alike/agentShare/jobs/$j->jobID/$vm->VMID/*.HCA";
+        exec("rm -f $path");
+
+	$res = doCommitBackup($j,$vm->VMID, $timer);
+	if($res){
+		//addJobLog("Backup complete",0, $j->jobID, $vm->VMID);
+                return true;
+	}else{
+		addJobLog("Backup failed to commit to datastore",1, $j->jobID, $vm->VMID);
+                return false;
+	}
+}
+
+function doCommitBackup($j, $vmid, $timer){
+        $cmd = array();
+        $cmd["command"] = "commit";
+        $line = "/home/alike/Alike/agentShare/jobs/$j->jobID/$vmid";
+        $cmd["source"] = $line;
+        $cmd["site"] = "0";
+
+        $msg = "Globally deduplicating and committing to datastore. ";
+        $eid = addJobLog($msg, 3, $j->jobID, $vmid, 17100222);
+
+        try{
+                $barf = issueJavaCmd($cmd, $j->jobID, $vmid, $eid);
+                $msg = "$msg}<}100";
+                updateJobLog($msg, 0, $eid);
+		gen_log(LOG_DEBUG, "Beginning purge/retention procssing");
+                doPurge($j->jobID, $vmid, $j->scheduleID);
+
+                sleep(2);
+                $sql = "UPDATE vm_version set processingTime=? where vmid=? and jobid=?";
+                dbSet("nimbus",$sql, array($timer, $vmid, $j->jobID));
+
+                $ver = getVersionFromJob($vmid, $j->jobID);
+                if($ver >0){
+			$sql = "UPDATE job_vms set vm_version = ? where jobID=? and VMID=?";
+			dbSet("nimbus", $sql, array($ver, $j->jobID, $vmid));
+                }
+
+                updateJobStats($j->jobID);
+                return true;
+        }catch(Exception $ex){
+		$msg = $ex->getMessage();
+		$bad = "contains illegal character for hexBinary";
+		if(strpos($msg, $bad) !== false){
+			$msg = "Backup data failed network integrity check. (Checksum mismatch post transit)";
+		}
+                updateJobLogStatus(1, $eid);
+                $msg = "Failed to process backup data: $msg";
+                addJobLog($msg, 1, $j->jobID, $vmid);
+                return false;
+        }
+}
+function doPurge($jobid, $vmid, $schedID, $siteID=0){
+        $fn = "/tmp/wal-lockergfs.db";
+        $fn2 = "/tmp/wal-lockernimbusdb.db";
+	$gfsLock = null;
+	$ndbLock = null;
+        try {
+		$gfsLock = qflock($fn, 60);
+		$ndbLock = qflock($fn2, 60);
+                $bks = "/home/alike/Alike/BackupScheduler.exe";
+                $cmd = "/usr/local/bin/wine $bks -p $jobid $vmid $schedID $siteID";
+                $res=-1;
+                $out = array();
+                exec($cmd,$out,$res);
+                $purgy = trim(implode($out));
+		gen_log(LOG_DEBUG, "BKS returned $purgy (code $res)");
+                // Be sure to unlock immediately to prevent carnage
+		qunflock($gfsLock);
+		$gfsLock=null;
+		qunflock($ndbLock);
+		$ndbLock=null;
+                if($res !=0){
+                        addJobLog($purgy, 1, $jobid, $vmid);
+                }else{
+                        $msg = $purgy;
+                        if($msg == ""){ $msg = "No backups require purging"; }
+                        addJobLog($msg, 0, $jobid, $vmid);
+                        syncDBs(true);
+                }
+	} finally {
+                // Make shure we close immediately
+		qunflock($gfsLock);
+		qunflock($ndbLock);
+        }
+}
+
+
+function generateCbtForVdi($newDisk, $oldUuid, $file, $bs){
+	gen_log(LOG_DEBUG, "Generating XCL for $newDisk->name_label ($newDisk->vdi_uuid vs $oldUuid)");
+
+	$size = $newDisk->size;
+	$newUuid = $newDisk->vdi_uuid;
+	$bmp = getChangeBitmapXen($oldUuid, $newUuid);
+
+	$kblocksPerBMP = $bs / 512;
+
+	$loops = $size / (512 * 1024);
+	if(strlen($bmp) < $loops){
+		gen_log(LOG_DEBUG, "VDI CBT bitmap (from Xen) is too small- $loops vs ". strlen($bmp));
+		return;
+		//throw new Exception("VDI CBT bitmap (from Xen) is too small- $loops vs ". strlen($bmp));
+	}
+	$can = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF\n"; // \n
+	$cannot = "00000000000000000000000000000000\n";  // \n
+
+	if(file_exists($file)){ unlink($file); }
+	exec("touch $file");
+
+	$numSkipped=0;
+	$cantSkipBlock=false;
+	$innerLoop=0;
+	for($i=0; $i < $loops; $i++){
+		$innerLoop++;
+		if(ord($bmp[$i]) == 0){ $numSkipped++; }
+		else{ $cantSkipBlock = true; }
+
+		if($innerLoop == $kblocksPerBMP){
+			if($cantSkipBlock){
+				file_put_contents($file, $cannot, FILE_APPEND);
+			}else{
+				file_put_contents($file, $can, FILE_APPEND);
+			}
+			$cantSkipBlock = false;
+			$innerLoop=0;
+		}
+	}
+	file_put_contents($file, "CODA", FILE_APPEND);
+
+	$changed =$loops - $numSkipped;
+	gen_log(LOG_INFO, "[CBT] ". bytesToString($changed * (512 * 1024)) ." Changed. ($changed/$loops blocks)" );
+
+}
+
+function rotateCbtSnapshots($inf, $vm){
+	gen_log(LOG_DEBUG, "Rotating CBT snapshots");
+	$note = "[Alike CBT metadata-only]";
+	$new = getDisksXen($inf->snapUuid, false, true);
+	$vdisForMeta = "";
+	foreach($new as $d){
+		// do this first b/c xen has a weird bug w/ data-destroy where it claims the vdi doesn't exist when you try to rename it has been dd'ed
+		$res = xen_call("vdi-param-set name-label=\"$d->name_label $note\" uuid=$d->vdi_uuid");	// rename to help avoid confusion
+		gen_log(LOG_DEBUG, "Renamed vdi ($d->vdi_uuid - > $note) Res: $res");
+
+		deleteVBD($d->vbd_uuid);					// drop the VBD links
+		$res = xen_call("vdi-data-destroy uuid=$d->vdi_uuid");		// hollow out the VDIs
+		gen_log(LOG_DEBUG, "Data Destroyed CBT vdi ($d->vdi_uuid) Res: $res");
+		if(!empty($res)){
+			gen_log(LOG_WARNING, "Xen failed to enable cbt on snapshot VDI ($d->name_label [$d->vdi_uuid]) xapi result: $res");
+			gen_log(LOG_INFO, "The next backup will attempt to establish a baseline for this disk");
+			deleteVDI($d->vdi_uuid);	// delete the old VDIs
+		}else{
+			$vdisForMeta .=$d->vdi_uuid.",";
+		}
+	}
+	if(!empty($inf->oldCbtSnap)){
+		$vdis = getCbtSnapVdis($inf->oldCbtSnap);
+		foreach($vdis as $v){
+			deleteVDI($v);	// delete the old VDIs
+		}
+		$res =deleteSnapshotXen($inf->oldCbtSnap, true );	// delete the empty snapshot
+		gen_log(LOG_DEBUG, "Deleted old CBT snap ($inf->oldCbtSnap) Res: $res");
+	}
+	setCbtSnapVdis($inf->snapUuid, $vdisForMeta);
+
+	$cache = "/home/alike/Alike/remoteDBs/cbtCache";
+	$hcvFile = "$cache/".$vm->VMID.".HCV";
+	$prev = file_get_contents($hcvFile);
+	file_put_contents($hcvFile, $inf->cbtSnapName);
+//	$res = xen_call("snapshot-param-set name-label=$inf->cbtSnapName uuid=$inf->snapUuid");
+	gen_log(LOG_DEBUG, "Writing HCV with: $inf->cbtSnapName");
+	
+	// data destroy snapshot $disks->snapUuid
+	// rename current snap to reserved name $disks->cbtSnapName
+	// delete old snapshot	$disks->oldCbtSnap
+}
+
+function getCbtSnapVdis($uuid){
+	$cmd = "snapshot-param-get param-name=xenstore-data uuid=$uuid";
+	$res = trim(xen_call($cmd));
+	$lines = explode(";", $res);
+	foreach($lines as $l){
+		if(strpos($l, "alike-cbt-vdis") !== false){
+			$parts = explode(":", $l);
+			$vdis = explode(",",trim($parts[1]));
+			return array_filter($vdis);
+		}
+	}
+	return null;
+}
+
+function setCbtSnapVdis($uuid, $vdis){
+	if(is_array($vdis)){
+		$vdis = implode(",", $vids);	
+	}
+	 $res = xen_call("vm-param-set xenstore-data:\"alike-cbt-vdis=$vdis\" uuid=\"$uuid\"");
+	gen_log(LOG_DEBUG, "set cbt snap meta ($vdis): $res");
+}
+
+// find any CBT snaps for matching this prefix and delete them
+function findAndScrubCbts($uuid, $prefix){
+	$res =trim(xen_call("vm-param-get uuid=$uuid param-name=snapshots"));
+	$ourSnaps = explode(";",$res);
+	$ourSnaps = array_map('trim', $ourSnaps);
+
+	$res =trim(xen_call("snapshot-list"));
+	$all = json_decode(parse_xen_result($res), true);
+	foreach($all as $s){
+		if(in_array($s["uuid"], $ourSnaps) && strpos($s["name-label"], $prefix)!== false){
+			// delete this snap
+			gen_log(LOG_DEBUG, "Deleting old CBT snapshot: ". $s["name-label"]);
+			deleteSnapshotXen($s["uuid"], true);	// kill the snapshot abd its vbd/vdis
+		}
+	}
+}
+
+///////////////////////////////////////////////////// BEGIN QHB CBT ////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+/*
+ * deviceStr is the snapshot, folks!
+ */
+
+function getStateFileName($volNum) {
+	return "cbt.state.$volNum";
+}
+function agentCbtPre($ip, $jobID, $vmID, $deviceStr, $volNum, $driveLet, $snapTime, $bs){
+	//gen_log(LOG_DEBUG, "agentCbtPre called with 
+	//			ip: $ip jobid: $jobID vmid: $vmID deviceStr: 
+	//			$deviceStr volNum: $volNum driveLet: $driveLet snapTime: $snapTime");
+	$shouldVolumize = true;
+ 	$stupidJob = getJob($jobID);
+        if($shouldVolumize && array_key_exists("forceFull", $stupidJob->Options) && $stupidJob->Options["forceFull"] ==1) {
+                gen_log(LOG_DEBUG, "forceFull enabled, skipping any CBT state");
+                return "BAD";
+        }
+
+	
+	$myA3Id = myA3Id();
+	$myUuid = $vmUuid = getVMUuid($vmID);
+	// Obtain the highest USN for the volume using FSUTIL 
+	$myUsn = verifyAndEnableUsnJournals($ip, $driveLet);
+	verifyAndEnableRangeTracking($ip, $driveLet);
+	//$myUsn = getHighestUsn($ip, $driveLet);
+	$stateFileName = getStateFileName($volNum);
+	// Determine if the remote file "cbt.state.$diskNum" exists
+
+	$stateFileContents = agentFileGetContents($ip, $stateFileName);
+	$dr5 = "MISSING";
+        if($shouldVolumize && empty($stateFileContents)){
+		gen_log(LOG_INFO, "CBT state not found for drive $driveLet, performing full scan");
+		$shouldVolumize = false;
+	}
+	$cachedMd5File = getQhbCbtCacheFile($vmID, $volNum);
+	$dr5 = "BADBADBADBAD";
+	if($shouldVolumize) {
+		// Generate MD5 by killing ALL spaces
+		$trimmed = preg_replace('/\s+/', '', $stateFileContents);
+		$dr5 = md5($trimmed);	
+	}
+	gen_log(LOG_DEBUG, "Checking for $cachedMd5File....");
+	if($shouldVolumize && file_exists($cachedMd5File) == false) {
+		gen_log(LOG_INFO, "Last CBT state not found in CBT cache, performing full scan");
+		$shouldVolumize = false;
+	} else {
+		//gen_log(LOG_DEBUG, "$cachedMd5File exists, loading...");
+	}
+	// For first-time backups or rebuilding state, just save the previous USN as "bad"
+	$lowUsn = "BADUSN";
+	$timestamp = -1;
+	$resumeFile = createUuid();
+	$resumeFile = "$resumeFile.resume";
+	if($shouldVolumize) {
+		$blockSize = getFieldFromCbtState("blockSize", $stateFileContents);
+		$guid = getFieldFromCbtState("a3guid", $stateFileContents);
+	        $uuid = getFieldFromCbtState("uuid", $stateFileContents);
+        	$timestamp = getFieldFromCbtState("timestamp", $stateFileContents);
+		$resumeFile = getFieldFromCbtState("resumeFile", $stateFileContents);
+		
+		gen_log(LOG_DEBUG, "Remote guid is $guid, remote uuid is $uuid, timestamp is $timestamp, blockSize is $blockSize");
+		$oldMd5 = trim(file_get_contents($cachedMd5File));
+		if($oldMd5 !== $dr5) {
+			$shouldVolumize = false;
+			if($guid != $myA3Id) {
+				gen_log(LOG_WARNING, "CBT state belongs to a different A3! Will perform full scan.");
+			}
+			if($uuid != $myUuid) {
+				gen_log(LOG_WARNING, "UUID of machine changed since last backup. $uuid vs $myUuid. Must rescan.");
+			}
+			gen_log(LOG_WARNING, "Md5 of remote CBT state ($dr5) does not match cache ($oldMd5). Must rescan");
+		}
+		
+	}
+	if($shouldVolumize) {
+                $agentUptime = getAgentUptimeTs($ip);
+                if($agentUptime > $timestamp) {
+                        $shouldVolumize = false;
+                        $friendly1 = date("Y-m-d H:i:s", $timestamp);
+                        $friendly2 =  date("Y-m-d H:i:s", $agentUptime);
+                        gen_log(LOG_WARNING, "Agent has been running since $friendly2, which is after last incremental of $friendly1. Must rescan");
+                }
+        }
+
+	
+	// Need to determine if the backup version exists.
+	if($shouldVolumize && verifyVersionExists($uuid, $timestamp, $vmID, $jobID) == false) {
+		$shouldVolumize = false;
+		gen_log(LOG_WARNING, "Previous backup with timestamp $timestamp not found! Must perform rescan.");
+	}
+	if($shouldVolumize == false) {
+		gen_log(LOG_DEBUG, "Deleting $resumeFile, if it exists");
+		agentDeleteFile($ip, $resumeFile);
+	}
+		
+	gen_log(LOG_DEBUG, "Serializing NTFS state of volume $driveLet");
+	$contents = generateStateFile(	
+					$ip, 
+					$driveLet, 
+					$deviceStr, 
+					$volNum, 
+					$myUuid, 
+					$myA3Id, 
+					$snapTime,
+					$bs,
+					$resumeFile);
+	$newMd5 = uploadStateFile($ip, $volNum, $contents);
+	$topMsg = "Running NTFS analysis for drive $driveLet ";
+	$veid = addJobLog($topMsg,3, $jobID, $vmID);
+	$logState =1;
+	try {
+		//gen_log(LOG_INFO, "Running NTFS changed journal scan for drive $driveLet");
+		$xclPath = "chroot/jobs/$jobID/$vmID/$volNum.xcl";
+		$logFilePath = "chroot/jobs/$jobID/$vmID/$volNum.cbt.log";
+		$cmd = "volumizer.exe chroot/$stateFileName.active $xclPath $logFilePath";
+		gen_log(LOG_DEBUG, "Executing: $cmd");
+		$rez = agentRunPreship($ip, $cmd);
+		//gen_log(LOG_DEBUG, "Rez is: $rez");
+		// Check this for certain specific text outcomes!
+		if(stripos($rez, "error:") !== false) {
+			throw new ErrorException("NTFS volume analysis failed with $rez");
+		}
+		// Only warn on non-first time runs
+		if($shouldVolumize) {
+			if(stripos($rez, "reason:") !== false) {
+				// rez ends with all-caps "SUCCESS" which was needed to get here, but don't tell the user
+				// that it's a "SUCCESS" when to them it's not
+				$msg = str_replace("SUCCESS", "", $rez);
+				gen_log(LOG_WARNING, "Backup state must be rebuilt. $msg");
+			}
+		} else if(stripos($rez, "SUCCESS") === false) {
+			gen_log(LOG_DEBUG, $rez);
+			throw new ErrorException("Possible antivirus interference, as NTFS analysis appeared not to run or ran rather abnormally");
+					
+		}
+		$logState = 0;
+		// Rename the state file upon SUCCESS so we can grab it next time
+	} finally {
+		$st = "[Complete]";
+		if($logState ==1){ $st = " [Failed]"; }
+		updateJobLog("$topMsg $st",$logState, $veid);		
+	}
+	return $newMd5;	
+}
+
+function getQhbCbtCacheFile($vmID, $volNum) {
+	$cache = "/home/alike/Alike/remoteDBs/cbtCache";
+	if(!is_dir($cache)){ exec("mkdir $cache"); }
+     	$cachedMd5File = "$vmID.$volNum.cbt5";
+      	return "$cache/$cachedMd5File";
+}
+
+
+function uploadStateFile($ip, $volNum, $stateFileContents) {
+	$stateFileName = getStateFileName($volNum);
+	$stateFileName= "$stateFileName.active";
+        // Clean it out if it already exists?
+        agentRunCmdWithRetry($ip, "cmd /c del $stateFileName");
+        agentUploadFromMem($ip, $stateFileName, $stateFileContents);
+        $trimmed = preg_replace('/\s+/', '', $stateFileContents);
+        gen_log(LOG_DEBUG, "Uploaded $stateFileName to $ip");
+        $dr5 = md5($trimmed);
+        return $dr5;
+}
+
+
+function generateStateFile($ip, $driveLetter, $deviceStr, $volNum, $myUuid, $myA3Id, $snapTime, $blockSize, $resumeFile) {
+
+	 $salty = microtime(true);
+	// Generate new cbt state file, clobbering whatever is there
+	$stateFileContents = <<< END
+resumeFile==%02
+driveLetter==%03
+snapshot==%04
+driveNum==%05
+uuid==%06
+timestamp==%07
+a3guid==%08
+blockSize==%09
+salt==%10
+END;
+ 	$stateFileContents = str_replace('%02', $resumeFile, $stateFileContents);
+	$stateFileContents = str_replace('%03', $driveLetter, $stateFileContents);
+	$stateFileContents = str_replace('%04', $deviceStr, $stateFileContents);
+	$stateFileContents = str_replace('%05', $volNum, $stateFileContents);
+	$stateFileContents = str_replace('%06', $myUuid, $stateFileContents);
+	$stateFileContents = str_replace('%07', $snapTime, $stateFileContents);
+	$stateFileContents = str_replace('%08', $myA3Id, $stateFileContents);
+	$stateFileContents = str_replace('%09', $blockSize, $stateFileContents);
+	$stateFileContents = str_replace('%10', $salty, $stateFileContents);
+	
+	return $stateFileContents;
+}
+
+
+function agentCbtPost($ip, $vmID, $volNum, $md5){
+	gen_log(LOG_DEBUG, "agentCbtPost invoked with ip: $ip VMID: $vmID volNum: $volNum MD5: $md5");
+	$stateFileName = getStateFileName($volNum);
+	if(agentFileExists($ip, "$stateFileName.active") == false) {
+		throw new ErrorException("Active state file $stateFileName.active not found!");
+	}
+	gen_log(LOG_DEBUG, "Renaming state file from $stateFileName.active to $stateFileName");
+	if(agentFileExists($ip, $stateFileName)) {
+		// This really shouldn't happen man
+		agentRunCmdWithRetry($ip, "cmd /c del chroot\\$stateFileName");
+		if(agentFileExists($ip, $stateFileName)) {
+			throw new ErrorException("Previous erroneous state file existed, and cannot be cleaned up! Permissions problem?");
+		}
+	}
+      	agentRunCmd($ip, "cmd /c rename chroot\\$stateFileName.active $stateFileName");
+	if(agentFileExists($ip, $stateFileName) == false) {
+		throw new ErrorException("Rename of $stateFileName.active to $stateFile failed!");
+	}
+	//gen_log(LOG_DEBUG, "Serializing QHB CBT state for next backup...");
+	$cool = getQhbCbtCacheFile($vmID, $volNum);
+	file_put_contents($cool, $md5);	
+	//gen_log(LOG_DEBUG, "Wrote QHB md5 state of $md5 to $cool");
+}
+
+function agentUploadFromMem($ip, $destPath, $contents) {
+	$rando = createUuid();
+        $tmpPath = "/tmp/$rando.upload";
+        file_put_contents($tmpPath, $contents);
+        try {
+		return agentUploadFile($ip, $tmpPath, "chroot/$destPath");
+        } finally {
+                unlink($tmpPath);
+        }
+}
+
+function myA3Id() {
+	return getInstallID();
+}
+
+function getUUIDPath(){
+        $file = "/mnt/restore/0/uuid.list";
+        if(!file_exists($file)){
+                $msg = "RestoreFS not available (uuid.list missing).  Is the DataEngine service running?";
+		throw new ErrorException($msg);
+	}
+
+        $raw = explode("\n",trim(file_get_contents($file)) );
+        $out = array();
+        foreach($raw as $l){
+                $bits = explode("=", $l);
+                if(count($bits) >=2){
+                        $out[trim($bits[0])] = trim($bits[1]);
+                }
+        }
+
+        return $out;
+}
+
+
+function verifyVersionExists($uuid, $timestamp, $vmid, $jobid) {
+	$uuid = strtoupper($uuid);
+	$uuid = str_replace('-', '', $uuid);
+	$list = getUUIDPath();
+	$vmPath = $list[$uuid];
+	$vmPath = "/mnt/restore/0/$vmPath/$timestamp/0.hcl";
+	//gen_log(LOG_DEBUG, "Statting previous version at \"$vmPath\"");
+	if(file_exists($vmPath) == false) {
+		return false;
+	}
+	$vmDir = "/home/alike/Alike/agentShare/jobs/$jobid/$vmid";
+	$hcvPath = "$vmDir/$timestamp.HCV";
+	if(file_exists($hcvPath) == false) {
+		gen_log(LOG_DEBUG, "Backup exists, but no HCV found at $hcvPath. Must rebaseline.");
+		return false;
+	}
+	return true;
+}
+
+function verifyAndEnableRangeTracking($ip, $driveLet) {
+	if(hasRangeTracking($ip, $driveLet) == true) {
+		return;
+	}
+		
+	$cmd = "fsutil usn enablerangetracking c=1048576 s=1048576 $driveLet";
+        $rez = agentRunCmd($ip, $cmd);
+	if(hasRangeTracking($ip, $driveLet) == false) {	
+                gen_log(LOG_INFO, "Drive $driveLet does not support write range tracking. Please see Quadric Software KB for information on write range tracking.");
+        }
+}
+
+function hasRangeTracking($ip, $driveLet) {
+	$cmd = "fsutil usn queryjournal $driveLet";
+        $rez = agentRunCmdWithRetry($ip, $cmd);
+	//gen_log(LOG_DEBUG, $rez);
+
+        $regex = "/Write range tracking file size threshold/";
+        if(preg_match($regex, $rez)) {
+		return true;
+	}
+	return false;
+}
+
+
+
+function verifyAndEnableUsnJournals($ip, $driveLet) {
+	$goodUsn = false;
+	$rez = "BAD";
+	try {
+		$rez = getHighestUsn($ip, $driveLet);
+		$goodUsn = true;
+	} catch(Exception $ee) {
+		;
+	}
+	if($goodUsn) {
+		return $rez;
+	}
+	$cmd = "fsutil usn createjournal m=1000 a=100 $driveLet";
+	
+	$rez = agentRunCmd($ip, $cmd);
+	// Get and return highest USN
+	$usn = getHighestUsn($ip, $driveLet);
+	gen_log(LOG_DEBUG, "Enabled USN tracking on drive $driveLet. Current USN is $usn.");
+	return $usn;
+}
+
+
+function getHighestUsn($ip, $driveLet) {
+	$cmd = "fsutil usn queryjournal $driveLet";
+	gen_log(LOG_DEBUG, $cmd);
+	$rez = agentRunCmdWithRetry($ip, $cmd);
+	$output_array = array();
+	$rez2 = preg_match('/Next Usn\W*:\W(\w+)/', $rez, $output_array);
+	if($rez2 === false || $rez2 != 1) {
+		throw new ErrorException("Unable to obtain USN, fsutil returned $rez");
+	}
+	//print_r($output_array);
+	return $output_array[1];
+}
+
+function winHexToDec($str) {
+	$hexStr = substr($str, 2);
+	return hexdec($hexStr);
+}	
+
+function getFieldFromCbtState($key, $state) {
+	$out_ar = array();
+	$rez = preg_match("/$key==(\\S+)/", $state, $out_ar);
+	if(count($out_ar) < 2) {
+		throw new ErrorException("key $key not found in state file $state");
+	}
+	return trim($out_ar[1]);
+}
+
+function myCheckAndMakeDirReal($dir) {
+        if(file_exists($dir)){
+                //gen_log(LOG_INFO, "Directory $dir already exists, but that's ok");
+                return;
+        }
+        if(!mkdir($dir)){
+		gen_log(LOG_ERR, "Unable to create dir $dir, this may cause some issue!");
+        }
+}
+
+function getAgentUptimeTs($ip) {
+        $cmd = "powershell \"(Get-Process -Name 'qsbagent').StartTime.ToUniversalTime()\"";
+        $rez = trim(agentRunCmd($ip, $cmd));
+        $dateTime = DateTime::createFromFormat("l, F d, Y g:i:s A", $rez, new DateTimeZone("UTC"));
+        $timestamp = $dateTime->getTimestamp();
+        return $timestamp;
+}
+
+
+?>

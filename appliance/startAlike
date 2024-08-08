@@ -1,0 +1,267 @@
+#!/usr/bin/php -q
+<?php
+
+include_once("/usr/local/sbin/common_lib");
+
+$GLOBALS["BIN_PATH"]="/usr/local/sbin";
+$GLOBALS["ALIKE_HOME"]="/home/alike/Alike";
+if(amRoot() ==false){ 
+	echo "Starting Alike services, please wait.\n";
+        $args = join($argv, " ");
+        echo shell_exec("sudo $args");
+	exit;
+}
+
+$doBKS=true;
+if(strpos(join($argv, " "), "--no-bks") !== false) { $doBKS=false; }
+
+
+if(!freeSpaceCheck()){
+	$use = getDiskUsageLocal();
+	$free = bytesToString($use->free);
+	echo "Low Disk Space Warning!\n";
+	echo "There is not enough free space to start.\n";
+	echo "Only $free free.\n";
+	echo "Please free space before continuing.\n";
+	syslog(LOG_ERR,"Low Disk Space on A3 system drive.  Only $free available.  Services cannot start!");
+	exit(1);
+}
+if(!freeSpaceCheck()){
+	$use = getDiskUsageSR();
+	$free = bytesToString($use->free);
+	echo "Low Alike SR Space Warning!\n";
+	echo "There is not enough free Alike SR space to start.\n";
+	echo "Only $free free.\n";
+	echo "PLEASE CONTACT SUPPORT FOR ASSISTANCE.\n";
+	syslog(LOG_ERR,"Low Disk Space on A3 SR.  Only $free available.  Services cannot start!");
+	exit(1);
+}
+
+
+try{
+	syslog(LOG_DEBUG,"Beginning to start Alike services");
+
+	if(isADSFound()){
+		echo "ADS Mounted, continuing to start Alike services\n";
+	}else{
+		myDie("ADS not found!  Please attach an existing ADS, or use the ADS tool to create one.\n");
+	}
+
+	checkEnv();
+
+	exec("/etc/init.d/smbd start");
+
+	if(trim(shell_exec("pgrep java"))){
+		echo "Alike Data Engine (Java) is already running!\n";		
+		syslog(LOG_INFO,"Ailke services (java) already running");
+	}else{
+
+		if(startJava() == false){ exit(1); }
+		if(startFUSE()== false){ exit(1); }		
+		disownABDs(0);	// reset ABD checkouts, just in case
+	}
+
+	
+	if(startWS()==false ){ exit(1); }
+	
+	if($doBKS){
+		if(schedulerState()){
+			echo "Scheduler already running.\n";
+		}else{
+			echo "Running startup tasks\n";
+			echo shell_exec( $GLOBALS["ALIKE_HOME"]."/hooks/startupTasks");
+			echo "Enabling job scheduling.\n";
+			startScheduler();
+		}
+	}else{
+		syslog(LOG_NOTICE,"Skipping BKS based on arguments");
+	}
+	syslog(LOG_NOTICE,"Alike services started");
+	exit(0);
+
+
+}catch(Exception $e){
+        echo "Error: ". $e->getMessage();
+	syslog(LOG_WARNING,"Ailke services failed to start. ". $e->getMessage());
+	exit(1);
+}
+
+function checkEnv(){
+	setSetting("dsid0", "ALIKE_ADS");
+	setSetting("dsid1", "ALIKE_ODS");
+	// look for folders, and make them if they're not there.
+	// die if we can't make them
+
+	exec("touch /home/alike/Alike/agentShare/seed");
+	
+	$dir = "/mnt/flr";
+	if(!file_exists($dir)){ 
+		if(!mkdir($dir)){ myDie("Failed to create directory: $dir\n"); }
+	}
+	exec("chown alike.alike $dir"); 
+
+	$dir = "/mnt/restore";
+	if(!file_exists($dir)){ 
+		if(!mkdir($dir)){ myDie("Failed to create directory: $dir\n"); }
+	}
+	exec("chown -R alike.alike $dir"); 
+	exec("chmod 777 $dir");
+
+	$dir = "/mnt/Data_In";
+	if(!file_exists($dir)){ 
+		if(!mkdir($dir)){ myDie("Failed to create directory: $dir\n"); }
+	}
+	exec("rm -fr /mnt/Data_In/*");
+	exec("chown root.root $dir"); 
+	shell_exec("chmod 555 $dir");
+
+
+	
+	$dir = $GLOBALS["jobPath"];
+	if(file_exists($dir)){
+		exec("rm -fr $dir/*");
+	}else{
+		echo "Creating ADS jobs folder\n";
+		if(!mkdir($dir, 0777, true)){ myDie("Failed to create ADS Jobs directory: $dir\n"); }
+		exec("chown -R alike.alike $dir"); 
+	}
+
+	$dir = $GLOBALS["jvPath"];
+	if(!file_exists($dir)){ 
+		echo "Creating ADS JV folder: $dir\n";
+		if(!mkdir($dir, 0777, true)){ myDie("Failed to create JV directory: $dir\n"); }
+	} else {
+		echo "Cleaning ADS JV folder: $dir\n";
+		exec("rm -f $dir/*");
+	}	
+	exec("chown -R alike.alike $dir"); 
+
+	$dir = $GLOBALS["progPath"];
+	if(!file_exists($dir)){ 
+		if(!mkdir($dir, 0777, true)){ myDie("Failed to create directory: $dir\n"); }
+	}
+	exec("chown -R alike.alike $dir"); 
+
+	$targ = $GLOBALS["ALIKE_HOME"] ."/cbtTemp";
+	$dest = "/mnt/ads/cbtTemp";
+
+	if(!file_exists($dest)){ 
+		if(!mkdir($dest, 0777, true)){ myDie("Failed to create cbtTemp directory: $dest\n"); }
+	}else{
+		exec("rm -fr ".$dest."/*");
+	}
+	exec("chown -R alike.alike $dest"); 
+
+	if(!file_exists($targ)){
+		symlink($dest,$targ);
+	}
+	else if(!is_link($targ)){
+		myDie("cbtTemp folder is not a symlink ($targ)\n"); 
+	}
+
+	if(getSetting("enableOnsiteVaulter") == "true"){
+		try{
+			$s = Share::byID(1);	
+			if(!$s->isMounted()){
+				echo "Disabling Vaulting (not mounted)\n";
+				setSetting("enableOnsiteVaulter","false");
+			}
+		}catch(Exception $ex){
+			echo "Disabling Vaulting (share not valid)\n";
+			setSetting("enableOnsiteVaulter","false");
+		}
+	}
+
+
+	$mem = getMemory();
+	$tots = ceil($mem->total/1024/1024);
+
+	echo "\nDetected Total A3 Memory: $tots MB\n";
+
+	if($tots < 800){
+		echo "Very low system memory detected ($tots MB).\n";
+	}
+	$blockSz = getSetting("blockSize");
+	$build = getA3Build();
+	if($build >= 8353 && $blockSz > 512) {
+		$timeo = time();
+		$sql = "INSERT OR IGNORE INTO Settings (name,val) VALUES ('cbtBadBeforeTs', ?)";
+		dbSet("nimbus", $sql, array($timeo) );
+	}
+	if($build >= 8430 && $blockSz > 512) {
+		$timeo = time();
+		$sql ="INSERT OR IGNORE INTO Settings (name,val) VALUES ('cbtBadBeforeTs2', ?)";
+		dbSet("nimbus", $sql, array($timeo) );
+	}
+	//if($build >= 9227) {
+                $timeo = time();
+                $sql= "INSERT OR IGNORE INTO Settings (name,val) VALUES ('orphanVdiTs', ?)";
+		dbSet("nimbus", $sql, array($timeo) );
+	//}
+
+
+}
+
+
+function startFUSE(){
+	$BIN_PATH = $GLOBALS["BIN_PATH"];
+	$AMB_PATH="/mnt/Data_In";
+	$BLKFS_PATH="/mnt/restore";
+	
+	echo "Prepping restore mount...\n";
+        echo shell_exec("rm -fr $BLKFS_PATH");
+        echo shell_exec("mkdir $BLKFS_PATH");
+	echo "Mounting Alike virtual restore share\n";
+	echo shell_exec("$BIN_PATH/blkfs -oallow_other -osync_read $BLKFS_PATH");
+	return true;
+}
+
+function startJava(){
+	$ALIKE_HOME = $GLOBALS["ALIKE_HOME"];
+
+	$chk = "/tmp/java.status";
+        if(file_exists($chk)){
+                unlink($chk);
+        }
+
+        echo "Starting Alike Backend (Java)";
+        shell_exec("su alike -c  \"$ALIKE_HOME/java/blockvaulter.bash $ALIKE_HOME &> /tmp/java.out &\"");
+        $i=0;
+        while(file_exists($chk)== false){
+                if($i == 300){
+                        echo "\nTimeout waiting for Alike Backend (Java) to start!\n";
+                        echo "Check the /var/log/engine.log for more details.\n";
+                        exit(1);
+                }
+		echo ".";
+		$res = trim(file_get_contents("/tmp/java.out") );
+		if($res != ""){
+			echo "Failed to start Java\n";
+			echo "Error: $res\n";
+			exec("killall java");
+			exit($res);
+		}	
+
+                usleep(500000);	// 500 ms
+                $i++;
+        }
+        echo "\nBackend Started\n";
+
+	return true;
+}
+
+function startWS(){
+	echo "Starting web services\n";
+	exec("/etc/init.d/nginx start 2>&1 > /dev/null");
+	exec("/etc/init.d/php7.4-fpm start 2>&1 > /dev/null");
+	echo "Web services have been started\n";
+	return true;
+}
+
+
+function myDie($msg){
+	syslog(LOG_ERR,$msg);
+	echo $msg;
+	exit(1);
+}
+

@@ -1,0 +1,130 @@
+#!/usr/bin/php -q
+<?php
+
+include_once("/usr/local/sbin/common_lib");
+include_once("/usr/local/sbin/common_lib");
+include_once("/usr/local/sbin/shared_lib");
+
+
+if(amRoot()==false){
+	echo "Stopping Alike services, please wait.\n";
+	$args = join($argv, " ");
+	echo shell_exec("sudo $args");
+	return;
+}
+
+try{
+
+	$doWS=true;
+	if(strpos(join($argv, " "), "--no-web") !== false) { $doWS=false; }
+
+	$res=0;
+
+	syslog(LOG_INFO,"Stopping the Alike services");
+
+	if(isADSFound()){
+		disownABDs(0);
+	}
+
+	if(stopBKS()==false ){  }
+	if(stopJava() == false){ $res=1; }
+	if(stopFUSE()== false){ $res=1; }
+	if($doWS){
+		if(stopWS()==false ){ $res=1; }
+	}
+	syslog(LOG_INFO,"Alike services stopped ($res)");
+
+	return $res;
+
+
+}catch(Exception $e){
+        echo "Error: ". $e->getMessage();
+}
+
+
+function stopFUSE(){
+        echo "Unmounting Virtual Restore Share\n";
+        exec("sudo killall blkfs >/dev/null 2>&1");
+	return true;
+}
+
+function stopJava(){
+
+	$chk = "/tmp/java.status";
+        if(file_exists($chk)){ unlink($chk); }
+
+	if(trim(shell_exec("pgrep java")== false)){ 
+		echo "Alike Backend (Java) isn't running.\n";
+		return; 
+	}
+	if(isADSFound()){
+		echo "Initiating Clean Shutdown of Alike Backend\n";
+		exec("service smbd stop");
+		$content = '{"command":"shutdown"}';
+		$filebase = $GLOBALS["jvPath"]."/000_000.kg";
+		
+		$killfile = $filebase . ".cmd";
+		$result = $filebase . ".result";
+		$max = 0;
+		file_put_contents($killfile, $content);
+		shell_exec("chown alike.alike $killfile");
+		while(file_exists($result) == false) {
+			sleep(1);
+			if($max++ > 300) {
+				echo "Timeout waiting for clean shutdown\n";
+				break;
+			}
+		}
+		exec("/usr/local/sbin/dbSyncer --unsafe");
+	}	
+        echo "Stopping Alike Backend\n";
+        exec("killall java");
+	$cnt =0;
+	while(trim(shell_exec("pgrep java"))){
+		if($cnt == 60){ return false; }
+		usleep(100000);
+		$cnt++;
+		echo ".";
+	}
+	echo "\nAlike Backend stopped.\n";
+
+	return true;
+}
+
+function stopBKS(){
+	stopScheduler();
+	if(!isADSFound()){ return; }
+	$cnt =0;
+	while(trim(shell_exec("pgrep jobRunner"))){
+		if($cnt == 60){ break; }
+		usleep(100000);
+		$cnt++;
+	}
+	try{
+		$sql = "UPDATE job set status = 5 where status = 0 or status=2 or status =3";
+		dbSet("nimbus",$sql);
+	}catch(Exception $ex){ }
+
+    
+	if(trim(shell_exec("pgrep jobRunner"))){
+		echo "Failed to Stop all scheduled jobs gracefully. Forcing shutdown.\n";
+		exec("killall jobRunner 2>&1 > /dev/null");
+	}
+	return;
+}
+
+
+function stopWS(){
+	if(trim(shell_exec("pgrep nginx")== false)){
+		echo "Web services not running\n";
+		return;
+	}
+	echo "Stopping web services... ";
+	exec("/etc/init.d/nginx stop 2>&1 > /dev/null");
+	//exec("/etc/init.d/php7.4-fpm stop 2>&1 > /dev/null");
+	echo "stopped\n";
+	return true;
+}
+
+
+

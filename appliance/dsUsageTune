@@ -1,0 +1,46 @@
+#!/usr/bin/php -q
+<?php
+
+$dsNum = $argv[1];
+
+if($dsNum == 0) {
+	$adsVal = "/mnt/ads";
+} else {
+	$adsVal = "/mnt/ods1";
+}
+
+
+$metrix = "/tmp/metrics";
+$blockCountFile = "$metrix/$dsNum.blockCount";
+$sentBlockFile = "$metrix/$dsNum.blockDataSent";
+$sentCountFile = "$metrix/$dsNum.blockCountSent";
+$thruFile = "$adsVal/$dsNum.thru";
+
+include_once("/usr/local/sbin/common_lib");
+
+
+$du = preg_split('/\s+/', shell_exec("du -bs /mnt/ads/blocks"))[0];
+//$du = explode(" ", $du)[0];
+#$blockCount = shell_exec("awk -F, '{print $1}' $blockCountFile");
+$blockCount =  preg_split('/\s+/', file_get_contents($blockCountFile))[0];
+$correctedAvr = $du / $blockCount;
+$sentBlockSize =  preg_split('/\s+/', file_get_contents($sentBlockFile))[0];
+$sentBlockCount = preg_split('/\s+/', file_get_contents($sentCountFile))[0];
+$correctedSentSize =  $sentBlockCount * $correctedAvr;
+$correctedSentSize = floor($correctedSentSize);
+$correctedStr = number_format($sentBlockCount,0,'.','').",".number_format($correctedSentSize, 0, '.', '');
+
+
+print "Loading blocks directory allocation...please wait!\n";
+print "Blocks allocation size, bytes: $du\n";
+print "A3 block count: $blockCount\n";
+print "Traffic bytes logged: $sentBlockSize\n";
+print "Corrected average compressed block: $correctedAvr\n";
+print "Issuing adjustments...\n";
+print "(Corrected internal value literal: $correctedSentSize)\n";
+print "(Resulting internal value string: $correctedStr)\n";
+
+file_put_contents($thruFile, $correctedStr);
+
+print "Correction complete. You may now start A3 services.\n";
+?>

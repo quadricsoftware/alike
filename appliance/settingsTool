@@ -1,0 +1,318 @@
+#!/usr/bin/php -q
+<?php
+
+include_once("/usr/local/sbin/shared_lib");
+include_once("/usr/local/sbin/common_lib");
+$salt = "this is the randomizer";
+
+$prog = basename($argv[0]);
+if(count($argv) < 2){
+        $msg = "Insufficient parameters\n";
+	$msg .= "$prog can export and import your configuration settings (jobs, hosts, authprofiles)\n";
+	$msg .= "This is just for config settings-- no data will be imported/exported!\n\n";
+        $msg .= "Usage: $prog <export|repair> <*settings file> <*database file>\n";
+	$msg .= "*Optional args. \n";
+	$msg .="PLEASE NOTE:\n";
+	$msg .="Your ADS must be defined and mounted before repair/exporting.\n";
+	$msg .="When importing, you MUST relicense your host servers\n\n";
+        die($msg);
+}
+$cmd = $argv[1];
+
+$default=true;
+
+$file = "";
+if(count($argv) >2){
+	$file = $argv[2];
+	$default=false;
+}else{
+	$file = "/mnt/ads/prodDBs/settings.bak";
+	echo "Note: Using default settings file location ($file). \n";
+
+	if(!file_exists($file) && $cmd == "repair"){
+		die("Could not open settings file for repair!\nMissing: $file\n\n");
+	}
+}
+
+$dbFile = "/mnt/ads/prodDBs/nimbusdb.db";
+if(count($argv) >3){
+	$dbFile = $argv[3];
+}else{
+	echo "Note: Using default DB: $dbFile\n";
+}
+
+
+if($cmd=="export"){
+	if(!file_exists($dbFile)){
+		die("Could not find DB file ($dbFile) for export!\n");
+	}
+	$db = getGenericDB($dbFile);
+	$GLOBALS['db'] = $db;
+	echo "Exporting settings to file: $file\n";
+
+	if(file_exists($file)){ 
+		$bak = $file.".1";
+		echo "Settings file already exists.  Moving existing backup to $bak ";
+		exec("mv $file $bak");
+//		$resp = trim(fgets(STDIN));
+//		if($resp != "y" && $resp != "Y"){
+//			echo "Ok, cancelling now.\n";
+//			exit(0);
+//		}
+	}
+	echo "Gathering settings\n";
+	$o = exportSettings();
+	echo "Preparing portable format\n";
+	$e = base64_encode(jumbler(json_encode($o), $salt));
+	file_put_contents($file, $e);
+	echo "Done. File $file written.\n";
+
+}else if($cmd == "repair"){
+	$tmpDir = "/tmp/dbRepair";
+	exec("mkdir -p $tmpDir/");
+
+	$dbFile = "$tmpDir/repaired.db";
+
+	if (file_exists($dbFile)){
+		echo "$dbFile exists!\n";
+		die("Please delete $dbFile before continuing.\n");
+	}
+	echo "Creating blank new db for import\n";
+	echo shell_exec("sqlite3 $dbFile <  /mnt/ads/prodDBs/nimbusdb.schema");
+
+	$db = getGenericDB($dbFile);
+	$GLOBALS['db'] = $db;
+	//checkRunningSvc();
+
+	if(!file_exists($file)){ die("File ($file) does note exist!\n"); }
+	echo "Importing settings from file: $file\n";
+        echo "Begin repair process? (y/n) ";
+        $resp = trim(fgets(STDIN));
+        if($resp != "y" && $resp != "Y"){
+                echo "Ok, cancelling now.\n";
+                exit(0);
+        }
+        echo "Ok, reading settings from file: $file.\n";
+//	exec("cp -f $dbFile $bakFile");
+
+	try{
+		echo "Processing source data.\n";
+		$json = json_decode(jumbler(base64_decode(file_get_contents($file)),$salt));
+		echo "Recreating repaired DB: $dbFile\n";
+		importSettings($json);
+		echo "Repair complete.\nRepaired DB is located: $dbFile  \n";
+	}catch(Exception $ex){
+		echo "Error while importing!\n".$ex->getMessage() ."\n";
+		exit(1);
+	}
+}else{
+	echo "Unknown command: $cmd\n";
+}
+
+//$instID = getInstallID();
+function importSettings($d){
+	$s = new stdClass();
+	$s->name = "installID";
+	$s->val = getInstallID();
+	array_push($d->settings, $s);
+	insertSettings($d);
+	insertHosts($d);
+	insertSchedules($d);
+//	insertAuthProfiles($d);
+	insertVMs($d);
+}
+function insertSettings($d){
+	dbSet("nimbus", "delete from settings");
+	$sql = "INSERT into settings (name,val) values(?, ?)";
+	foreach($d->settings as $s){
+		if($s->name == "dataStoreUser1"){ continue; }
+		if($s->name == "dataStorePass1"){ continue; }
+		if($s->name == "dataStoreShare1"){ continue; }
+		if($s->name == "dataStoreType1"){ continue; }
+		if(strpos($s->name, "dataStoreMisc1") !== false){ continue; }
+		dbSet("nimbus", $sql, array($s->name, $s->val ));
+	}
+}
+function insertHosts($d){
+        dbSet("nimbus", "delete from host");
+        dbSet("nimbus", "delete from host_net");
+        dbSet("nimbus", "delete from host_sr");
+        $sql = "INSERT into host (hostID,hostName,virtType,username,password,role,key,port,deleteFlag,uuid,poolID) values(?,?,?,?,?,?,?,?,null,?,?)";
+        foreach($d->hosts as $s){
+		$s->password = obfuscate($s->password);
+		if($s->deleteFlag ==1){
+			continue;
+		}
+		if(!isset($s->role) || $s->role == ""){ $s->role=1; }
+		if(!isset($s->key) || $s->key == ""){ $s->key="imported"; }
+                dbSet("nimbus", $sql, array($s->hostID, $s->hostName,$s->virtType,$s->username,$s->password,$s->role,$s->key,$s->port,$s->uuid,$s->poolID ) );
+		if($s->virtType == 10){
+			$sql2 = "INSERT into VM (VMName,virtTech,hostID,deleteFlag,UUID,poolID, authProfile) values (?,10,$s->hostID,NULL,?,?,?)";
+			dbSet("nimbus", $sql2, array($s->hostName, $s->uuid, $s->hostName, 0 ));
+		}
+        }
+	$sql = "INSERT into host_net(hostid,netid) values(?,?)";
+	dbSet("nimbus", $sql);
+	foreach($d->host_net as $s){
+		dbSet("nimbus", $sql, array($s->hostid, $s->netid));
+	}
+	$sql = "INSERT into host_sr(hostid,srid) values(?,?)";
+	dbSet("nimbus", $sql);
+	foreach($d->host_sr as $s){
+		dbSet("nimbus", $sql, array($s->hostid, $s->srid));
+	}
+}
+
+function insertAuthProfiles($d){
+	dbSet("nimbus", "delete from authprofile");
+
+	$sql = "INSERT into authprofile(ID,name,username,password,context,isDefault) values(?,?,?,?,?,?)";
+        foreach($d->authprofiles as $s){
+		$s->password = obfuscate($s->password);
+                dbSet("nimbus", $sql, array($s->ID, $s->name,$s->username,$s->password,$s->context,$s->isDefault));
+        }
+}
+function insertVMs($d){
+	dbSet("nimbus", "delete from vm");
+	// VMID|VMName|virtTech|hostID|deleteFlag|maxVersions|UUID|poolID|maxVersionsOffsite|authProfile|accessIP
+
+	$sql = "INSERT into vm(VMID,VMName,virtTech,hostID,deleteFlag,maxVersions,UUID,poolID,maxVersionsOffsite,authProfile,accessIP) values(?,?,?,?,null,?,?,?,?,?,?)";
+        foreach($d->vms as $s){
+                dbSet("nimbus", $sql , array($s->VMID, $s->VMName,$s->virtTech,$s->hostID,$s->maxVersions,$s->UUID,$s->poolID, $s->maxVersionsOffsite,$s->authProfile,$s->accessIP));
+        }
+}
+
+
+function insertSchedules($d){
+	dbSet("nimbus", "delete from schedule");
+	dbSet("nimbus", "delete from schedule_exts");
+	dbSet("nimbus", "delete from schedule_dates");
+	dbSet("nimbus", "delete from schedule_vms");
+	dbSet("nimbus", "delete from schedule_options");
+
+	$sql = "INSERT into schedule (scheduleID,name, timestamp, jobtype, scheduletype, interval, occurances, username,password,targetpath, virttype, deleteflag, runbase, isActive) values(?, ?,?,?,?,?,?,?,?,?,?,null,?,?)";
+	foreach($d->schedules as $s){
+		dbSet("nimbus", $sql, array($s->scheduleID,$s->name, $s->timestamp,$s->jobType,$s->scheduleType,$s->interval,$s->occurances,$s->username,$s->password,$s->targetPath,$s->virtType,$s->runBase,$s->isActive ));
+	}
+
+	$sql = "INSERT into schedule_options(scheduleID,option,val) values(?,?,?)";
+	foreach($d->schedule_options as $s){
+		dbSet("nimbus", $sql, array($s->scheduleID, $s->option,$s->val ));
+	}
+	$sql = "INSERT into schedule_exts(scheduleID,extid) values(?,?)";
+	foreach($d->schedule_exts as $s){
+		dbSet("nimbus", $sql, array($s->scheduleID, $s->ExtID));
+	}
+	$sql = "INSERT into schedule_vms(scheduleID,vmid,vm_version) values(?,?,?)";
+	foreach($d->schedule_vms as $s){
+		dbSet("nimbus", $sql, array($s->scheduleID, $s->VMID,$s->VM_Version ));
+	}
+	$sql = "INSERT into schedule_dates(scheduleID,date) values(?,?)";
+	foreach($d->schedule_dates as $s){
+		dbSet("nimbus", $sql, array($s->scheduleID, $s->date));
+	}
+}
+
+
+
+function exportSettings(){
+	$isLegacy=false;
+
+	$sql = "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='version_site';";
+	$num = dbGetColumn("nimbus", $sql);
+	if($num == 0){ $isLegacy = true; echo "Detected legacy DB format\n";}
+
+
+	$out = new stdClass();
+	$out->settings = array();
+	$sql = "SELECT * from settings";
+	$barf = dbGet("nimbus", $sql);
+	foreach($barf as $v){
+
+		$skip=false;
+		if($v->name == "installID"){ $skip = true; }
+		else if($isLegacy && checkLegacySetting($v->name) ==false){ $skip =true; }
+
+		if($skip==false){
+			array_push($out->settings, $v);
+		}
+	}
+
+	$out->hosts = array();
+	$sql = "SELECT * from host";
+	$all = dbGet("nimbus", $sql);
+	foreach($all as $v){
+		$v->key = "";
+		if($isLegacy){
+			$v->password = $v->password;
+		}else{
+			$v->password = unobfuscate($v->password);
+		}
+		array_push($out->hosts, $v);
+	}
+	$out->authprofiles = array();
+	$sql = "SELECT * from authprofile";
+	$all = dbGet("nimbus", $sql);
+	foreach($all as $v){
+		if($isLegacy){
+			$v->password = $v->password;
+		}else{
+			$v->password = unobfuscate($v->password);
+		}
+		array_push($out->authprofiles, $v);
+	}
+
+	$sql = "SELECT * from VM where deleteFlag is null";
+	$out->vms = dbGet("nimbus", $sql);
+	$sql = "SELECT * from schedule where deleteFlag is null and jobType =0  or jobType = 2 or jobType = 5 or jobType = 6 or jobType = 14";
+	$out->schedules = dbGet("nimbus", $sql);
+
+	foreach($out->schedules as $s){
+		if($s->jobType == 14 ){ $s->jobType = 5; }
+		else if($s->jobType == 2 || $s->jobType == 6 ){ $s->jobType = 0; }
+	}
+
+
+	$sql = "SELECT * from schedule_options";
+	$out->schedule_options = dbGet("nimbus", $sql);
+	$sql = "SELECT * from schedule_vms";
+	$out->schedule_vms = dbGet("nimbus", $sql);
+	$sql = "SELECT * from schedule_dates";
+	$out->schedule_dates = dbGet("nimbus", $sql);
+	$sql = "SELECT * from schedule_exts";
+	$out->schedule_exts = dbGet("nimbus", $sql);
+	$sql = "SELECT * from host_net";
+	$out->host_net = dbGet("nimbus", $sql);
+	$sql = "SELECT * from host_sr";
+	$out->host_sr = dbGet("nimbus", $sql);
+
+	return $out;
+}
+
+
+
+function checkLegacySetting($key){
+	$keepers = array(
+		"pinABDonSourceHost",
+		"smtpNotify",
+		"uiPass",
+		"useSMTPSSL",
+		"blockSize",
+		"useSMTPAuth",
+		"smtpUsername",
+		"smtpToAddress",
+		"smtpPort",
+		"smtpPassword",
+		"smtpFromAddress",
+		"numVersions",
+		"mungerThreadCount",
+		"enableWarningEmails",
+		"enableSummaryEmail",
+		"disableABDoffloading",
+		"QHBThrottle"
+	);
+
+	return in_array($key,$keepers);
+}
+
+?>

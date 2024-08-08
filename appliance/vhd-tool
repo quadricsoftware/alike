@@ -1,0 +1,37 @@
+#!/usr/bin/php -q
+<?php
+
+include_once("/usr/local/sbin/shared_lib");
+include_once("/usr/local/sbin/common_lib");
+include_once("/usr/local/sbin/xen_common");
+
+
+
+if(count($argv) != 2){
+        $msg = "Insufficient parameters\n\n";
+        $msg .= "Usage: vhd-tool <vhd file>\n";
+        die($msg);
+}
+$file = $argv[1];
+
+
+if(!file_exists($file)){
+	die("Could not open file: $file\n");
+}
+
+$meta = xen_vdiMeta($file);
+
+echo "Our guid: ". $meta["guid"] ."\n";
+echo "Our VHD Type: ". $meta["type"] ."\n";
+echo "Our VHD Size: ". $meta["size"] ." ". bytesToString($meta["size"]) ." \n";
+if($meta["pGuid"] == "00000000-0000-0000-0000-000000000000"){
+		echo "We have no VHD parent\n";
+}else{
+	echo "Our Parent Guid: ". $meta["pGuid"] ."\n";
+	echo "Our Parent VHD File: ". $meta["pPath"] ."\n";
+}
+
+//print_r($meta);
+
+
+?>

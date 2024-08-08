@@ -1,0 +1,361 @@
+<?php
+include_once("/usr/local/sbin/common_lib");
+include_once("/usr/local/sbin/shared_lib");
+
+
+//      Get the VHDs
+function getVmVhdsHV($ip, $uuid){
+        $disks = array();
+        $q = wrapPS('$vhds =Get-VHD -VMid '.$uuid.'; Foreach($hd in $vhds){ Write-Host "$($hd.size),$($hd.DiskIdentifier)"; }', true);
+        $cmd = 'powershell -Command "'.$q.'"';
+        $out = array_filter(explode(PHP_EOL,agentRunCmd($ip, $cmd)));
+	try{
+		checkHvResults($out[0]);
+	}catch(Exception $ex){
+		gen_log(LOG_WARNING, "Missing disk on VM $uuid");
+		return $disks;
+	}
+
+        if(is_array($out) && count($out) > 0){
+                for($i=0; $i < count($out); $i++){
+                        $disk = new stdClass();
+                        $bits = explode(" ", $out[$i]);
+			$disk->name = "";
+			$disk->description = "";
+                        $disk->uuid = $bits[1];
+                        $disk->size = $bits[0];
+			$disk->bootable = 1;
+			$disk->userdevice = $i;
+			$disk->device = "";
+                        $disk->type = 1;
+                        array_push($disks, $disk);
+                }
+        }
+
+        return $disks;
+}
+
+function getVmVhdFilesHV($ip, $uuid){
+        $q = wrapPS("(Get-VM -Id ". $uuid." | Get-VMHardDiskDrive).Path", true);
+        $cmd = 'powershell -Command "'.$q.'"';
+        $out = array_filter(explode(PHP_EOL,agentRunCmd($ip, $cmd)));
+	checkHvResults($out[0]);
+
+        $disks = array();
+        if(is_array($out) && count($out) > 0){
+                for($i=0; $i < count($out); $i++){
+                        array_push($disks, trim($out[$i]) );
+                }
+        }
+
+        return $disks;
+}
+
+
+
+function getVmIpHV($ip, $uuid){
+        $q = wrapPS('Get-VM -id '.$uuid.' | Get-VMNetworkAdapter | Select -expandproperty IPAddresses', true);
+        $cmd = 'powershell -Command "'.$q.'"';
+        $out = array_filter(explode(PHP_EOL,agentRunCmd($ip, $cmd)));
+	if(count($out) > 0 ){
+		checkHvResults($out[0]);
+	}
+        $ip = "";
+        foreach($out as $i){
+                $i = trim($i);
+                if(strpos($i, "::") !== false){ continue; }     // skip ipv6
+                if(substr($i, 0, strlen("169"))=== "169" ){ $ip = $i; }
+                else{return $i;}
+        }
+        return $ip;
+}
+
+function getVmMemoryHV($ip, $uuid){
+	$q = "SELECT AllocationUnits,Limit FROM Msvm_MemorySettingData where InstanceID like '%$uuid%'";
+        $out= agentWmiCmd($ip, $q, true );
+        $out = agentParseWmi($out);
+        $memory = $out->Limit * 1024 ;
+	return $memory;
+}
+
+function getVmCpuHV($ip, $uuid){
+	$q = "SELECT VirtualQuantity FROM Msvm_ProcessorSettingData where InstanceID like '%$uuid%'";
+        $out= agentWmiCmd($ip, $q, true );
+        $out = agentParseWmi($out);
+        $numCpus = $out->VirtualQuantity;
+	return $numCpus;
+}
+
+function snapshotVmHV($ip, $uuid, $snapName){
+	$q = wrapPS("get-vm -id $uuid | checkpoint-vm -snapshotname $snapName");
+        $cmd = 'powershell -Command "'.$q.'"';
+        $out = array_filter(explode(PHP_EOL,agentRunCmd($ip, $cmd)));
+	checkHvResults($out[0]);
+	return $out;	// always blank-- thanks HV
+}
+
+function getSnapshotVhdsHV($ip, $uuid, $snapName){
+	$q = wrapPS('get-vm -id '.$uuid.' | get-vmsnapshot |where-object {$_.name -like \''.$snapName.'*\' } | get-vmharddiskdrive | select-object -property path | ft -hidetableheaders | out-string -width 4096', true);
+        $cmd = 'powershell -Command "'.$q.'"';
+        $out = array_filter(explode(PHP_EOL,agentRunCmd($ip, $cmd)));
+        $disks = array();
+        if(is_array($out) && count($out) > 0){
+                foreach($out as $v){
+			$v = trim($v);
+			if(empty($v)){ continue; }
+			array_push($disks, $v);
+                }
+        }
+echo "getting vhds\n";
+        return $disks;
+}
+
+function deleteSnapshotHV($ip, $uuid, $snapName, $skipme=""){
+	// delete by pattern and skip
+	$q ='get-vm -id '.$uuid.'  | get-vmsnapshot | where-object { $_.name -like \''.$snapName.'*\' } | Remove-vmsnapshot';
+	if(!empty($skipme)){
+		$q ='get-vm -id '.$uuid.'  | get-vmsnapshot | where-object { $_.name -like \''.$snapName.'*\' -and $_.Name -notlike \''.$skipme.'*\' } | Remove-vmsnapshot';
+	}
+        $q = wrapPS($q);
+        $cmd = 'powershell -Command "'.$q.'"';
+        $out = array_filter(explode(PHP_EOL,agentRunCmd($ip, $cmd)));
+	checkHvResults($out[0]);
+	return $out;
+}
+
+function getHVSpecificMeta($vm, $uuid, &$meta){
+        $hostIP = $vm->hostName;
+        $memory = getVmMemoryHV($hostIP, $uuid);
+        $numCpus = getVmCpuHV($hostIP, $uuid);
+
+        // add a stub NIC
+        $tmp = new stdClass();
+        $tmp->uuid = "";
+        $tmp->netuuid = "";
+        $tmp->netname = "";
+        $tmp->mac = "";
+        $tmp->mtu = 1500;
+        array_push($meta->VIFS, $tmp);
+
+        $meta->numCPUs =$numCpus;
+        $meta->memory = $memory;
+        $meta->memoryStaticMax = $memory;
+        $meta->memoryStaticMin = $memory;
+        $meta->memoryDynamicMax = $memory;
+        $meta->memoryDynamicMin = $memory;
+
+        // set: memory, cpus,  vifs and disks
+        $meta->platform["SecureBoot"] = "false";
+        $q = "select VirtualSystemSubtype,SecureBootEnabled,ConfigurationID from Msvm_VirtualSystemSettingData where ConfigurationID='$uuid'";
+        $out= agentWmiCmd($hostIP, $q , true);
+        $gixi = agentParseWmi($out );
+        if(isset($gixi->SecureBootEnabled) && strpos($gixi->VirtualSystemSubType, "SubType:2") !== false){
+//                $meta->isGen2 = true;
+                $meta->platform["Microsoft:Hyper-V:SubType:2"] = "true";
+        }else{
+//                $meta->isGen2 = false;
+                $meta->platform["Microsoft:Hyper-V:SubType:2"] = "false";
+        }
+        if(isset($gixi->SecureBootEnabled) && strpos($gixi->SecureBootEnabled, "True") !== false){
+                $meta->platform["SecureBoot"] = "true";
+        }
+        $q ="select BootSourceType,InstanceID,FirmwareDevicePath,BootSourceDescription from Msvm_BootSourceSettingData where InstanceID like '%".  $uuid . "%'";
+        $out= agentWmiCmd($hostIP, $q , true);
+        $vset = agentParseWmi($out );
+        foreach($vset as $v){
+                if(isset($v->BootSourceType) && $v->BootSourceType == 3){
+                        $f = $v->FirmwareDevicePath;
+                        $d = $v->BootSourceDescription;
+                        if(strpos($f, "bootmgfw.efi")===false || $d != "Windows Boot Manager"){
+                                $efiStr = "$f|$d";
+                                $meta->platform["EFIBootFile"] = "$efiStr";
+                        }
+                }
+        }
+
+        $meta->VBDS = getVmVhdsHV($hostIP, $uuid);
+
+}
+
+function getDefaultVhdPathHV($ip){
+	$q =wrapPS("(get-VMHost).VirtualHardDiskPath", true);
+	$cmd = 'powershell -Command "'.$q.'"';
+        $out = array_filter(explode(PHP_EOL,agentRunCmd($ip, $cmd )));
+	checkHvResults($out[0]);
+	return trim($out[0]);
+}
+function createVmHV($ip, $vmName, $genType, $numCpus, $memoryMB, $vhds){
+	gen_log(LOG_DEBUG, "Creating VM $vmName");
+	$q = wrapPS("New-VM '" . $vmName . "' -Generation $genType -MemoryStartupBytes ". $memoryMB ."MB -NoVHD");
+	$cmd = 'powershell -Command "'.$q.'"';
+        $res = array_filter(explode(PHP_EOL,agentRunCmd($ip, $cmd )));
+	checkHvResults($res);
+
+        $q = wrapPS("Set-VMProcessor -VMName '" . $vmName . "' -Count $numCpus");
+	$cmd = 'powershell -Command "'.$q.'"';
+        $res = array_filter(explode(PHP_EOL,agentRunCmd($ip, $cmd)));
+	checkHvResults($res, false);
+
+	foreach($vhds as $v){
+		gen_log(LOG_DEBUG, "Attaching VHD to $vmName: $v");
+		$q = wrapPS("Add-VMHardDiskDrive -VMName '".$vmName."' -Path '". $v."'");
+		$cmd = 'powershell -Command "'.$q.'"';
+		$res = array_filter(explode(PHP_EOL,agentRunCmd($ip, $cmd)));
+		checkHvResults($res, false);
+	}
+	$uuid = getVmUuidHv($ip, $vmName);
+	return $uuid;
+}
+
+
+function getHostFromHV($ip){
+        $h = new stdClass();
+        $h->uuid = getOrMakeAlikeGuid($ip, true);
+        $h->poolID = $h->uuid;
+        $q =  "SELECT DNSHostName, Name,NumberOfProcessors,TotalPhysicalMemory,HypervisorPresent from Win32_ComputerSystem";
+        $out= agentWmiCmd($ip, $q );
+        $hvInfo1 = agentParseWmi($out);
+        $h->totalMem = $hvInfo1->TotalPhysicalMemory;
+        $h->numCPU = $hvInfo1->NumberOfProcessors;
+        $h->nativeName = $hvInfo1->Name;
+        $h->name = $ip;
+        $h->role = 0;
+        $h->type = 3;
+
+        $q = "SELECT Caption,Version,FreePhysicalMemory  from Win32_OperatingSystem";
+        $out= agentWmiCmd($ip, $q );
+        $hvInfo = agentParseWmi($out);
+        $h->osName = $hvInfo->Caption;
+        $h->freeMemory =$hvInfo->FreePhysicalMemory;
+
+        $h->username = json_encode(agentStatus($ip));
+        $h->password = "";
+        $h->isLicensed = 0;
+
+        return $h;
+}
+
+function getVmsOnHvHost($h, $extended=false){
+        $ip = $h->name;
+        $q =  "SELECT Name,ElementName,EnabledState,Caption FROM Msvm_ComputerSystem";
+        $out= agentWmiCmd($ip, $q , true);
+        $raws = agentParseWmi($out );
+        $vms = array();
+        foreach($raws as $v){
+                if(strpos($v->Caption, "Hosting Computer") !== false){
+                        continue;
+                }
+                $guy = new stdClass();
+                $guy->osName = "Unknown";
+                $guy->name = $v->ElementName;
+                $guy->uuid = $v->Name;
+                $guy->powerState = $v->EnabledState;
+                $guy->poolID = $h->poolID;
+                $guy->hostUUID = $h->uuid;
+		if($extended){
+			$guy->disks = getVmVhdsHV($ip, $guy->uuid);
+			$guy->ipaddress = getVmIpHV($ip, $guy->uuid);
+			$guy->size =0;
+			foreach($guy->disks as $d){ 
+				$guy->size += $d->size; 
+			}
+		}
+                array_push($vms, $guy);
+        }
+
+        return $vms;
+}
+
+function showHVProgress($eid, $msg, $jobID, $vmID, $devNum, $size){
+        $file = "/home/alike/Alike/temp/prog/$eid";
+        $prog = trim(file_get_contents($file));
+        gen_log(LOG_DEBUG, "Prog file: $file ($prog)");
+        // now we loop on that task progress and poop it to the joblog
+        $errCount=10;
+        while (true){
+                sleep(2);
+                $prog = trim(file_get_contents($file));
+                if(empty($prog)){
+                        $errCount--;
+                        if($errCount ==0){
+                                updateJobLog($vmsg." -- Error getting progress ",2, $veid);
+                                return;
+                        }
+                        $prog=0;
+                }else{
+                        $errCount=10;   // reset so only 10 in a row kills us
+                }
+                $state = 3;
+                if($prog == 100){ $state = 0; }
+                updateJobLog($msg." $prog%",$state, $eid);
+                updateProgTmpFile($jobID, $vmID, $devNum, $prog, $size);
+                if($prog >= 100){ break; }
+                if(checkForCancel($jobID)){
+                        // cancel stuff
+                        updateJobLog($vmsg." (cancelled): $prog%",2, $veid);
+                        return false;
+                }
+        }
+
+}
+
+
+
+function getVmUuidHv($ip, $name){
+	//$q = "(Write-Output Get-VM -Name '$name').Id";
+	$q = wrapPS("\$guid = (Get-VM -Name '".$name."').Id.Guid; Write-Output \$guid", true);
+//	$q = "\$ErrorActionPreference = 'Stop'; try { \$guid = (Get-VM -Name '".$name."').Id; Write-Output \$guid } catch { Write-Output ('ERROR: '+ \$_.Exception.Message.Trim()) }";
+	$cmd = 'powershell -Command "'.$q.'"';
+	$out = array_filter(explode(PHP_EOL,agentRunCmd($ip, $cmd)));
+	checkHvResults($out[0], false);
+	if (empty($out[0])){ return null; }
+	if(strpos($out[0], 'ERROR:') === 0){
+		gen_log(LOG_DEBUG, "HV found no VM with the name $name (". $out[0].")");
+		return null;
+	}else{
+		return trim($out[0]);
+	}
+}
+function powerOffVM($ip, $uuid){
+	$q = wrapPS("\$vm = Get-VM -Id '$uuid';  Stop-VM -VM \$vm -Force");
+	$cmd = 'powershell -Command "'.$q.'"';
+	$out = array_filter(explode(PHP_EOL,agentRunCmd($ip, $cmd )));
+	if (empty($out)){ return false; }
+	checkHvResults($out[0], false);
+
+	if(strpos($out[0], 'ERROR:') === 0){
+		return false;
+	}else{
+		gen_log(LOG_DEBUG, "HV stopped VM ($uuid) (". $out[0].")");
+		return true;
+	}
+}
+
+// quiet is for when you need to return results
+// otherwise, we insert a SUCCESS or ERROR in front of the returned results
+//
+function wrapPS($q, $quiet=false){
+	if($quiet){
+		return "\$ErrorActionPreference = 'Stop'; try { $q } catch { Write-Output ('ERROR: '+ \$_.Exception.Message.Trim()) }";
+	}else{
+		return "\$ErrorActionPreference = 'Stop'; try { $q; Write-Output 'SUCCESS' } catch { Write-Output ('ERROR: '+ \$_.Exception.Message.Trim()) }";
+	}
+}
+
+function checkHvResults($res, $throw=true){
+	$res = trim($res);
+	if(strpos($res, 'SUCCESS') === 0){
+		gen_log(LOG_DEBUG, "HV call succeeded ($res)");
+		return;
+	}
+	if(strpos($res, 'ERROR:') === 0){
+		gen_log(LOG_DEBUG, "HV call failed ($res)");
+		if($throw){
+			throw new Exception($res);
+		}
+	}
+
+}
+
+
+?>

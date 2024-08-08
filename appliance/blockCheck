@@ -1,0 +1,270 @@
+#!/usr/bin/php -q
+<?php
+
+include_once("/usr/local/sbin/common_lib");
+
+$GLOBALS['ep'] =  hex2bin(getSetting("blockPassword"));
+
+// This gets called by BKS before every job
+//
+$prog = basename($argv[0]);
+if(count($argv) <= 1){
+        $msg = "Insufficient parameters\n\n";
+        $msg .= "Usage: $prog <print>\n";
+	$msg .= "or -f <hcl file path>\n";
+	$msg .= "or -v <hcl file path> (vaults blocks)\n";
+        print $msg;
+	exit(1);
+}
+
+$doVault = false;
+$useOds = false;
+$single=true;
+$theBlock = "";
+if($argv[1] == "-f" || ($argc >= 3 && $argv[2] == "-f")){
+	if($argc < 3){ die("No file given\n"); }
+	 if($argv[1] == "-o") {
+                $useOds = true;
+		$argv[2] = $argv[3];
+        }
+
+	if(file_exists($argv[2]) == false){ die("HCL File not found: $argv[2]\n" ); }
+	$single=false;
+	
+} else if($argv[1] == "-v") {
+	$doVault=true;
+	if(!isset($argv[2])){
+		die("No HCL file provided!\n");
+	}
+} else {
+
+	if($argc > 2) {
+		if($argv[1] == "-o") {
+			$useOds = true;
+		}
+		$theBlock = $argv[2];
+	} else {
+		$theBlock = $argv[1];
+	}
+}
+if($useOds) {
+	echo "Will check blocks from ODS...\n";
+}
+	
+try{
+	if($doVault){
+		vaultBlocks($argv[2]);	
+	}else if($single){
+		processBlock($theBlock, $useOds, false);
+	}else{
+		processHCL($argv[2], $useOds);
+	}
+	exit(0);
+}catch(Exception $ex){
+	echo "Block check failed: ". $ex->getMessage() ."\n";
+	exit(1);
+}
+
+function processHCL($hcl, $useOds){
+	$start = time();
+	$cnt=0;
+	$badBlocks= array();
+	$handle = fopen($hcl, "r");
+	if (!$handle) {
+		throw new Exception("Failed to open HCL file: $hcl");
+	}
+	$blocks = (trim(shell_exec("wc -l $hcl")) -1);
+	echo "Processing $hcl ($blocks blocks)\n";
+	while (($line = fgets($handle)) !== false) {
+		$l = trim($line);
+		if($l == "CODA"){ break; }
+		try{
+			processBlock($l, $useOds);
+		}catch(Exception $ex){
+			echo "Block failed: ". $ex->getMessage() ."\n";
+			array_push( $badBlocks, $l);
+		}
+		$cnt++;
+	}
+	$sec = time() -  $start;
+	if($sec ==0){ $sec=1; }
+	$bps = round($cnt / $sec);
+	if(sizeof($badBlocks) > 0){
+		$baddies = sizeof($badBlocks);
+		echo "\nFound $baddies bad blocks!\n";
+		foreach($badBlocks as $b){
+			echo "$b\n";
+		}
+		echo "$cnt blocks total, $baddies bad blocks found. ($sec seconds, $bps blocks/sec)\n";
+	}else{
+		echo "$cnt blocks tested OK. ($sec seconds, $bps blocks/sec)\n";
+	}
+}
+
+function processBlock($print, $useOds, $silent=true){
+	$print = strtolower($print);
+	if($print == "59071590099D21DD439896592338BF95"){
+		if(!$silent){ echo "Skipping blank block\n"; }
+		return;
+	}
+
+	$pf = getBlockFile($print, $useOds);
+	if(!file_exists($pf)){ throw new Exception("Could not find block file: $pf"); }
+	$fs = filesize($pf);
+	if($fs <= 4){ throw new Exception("Block $print is abnormally small ($fs bytes).\nFile: $pf\n"); }
+	$fh = fopen($pf, "r");
+	$contents = fread($fh, $fs);
+	fclose($fh);
+
+	$h = unpack("C*",substr($contents,0,4));
+	$head = $h[1];
+	$payload = substr($contents,4);
+
+	$encrypted=0;
+	$compressed=false;
+	$out = "Block Header $head ";
+	if($head==18){
+		$out .= "(compress only)\n";
+		$encrypted=0;
+		$compressed=true;
+	}else if($head==80){
+		$out .= " (encrypt only [BF])\n";
+		$encrypted=0;
+		$compressed=false;
+	}else if($head==82){
+		$out .= "(compress encrypt [BF])\n";
+		$encrypted=1;
+		$compressed=true;
+	}else if($head==128 || $head == 144){
+		$out .= "(encrypt only [AES])\n";
+		$encrypted=2;
+		$compressed=false;
+	}else if($head==146 ){
+		$out .= "(compress encrypt [AES])\n";
+		$encrypted=2;
+		$compressed=true;
+	}else if($head==0){
+		$out .= " (no compress/encrypt)\n";
+		$encrypted=0;
+		$compressed=false;
+	}
+	if(!$silent){ echo $out; }
+
+	$blob = "";
+	$iv = substr(basename($print),0,32);
+	if($encrypted){
+		$blob = decrypt($payload, $GLOBALS['ep'],  $iv, $encrypted);
+                if($compressed){
+                        $blob = decompress($blob);
+                }
+	}else if($compressed){
+		$blob = decompress($payload);
+	}else{
+		$blob = $payload;
+	}
+
+
+	$calcPrint = strtoupper(md5($blob));
+	$theirs = strtoupper(substr(basename($print),0,32) );
+	if($calcPrint != $theirs){
+		throw new Exception("Block failed check: $theirs (our md5: $calcPrint )");
+	}
+	if(!$silent){ echo "Block checked OK\n"; }
+}
+
+
+function decompress(&$in, $skipHeader=true){
+	// our library needs padding, so let's add a bit
+        $pad = chr(0xF);
+        $tmp = $pad . $in;
+        //echo "MD5 predecom: " .md5($in)."\n";
+        $skip = 1;
+        $blob = lz4_uncompress($tmp, 512 * 1024, $skip);
+        if($blob== FALSE){
+                throw new Exception("Failed to decompress block!");
+        }
+        return $blob;
+
+}
+
+function getBlockFile(&$print, $useOds=false){
+	if(file_exists($print)){ return $print; }
+	$basey = "/mnt/ads/blocks/";
+	if($useOds) {
+		$basey = "/mnt/ods1/blocks/";
+	}
+        return $basey.substr($print, 0,3)."/$print";
+}
+function swapEnd($hex) {
+    return implode('', array_reverse(str_split($hex, 2)));
+}
+
+function decrypt($encData, $encPass,$iv, $type=2) {
+	if($type==2){
+		// THIS JIVES WITH JAVE
+		// AES
+		$binIV = hex2bin($iv);
+		$dec = openssl_decrypt($encData, "AES-256-CFB", $encPass, OPENSSL_RAW_DATA | OPENSSL_ZERO_PADDING , $binIV);
+		return $dec;
+	}else{
+		$m = md5($encPass) . md5($encPass);
+		$m = strtoupper($m);
+		$encPass = substr($m,0, 56);
+		$hex = bin2hex($encPass);
+		$iv = hex2bin("0000000000000000");
+		$cipher = "bf-cfb";
+		$raw = openssl_decrypt($encData, $cipher, $encPass, OPENSSL_RAW_DATA  | OPENSSL_ZERO_PADDING, $iv);
+		return $raw;
+	}
+}
+
+function vaultBlocks($hcl){
+	echo "Vaulting from HCL: $hcl\n";
+	if(!file_exists($hcl)){ echo "Could not find file: $hcl\n"; }
+	$tmp_file = tempnam(sys_get_temp_dir(), 'tmp.vblock');
+	exec("cat \"$hcl\" | grep -v CODA | sort -u > \"$tmp_file\"");
+	$numLines = count(file($tmp_file, FILE_IGNORE_NEW_LINES));
+	echo "$numLines unique blocks in hcl\n";
+	$ads = "/mnt/ads/blocks/";
+	$ods = "/mnt/ods1/blocks/";
+	$batchSize = 10;
+	$conc = 6;
+	$parallel = false;
+	if(file_exists("/usr/local/sbin/parallel")){ 
+		echo "Have parallel, concurrency: $conc\n";
+		$parallel = true; 
+	}else{ echo "No parallel, lineary copy\n"; }
+	$start = 1;
+	while ($start <= $numLines) {
+		$end = min($start + $batchSize - 1, $numLines);
+		$bLoad = implode("\n", array_slice(file($tmp_file, FILE_IGNORE_NEW_LINES), $start - 1, $end - $start + 1));
+		$bFile = tempnam(sys_get_temp_dir(), 'tmp.vblock.batch');
+		file_put_contents($bFile, $bLoad);
+		$runFile = tempnam(sys_get_temp_dir(), 'tmp.vblock.run');
+		foreach (file($bFile, FILE_IGNORE_NEW_LINES) as $print) {
+			$pFolder = substr($print, 0, 3);
+			$src = $ads."$pFolder/$print";
+			$dst = $ods."$pFolder/$print";
+			if($parallel){
+				exec("echo \"cp -n $src $dst\" >> $runFile");
+				//echo "$src -> $dst\n";
+			}else{
+				echo "No parallel, just copy $src -> $dst\n";
+//				exec("cp -n $src $dst");
+			}
+		}
+		if($parallel){
+			echo "\rRunning Batch $start    ";
+//			exec("cat $runFile | /usr/local/sbin/parallel -j $conc || exit 1 2>/dev/null");
+			echo "\rdone    ";
+		}
+		unlink($bFile);
+		unlink($runFile);
+		$start = $end + 1;
+	}
+	echo "\rDone!\n";
+	unlink($tmp_file);
+}
+
+?>
+

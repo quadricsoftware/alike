@@ -1,0 +1,773 @@
+<?php
+include_once("/usr/local/sbin/common_lib");
+include_once("/usr/local/sbin/shared_lib");
+
+$GLOBALS["xe_cmd"] = "/usr/bin/xe";
+$GLOBALS["xe_bad"] = array("Unable to contact server", "Authentication failed", "Error code:", "You cannot make regular API calls directly on");
+
+//  echo shell_exec("sudo /usr/local/sbin/startAlike");
+// exec("touch /home/alike/Alike/agentShare/seed");
+
+/*
+ * Please gimmi the hostID of the Xen guy you wanna talk to
+ */
+function connectXapiByPool($poolID){
+        $guy = getPoolMasters($poolID);
+        $hid = $guy[0];
+        //echo "Master for pool $p is hostid: $hid\n";
+        xen_connect($hid);
+}
+
+function connectXapiByVm($vmUuid){
+        $masters = getPoolMasters();
+        $out = array();
+        foreach($masters as $m){
+                try{
+                        xen_connect($m);
+			if(vmExistsXen($vmUuid)){ return $m; }
+                }catch(Exception $ex){
+                        gen_log(LOG_WARNING, "Failed to connect to host ($m->name) in connectByVm: ". $ex->getMessage());
+                }
+        }
+        return null;
+}
+
+function xen_connect($hostId) { 
+	$h = getHost($hostId);
+	$GLOBALS["host"] = $h;
+	set_xen_env();
+}
+
+function set_xen_env(){
+	$h = $GLOBALS["host"];
+	$myPass = $h->password;
+	$myPass = str_replace(',', '\,', $myPass);
+	$foo = <<< END
+XE_EXTRA_ARGS=server=%s,username=%s,password=%s
+END;
+	$foo = sprintf($foo, $h->name, $h->username, $myPass);
+	putenv($foo);
+}
+
+function xen_call($cmd, ...$args) {
+	if(getenv("XE_EXTRA_ARGS") == false) {
+		throw new ErrorException("authToXen not yet called!");
+	}
+	$cmd1 = $GLOBALS["xe_cmd"] ." $cmd ".implode($args, ' ')." 2>&1";
+	//echo "CMD is $cmd1\n";
+	$returnMe = shell_exec($cmd1);
+	foreach($GLOBALS["xe_bad"] as $bad) {
+		//echo "$returnMe vs $bad\n\n";
+		if(substr($returnMe, 0, strlen($bad)) === $bad) {
+			if(strpos($returnMe, "Master IP address:") !== false){
+				$ip = trim(substr($returnMe,strpos($returnMe, "Master IP address: ")+19));
+				//echo "Redirected to Master: |$ip|\n";
+				$GLOBALS["host"]->name = $ip;
+				set_xen_env();
+				return xen_call($cmd, implode($args, ' '));
+			}
+			throw new ErrorException("Xen returned error: $returnMe");
+		}
+	}
+	return $returnMe;
+	
+}
+
+// returns JSON array
+function parse_xen_result($raw){
+	$raw = explode("\n\n",$raw);	// taken directly from xen_call output
+        $res = array();
+        foreach($raw as $v){ 
+                if(!empty(trim($v) )){
+                        array_push($res, parse_ents($v));
+                }
+        }
+        return json_encode($res);
+}
+
+function parse_ents($raw, $clean=true){
+        $res = [];
+	$raw = trim($raw);
+        $raw2 = explode("\n",$raw);
+        foreach($raw2 as $v){ 
+                // eg.   platform (MRW): hpet: true; nx: true; secureboot: false; pae: true; apic: true; viridian: true; acpi: 1 
+                $sp = strpos($v,":"); 
+                if($sp !== false){ 
+                        $key = substr($v, 0 ,$sp);
+                        $val = substr($v, $sp +1);
+                        $key = trim($key);
+                        if($clean){
+                                $r3 = explode("(",$key);
+                                $key = trim($r3[0]);
+                        }
+                        $res[$key] = parse_subent(trim($val) );
+                }
+        }
+        return $res;
+}
+
+function parse_subent($val){
+        if(strpos($val,": ") !== false){ 
+                if(strpos($val,";") !== false){ 
+                        $out = [];
+                        $bits = explode(";",$val);
+                        foreach($bits as $v){ 
+                                $o = parse_subent($v);
+                                $out[trim($o[0])] = trim($o[1]);
+                        }
+                        $val = $out; 
+                }else{
+			$out = array();
+                        $tmp1 = explode(": ",$val);
+			foreach($tmp1 as $t){
+				array_push($out, trim($t) );
+			}
+			$val = $out;
+                }
+        }else if(strpos($val,";") !== false){ 
+		$out = array();
+                $tmp1 = explode(";",$val);
+		foreach($tmp1 as $t){
+			array_push($out, trim($t) );
+		}
+		$val = $out;
+        }
+        return $val;
+}
+
+function validateRez($rez, $msg="Xen call failed") {
+	$rez = trim($rez);
+	if(stripos($rez, "invalid") !== false) {
+		throw new ErrorException("$msg: $rez");
+	}
+}
+
+/*
+ * Tells us about a VHD file
+ */
+function xen_vdiMeta($vhdFileName) {
+	if(!file_exists($vhdFileName)){
+		throw new Exception("VHD File doesn't exist! ($vhdFileName)");
+	}
+	$f = fopen($vhdFileName, "r");
+	try {
+		fseek($f, 40);
+		$size = implode(unpack("J", fread($f, 8)));
+		fseek($f, 60);
+		$type = implode(unpack("N", fread($f, 4)));
+		fseek($f, 68);
+		$guid = xen_bytesToUuid(fread($f, 16));
+		fseek($f, 512 + 40);
+		$parent = xen_bytesToUuid(fread($f, 16));
+		fseek($f, 512 + 64);
+		$parentPath = fread($f, 80);
+		$parentPath = mb_convert_encoding($parentPath, "UTF-8", "UTF-16BE");
+		$outy = array();
+		$outy["size"] = $size;
+		$outy["type"] = $type;
+		$outy["guid"] = $guid;
+		$outy["pGuid"] = $parent;
+		$outy["pPath"] = $parentPath;
+		return $outy;
+	} finally {
+		fclose($f);
+	}
+}
+
+
+function xen_bytesToUuid($bites) {
+	$b1 = implode(unpack("H*", substr($bites, 0, 4)));
+        $b2 = implode(unpack("H*", substr($bites, 4, 2)));
+        $b3 = implode(unpack("H*", substr($bites, 6, 2)));
+        $b4 = implode(unpack("H*", substr($bites, 8, 8)));
+        $b4a = str_split($b4, 4);
+        $b4b = implode(array_slice($b4a,1));
+        $guid = "$b1-$b2-$b3-$b4a[0]-$b4b";
+	return $guid;
+}
+
+########################################################################## Xen Wrapper like crap ##########################
+
+
+function getXenSpecificMeta($vm, $uuid, &$meta){
+	if(!vmExistsXen($uuid)){ throw new Exception("VM [$uuid] not found!"); }
+        $ip = $vm->ip;
+        $res = xen_call("vm-param-list uuid=$uuid");
+        $inf = parse_xen_result($res);
+        $ar = json_decode($inf, true);
+        $inf = $ar[0];
+        $memory = $inf["memory-static-max"];
+        $numCpus = $inf["VCPUs-max"];
+
+	foreach($inf["platform"] as $k=>$v){
+		$meta->platform[$k] = $v;
+	}
+
+	$hasEfi = false;
+	if (array_key_exists('firmware',$inf["HVM-boot-params"])){
+		foreach($inf["HVM-boot-params"] as $k=>$v){
+			$meta->hVMBootParams[$k] = $v;
+			if($v == "uefi"){
+				$hasEfi = true;
+			}
+		}
+	}
+
+	if($hasEfi){
+		$raw = json_decode(parse_xen_result(xen_call("vm-param-get param-name=NVRAM uuid=$uuid")), true);
+		$efi = $raw[0]["EFI-variables"];
+		$meta->hVMBootParams["__efi"] = $efi;
+		$meta->hVMBootParams["firmware"] = "uefi";
+	}
+
+        $meta->numCPUs =$numCpus;
+        $meta->memory = $memory;
+        $meta->memoryStaticMax = $memory;
+        $meta->memoryStaticMin = $memory;
+        $meta->memoryDynamicMax = $memory;
+        $meta->memoryDynamicMin = $memory;
+
+        $meta->description =  $inf["name-description"];
+	if(is_numeric($meta->description)){ $meta->description .=  " "; }	// numeric descriptions can make mono conversion fail
+	if( is_array($meta->description)){ $meta->description = implode("; ",$meta->description); }
+
+        $meta->pVArgs =$inf["PV-args"];                 //
+        $meta->pVBootloader=$inf["PV-bootloader"];                      //
+        $meta->pVBootloaderArgs=$inf["PV-bootloader-args"];             //
+        $meta->pVKernel=$inf["PV-kernel"];
+        $disks = getDisksXen($uuid,true);
+        foreach($disks as $d){
+                $tmp = new stdClass();
+                $tmp->name = $d->name_label;
+                $tmp->description = "Disk $d->userdevice description";
+                $tmp->uuid = $d->vdi_uuid;
+                $tmp->size = $d->size;
+                $tmp->bootable = false;
+                $tmp->device = $d->device;
+                $tmp->userdevice = $d->userdevice;
+                $tmp->type = 1;
+                if($tmp->userdevice == 0){
+                        $tmp->bootable = true;
+                }
+                array_push($meta->VBDS, $tmp);
+        }
+        $meta->VIFS = getVifsXen($uuid);
+}
+function getVifsXen($uuid){
+        $res = trim(xen_call("vm-vif-list  uuid=\"$uuid\""));
+        $inf = json_decode(parse_xen_result($res), true);
+
+        $vif = array();
+        $tmp = new stdClass();
+        foreach($inf as $v){
+                // netuuid, mac, mtu
+                $tmp = new stdClass();
+                $tmp->uuid = $v["network-uuid"];
+                $tmp->netuuid = $v["network-uuid"];
+                $tmp->mac = $v["MAC"];
+                $tmp->mtu = 1500;
+                $tmp->netname = "";
+                array_push($vif, $tmp);
+        }
+        return $vif;
+}
+function getDisksXen($uuid,$getDevice, $isSnap=false){
+	$q = "vm-disk-list";
+	if($isSnap){ $q = "snapshot-disk-list"; }
+        $res = trim(xen_call("$q  uuid=\"$uuid\""));
+        $inf = json_decode(parse_xen_result($res), true);
+        $disks = array();
+        $tmp = new stdClass();
+        foreach($inf as $d){
+                if (array_key_exists('userdevice',$d)){
+                        // we're a VBD
+                        $tmp->userdevice = $d["userdevice"];
+                        $tmp->vbd_uuid = $d["uuid"];
+                }else{
+                        // we're a VDI
+			
+                        $tmp->name_label = $d["name-label"];
+			if( is_array($tmp->name_label)){ $tmp->name_label = implode("; ",$tmp->name_label); }
+
+                        $tmp->vdi_uuid = $d["uuid"];
+                        $tmp->size = $d["virtual-size"];
+			$tmp->type =1;
+                        array_push($disks, $tmp);
+                        $tmp = new stdClass();
+                }
+        }
+	if($getDevice){
+		// we need to grab the device (ie xvda, xvdb, etc), which is part of the vbd
+		foreach($disks as $d){
+			$dev = trim(xen_call("vbd-param-get param-name=device uuid=$d->vbd_uuid"));
+			$d->device = $dev;
+			$dev = trim(xen_call("vdi-param-get param-name=sr-uuid uuid=$d->vdi_uuid"));
+			$d->sr_uuid = $dev;
+		}
+	}
+        usort($disks, "diskCmp");
+        return $disks;
+}
+// a sort just for xen disks
+function diskCmp($a, $b){
+        if($a->userdevice == $b->userdevice){ return 0; }
+        return ($a->userdevice < $b->userdevice) ? -1 : 1;
+}
+
+function takeSnapshotXen($uuid, $snapName){
+        $res = trim(xen_call("vm-snapshot  uuid=\"$uuid\" new-name-label=\"$snapName\""));
+        $uuid = trim($res);
+	if(!isValidXenUuid($uuid)){
+		throw new Exception($uuid);
+	}
+	return $uuid;
+}
+// ie. disk and memory snapshot
+function takeCheckpointXen($uuid, $snapName){
+        $res = trim(xen_call("vm-checkpoint  uuid=\"$uuid\" new-name-label=\"$snapName\""));
+        $uuid = trim($res);
+	if(!isValidXenUuid($uuid)){
+		throw new Exception($uuid);
+	}
+	return $uuid;
+}
+
+function deleteSnapshotXen($uuid, $killDisks=false ){
+	if(empty($uuid)){ return; }
+
+	if($killDisks){
+		$res = trim(xen_call("snapshot-reset-powerstate force=true uuid=\"$uuid\""));
+		gen_log(LOG_DEBUG, "Absurd snapshot shutdown call: $res");
+		$disks = getDisksXen($uuid,false, true);
+		$res = trim(xen_call("snapshot-destroy  uuid=\"$uuid\""));
+		gen_log(LOG_DEBUG, "deleted snapshot?  res: $res");
+		foreach($disks as $d){
+			if(!empty($d->vbd_uuid)){
+				// no unplugging from a non-running VM
+				$res = deleteVBD($d->vbd_uuid);
+				gen_log(LOG_DEBUG, "Destroyed VBD $d->vbd_uuid with res: $res");
+			}
+			$res = deleteVDI($d->vdi_uuid);
+			//gen_log(LOG_DEBUG, "Destroyed VDI $d->vdi_uuid with res: $res");
+		}
+	}else{
+		$res = trim(xen_call("snapshot-destroy  uuid=\"$uuid\""));
+		gen_log(LOG_DEBUG, "deleted snapshot?  res: $res");
+	}
+
+	return $res;
+}
+
+function deleteVmXen($uuid, $killDisks=false ){
+        if(empty($uuid)){ return; }
+
+        if($killDisks){
+                $res = trim(xen_call("vm-shutdown force=true uuid=\"$uuid\""));
+                $disks = getDisksXen($uuid,false, false);
+                $res = trim(xen_call("vm-destroy  uuid=\"$uuid\""));
+                gen_log(LOG_DEBUG, "deleted vm?  res: $res");
+                foreach($disks as $d){
+                        // no unplugging from a non-running VM
+                        $res = deleteVBD($d->vbd_uuid);
+                        gen_log(LOG_DEBUG, "Destroyed VBD $d->vbd_uuid with res: $res");
+                        $res = deleteVDI($d->vdi_uuid);
+                        gen_log(LOG_DEBUG, "Destroyed VDI $d->vdi_uuid with res: $res");
+                }
+        }else{
+                $res = trim(xen_call("vm-destroy  uuid=\"$uuid\""));
+                gen_log(LOG_DEBUG, "deleted vm (but left disks)?  res: $res");
+        }
+
+        return $res;
+}
+
+
+function getVmPowerStateXen($uuid){
+	$res = trim(xen_call("vm-param-get param-name=\"power-state\" uuid=\"$uuid\""));
+	return $res;
+}
+
+
+function unplugVBD($uuid){
+        if(empty($uuid)){ return; }
+        echo "Unplugging VBD $uuid\n";
+        $res = trim(xen_call("vbd-unplug uuid=$uuid"));
+        gen_log(LOG_DEBUG, "Unplugged VBD $uuid with res: $res");
+	return $res;
+}
+
+// deletes a VBD (the link between a VM and an VHD)
+// assumes a XEN connection exists
+function deleteVBD($uuid){
+        if(empty($uuid)){ return; }
+        echo "Deleting VBD $uuid\n";
+        $res = trim(xen_call("vbd-destroy uuid=$uuid"));
+	if( strpos($res, "was invalid")!== false){
+		return false;
+	}
+        gen_log(LOG_DEBUG, "Deleted VBD $uuid with res: $res");
+	return $res;
+}
+
+// deletes a VDI (the ACTUAL VHD)
+// assumes a XEN connection exists
+function deleteVDI($uuid){
+        if(empty($uuid)){ return; }
+        echo "Deleting VDI $uuid\n";
+        $res = trim(xen_call("vdi-destroy uuid=$uuid"));
+        gen_log(LOG_DEBUG, "Deleted VDI $uuid with res: $res");
+	return $res;
+}
+
+function vmExistsXen($uuid){
+	$res = trim(xen_call("vm-param-get param-name=\"uuid\" uuid=\"$uuid\""));
+	if( strpos($res, "was invalid")!== false){
+		return false;
+	}
+	return true;
+}
+
+//// CBT functions
+function getVDIsFromMeta($uuid){
+	// look for "alike-cbt-vdis" in the xenstore-data
+	// get the string and split on commas
+}
+function addVDIsToMeta($uuid){
+	// get vdi_uuids for all disks
+	// concatenate the vdis w/ commas (not at end)
+	// add to xenstore_data "alike-cbt-vdis"
+}
+
+function getChangeBitmapXen($oldUuid, $newUuid){
+	$cmd = "vdi-list-changed-blocks vdi-from-uuid=$oldUuid vdi-to-uuid=$newUuid";
+	$bmp = trim(xen_call($cmd));
+
+	return base64_decode($bmp);
+}
+
+function setIsTemplateXen($uuid, $isTemp){
+	$cmd = "template-param-set is-a-template=false uuid=$uuid";
+	if($isTemp == true){
+		$cmd = "template-param-set is-a-template=true uuid=$uuid";
+	}
+	return trim(xen_call($cmd));
+}
+
+function getVmUuidXen($name, $isTemplate=false){
+	$cmd = "vm-list name-label=\"$name\"";
+	if($isTemplate){ $cmd = "template-list name-label=\"$name\""; } 
+	$res = 	json_decode(parse_xen_result(xen_call($cmd)));
+	return $res[0]->uuid;
+}
+
+function startVmXen($uuid){
+	$cmd = "vm-start uuid=$uuid";
+	return trim(xen_call($cmd));
+}
+function setVmNameXen($uuid, $name){
+	$cmd = "vm-param-set uuid=$uuid name-label=\"$name\"";
+	return trim(xen_call($cmd));
+}
+
+function setLastCbtSnapDefunct($uuid, $snapName){
+	xen_call("vm-param-set xenstore-data:\"vm-data/lastCBT=$snapName\" uuid=\"$uuid\"");
+}
+
+function getLastCbtSnapDefunct($uuid){
+	$cmd = "vm-param-get param-name=xenstore-data uuid=\"$uuid\"";
+        $res = trim(xen_call($cmd));
+	$last = null;
+        if(strpos($res, "lastCBT") !== false){ 
+                $dat = json_decode(parse_xen_result($res), true);
+                $last = $dat[0]["vm-data/lastCBT"];
+        }
+	return $last;
+}
+
+function getVmsByTag($tag){
+	$masters = getPoolMasters();
+	$out = array();
+	foreach($masters as $m){
+		try{
+			xen_connect($m);
+			$h = getHost($m);
+			$cmd = "vm-list tags:contains=\"$tag\"";
+			$vms = json_decode(parse_xen_result(xen_call($cmd)));
+			foreach($vms as $v){
+				$v->poolID = $h->poolID;
+				$v->poolName = $h->poolName;
+				array_push($out, $v);
+			}
+		}catch(Exception $ex){
+			gen_log(LOG_WARNING, "Failed to enumerate VMs by Tag: ". $ex->getMessage());
+		}
+        }
+	return $out;
+}
+
+function addTagToVmXen($uuid, $tag){
+	$cmd = "vm-param-add uuid=$uuid param-name=tags param-key=$tag";
+        $res = trim(xen_call($cmd));
+	return $res;
+}
+
+function delTagFromVmXen($uuid, $tag){
+	$cmd = "vm-param-remove uuid=$uuid param-name=tags param-key=$tag";
+        $res = trim(xen_call($cmd));
+	return $res;
+
+}
+
+function getHomeHostXen($uuid ){
+        $state = trim(xen_call("vm-param-get param-name=\"power-state\" uuid=\"$uuid\""));
+        if($state  == "running"){
+		$home= trim(xen_call("vm-param-get param-name=\"resident-on\" uuid=\"$uuid\""));
+		return $home;
+        }
+	$home= trim(xen_call("vm-param-get param-name=\"affinity\" uuid=\"$uuid\""));
+	if(strpos($home, "not in database") !== false){
+		return null;
+	}
+	return $home;
+
+        $res = trim(xen_call("vm-param-get param-name=\"possible-hosts\" uuid=\"$uuid\""));
+        $possible = explode("; ", $res);
+	if(sizeof($possible)==1){ return $possible[0]; }	// this vm probably lives on local storage for that host
+
+	return null;	// not homed, not running
+}
+
+// for the standard xen shadow vm snapshot process
+function detachDisksFromVmXen($uuid ){
+        $disks = getDisksXen($uuid, true);
+	$pstate = getVmPowerStateXen($uuid);
+        foreach($disks as $d){
+		$res1="";
+		if($pstate == "running"){ $res1 = unplugVBD($d->vbd_uuid); }
+                $res2 = deleteVBD($d->vbd_uuid);
+		gen_log(LOG_DEBUG, "Detached VBD ($d->vbd_uuid) res: $res1, delete: $res2");
+        }
+}
+// plug just one
+function attachDiskToVmXen($uuid,$vdiUuid, $plug, $device){
+        $vbd = trim(xen_call("vbd-create", "vdi-uuid=$vdiUuid", "vm-uuid=$uuid", "device=$device"));
+	if(!isValidXenUUID($vbd)){
+		throw new Exception("Failed to attach VDI ($vdiUuid) to VM.  Xen error: $vbd");
+	}
+        if($plug){ xen_call("vbd-plug", "uuid=$vbd"); }
+}
+// gotta plug 'em all
+function attachDisksToVmXen($abdUuid, $disks, $plug, $doGFS=false){
+        $dev =1;
+	$extras = array();
+        foreach($disks as $d){
+		$shim = $d->vdi_uuid;
+		if($doGFS){
+                        $shim = trim(xen_call("vdi-clone", "uuid=$d->vdi_uuid"));
+                        $res = trim(xen_call("vdi-destroy", "uuid=$d->vdi_uuid"));
+			gen_log(LOG_DEBUG, "GFS vdi cleaned (orig: $d->vdi_uuid) shim: $shim ($res)");
+			array_push($extras, $shim);
+		}
+                $vbd = xen_call("vbd-create", "vdi-uuid=$shim", "vm-uuid=$abdUuid", "device=$dev" );
+		if(!isValidXenUUID($vbd)){
+			throw new Exception("Failed to attach disk to VM.  Xen error: $vbd");
+		}
+
+                if($plug){
+                        xen_call("vbd-plug", "uuid=$vbd");
+                }
+                $dev++;
+        }
+	return $extras;
+}
+
+function isSrGfs($uuid){
+	if(empty($uuid)){ 
+		gen_log(LOG_DEBUG, "Asked to check SR type for VDI, but given a blank uuid");
+		return false; 
+	}
+	$srUuid = trim(xen_call("vdi-param-get param-name=sr-uuid uuid=$uuid"));
+	if(!isValidXenUUID($srUuid)){
+		gen_log(LOG_WARNING, "(isSrGfs) Xen/XAPI: vdi-param-get returned error: $srUuid");
+		return false;
+	}
+	$type = trim(xen_call("sr-param-get param-name=type uuid=$srUuid"));
+	if($type == "gfs2"){ return true; }	
+	return false;
+}
+
+
+function hideVmXen($uuid){
+	return xen_call("vm-param-set other-config:\"HideFromXenCenter=true\" uuid=\"$uuid\"");
+}
+
+
+function makeBlankVmXen($name, $srId=null, $templateName="Other install media"){
+        $cmd = "vm-install new-name-label=\"$name\" template=\"$templateName\"";
+	if(!empty($srId)){
+		$cmd = "vm-install new-name-label=\"$name\" sr-uuid=$srId template=\"$templateName\"";
+	}
+        $out= trim(xen_call($cmd));
+	if(stripos($out, "invalid") !== false) {
+		;
+	} else {
+		// Sometimes templates poop disks. Unpoop them.
+		$uuid = $out;
+		$disks = getDisksXen($uuid,true);
+
+        	foreach($disks as $d){
+                	unplugVBD($d->vbd_uuid);
+	                deleteVBD($d->vbd_uuid);
+        	        deleteVDI($d->vdi_uuid);
+	        }
+
+		/* for($x = 0; $x < 10; ++$x) {
+			$cmdo = "vm-disk-remove uuid=$out device=$x";
+			$newOut = trim(xen_call($cmdo));
+			//gen_log(LOG_DEBUG, $newOut);
+		}*/
+	}
+
+        return $out;
+}
+
+function vdiExists($uuid){
+	$out = json_decode(parse_xen_result(xen_call("vdi-list uuid=\"$uuid\"")));
+	if(empty($out)){ echo "empty vdi $uuid\n"; return false;}
+	else if(!is_object($out[0])){ echo "not an object\n"; return false; }
+	if(trim($out[0]->uuid) == $uuid){ return true; }
+	return false;
+}
+
+function getVmMemory($uuid){
+	$mem = trim(xen_call("vm-param-get param-name=memory-static-max uuid=$uuid"));
+	return $mem;
+}
+
+function getXenTemplates($poolID, $justDefaults=false){
+	$cacheAge = 300;
+	$cacheFile = "/tmp/wscache/templates_$poolID";
+	if(file_exists($cacheFile)){
+		$last = filemtime($cacheFile);
+		if(time() - $last <= $cacheAge){
+			return json_decode(file_get_contents($cacheFile));
+		}
+	}
+	$out = array();
+        $cmd = "template-list";
+	$templates = json_decode(parse_xen_result(xen_call($cmd)));
+	foreach($templates as $t){
+		if (strpos($t->{'name-label'}, "ABD")){ continue; }
+		array_push($out, $t);
+	}
+	if($justDefaults){
+		$out2 = array();
+		foreach($out as $o){
+			$res = json_decode(xen_call("template-param-get param-name=is-default-template uuid=$o->uuid"));
+			if($res){
+				array_push($out2, $o);
+				//echo $o->{'name-label'} ." is a default template\n";
+			}
+		}
+		$out = $out2;
+	}
+
+	$out3 = array();
+	foreach($out as $o){
+		array_push($out3, $o->{'name-label'});
+	}
+	sort($out3);
+
+	file_put_contents($cacheFile, json_encode($out3));
+	
+	return $out3;
+}
+
+
+function createVdiForVm($vmUuid, $bytes, $srUuid, $vdiName, $vdiDesc, $type="user"){
+	// for memory-disks, type = suspend
+	//echo "Creating VDI: vdi-create: virtual-siz=$bytes, vm-uuid=$vmUuid, type=$type, sr-uuid=$srUuid, name-label=$vdiName\n";
+        $vdi = trim(xen_call("vdi-create", "virtual-size=$bytes", "vm-uuid=$vmUuid", "type=$type", "sr-uuid=$srUuid", "name-label=\"$vdiName\"", "description=\"$vdiDesc\""));
+        if(stripos($vdi, "invalid") !== false) { 
+                throw new ErrorException("Cannot create VDI.  Xen returned: $vdi");
+        }
+	return trim($vdi);
+}
+
+function uploadVhd($vhd, $uuid){
+        $vdi = trim(xen_call("vdi-import", "uuid=$uuid", "filename=$vhd", "format=vhd"));
+        if(stripos($vdi, "invalid") !== false) { 
+                throw new ErrorException("Cannot import VDI ($vhd, $uuid).  Xen returned: $vdi");
+        }
+	return $vdi;
+}
+
+function uploadRaw($raw, $uuid){
+	//gen_log(LOG_DEBUG, "vdi-import uuid=$uuid filename=$raw format=raw");
+        $vdi = trim(xen_call("vdi-import", "uuid=$uuid", "filename=$raw", "format=raw"));
+	//if(!isValidXenUUID($vdi)){
+	// Blank result is a success, normally
+        if(stripos($vdi, "invalid") !== false) { 
+                throw new ErrorException("Cannot import VDI ($raw, $uuid).  Xen returned: $vdi");
+        }
+        return $vdi;
+}
+
+// we should already be connected!
+function getHostsFromXen(){
+        $res = xen_call("pool-list" );
+        $pool = json_decode(parse_xen_result($res), true);
+        $poolid = $pool[0]["uuid"];
+	$master = $pool[0]["master"];
+
+	$hosts = array();
+
+	$res = xen_call("host-list" );
+        $guy = json_decode(parse_xen_result($res), true);
+        foreach($guy as $g){
+                $res = xen_call("host-param-list", "uuid=".$g["uuid"] );
+		$resp = json_decode(parse_xen_result($res), true);
+		$det = $resp[0];
+		$ip = $det["address"];
+
+		$h = new stdClass();
+		$h->uuid = $det["uuid"];
+		$h->nativeName = $det["name-label"];
+		$h->name = $det["address"];
+		$h->type = 2;
+		$h->poolID = $poolid;
+		$h->role = 0;
+		$h->ip = $det["address"];
+		if($h->uuid == $master){ $h->role =1; }
+
+		$cpu = $det["cpu_info"];
+		$soft = $det["software-version"];
+		$h->numCPU = $cpu["socket_count"];
+		$h->totalMem = $det["memory-total"];
+		$h->osName = $soft["product_brand"] ." ".$soft["product_version_text"];
+		$h->username = "";
+		$h->password = "";
+		$h->isLicensed =0;
+		array_push($hosts, $h);
+	}
+	return $hosts;
+}
+
+function getInternalNet(){
+	$res = json_decode(parse_xen_result(xen_call("network-list")));
+	foreach($res as $n){
+		if(stripos($n->{'name-label'}, "Host internal management") !== false){
+			return $n->uuid;
+		}
+	}
+	return null;
+}
+
+function isValidXenUUID($uuid) {
+	$uuid = trim($uuid);
+	$reg = '/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/';
+	$res = preg_match($reg, $uuid) === 1;
+	return $res;
+}
+
+?>

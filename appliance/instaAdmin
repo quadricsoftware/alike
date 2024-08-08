@@ -1,0 +1,135 @@
+#!/usr/bin/php -q
+<?php
+
+include_once("insta_common");
+include_once("engine_common");
+
+if(count($argv) < 2){
+	echo "Commands are listVmHosts plugSrToHost importVm linkVhd\n";
+	return;
+}
+
+if($argv[1] == "listVmHosts") {
+	$hashy = listInstaVmHosts();
+	foreach($hashy as $r) {
+                $vm = $r["vm"];
+		$host = $r["host"];
+		$diskStr = array();
+		$vdis = $r["disks"];
+		foreach($vdis as $v) {
+			$diskStr [] = $v['rfs'];
+		}
+		$diskStr = implode($diskStr, ',');
+                echo "VM $vm is running on host $host from restoreFs paths [ $diskStr ]\n";
+        }
+
+	//var_dump($hashy);
+}
+if($argv[1] == "plugSrToHost") {
+	$hostId = $argv[2];
+	$h = getHost($hostId);
+	echo "Plugging instaboot SR to host $hostId $h->uuid\n";
+	try{
+		plugInstaSr($hostId, $h->uuid);
+	}catch(Exception $ex){
+		gen_log(LOG_ERR,"Xen Error with SR: ". $ex->getMessage() );
+	}
+}
+
+if($argv[1] == "unplugSrToHost") {
+	$hostId = $argv[2];
+        $h = getHost($hostId);
+        echo "Plugging instaboot SR to host $hostId $h->uuid\n";
+	unPlugInstaSr($hostId, $h->uuid);
+}
+
+
+if($argv[1] == "importVm") {
+	$hostId = $argv[2];
+	$vmId = $argv[3];
+	throw new ErrorException("Use setXenMeta for now....");
+	//importVm($hostId, $vmId);
+	
+}
+
+if($argv[1] == "linkVhd") {
+	echo importVdi($argv[2]);
+	echo "\n";
+}
+
+if($argv[1] == "vhdMeta") {
+	print_r(xen_vdiMeta($argv[2]));
+	echo "\n";
+}
+if($argv[1] == "eclMeta") {
+	print_r(engine_getMetaInfoDecoded($argv[2]));
+}
+
+if($argv[1] == "listInstaVhds") {
+	echo implode(getInstaVhds(), "\n");
+	echo "\n";
+}
+
+if($argv[1] == "mapInstaVhds") {
+	$rez =instaVhdToRestoreFsPaths();
+	//var_dump($rez);
+	foreach($rez as $k => $v) {
+		$k = preg_split("/\//", $k);
+		$k = end($k);
+		echo "$v is shared as $k\n";
+	}
+}
+
+if($argv[1] == "attachVdis") {
+	$rez = attachVdis($argv[2], $argv[3], $argv[4], $argv[5]);
+}
+
+if($argv[1] == "instaBootVm") {
+	$myArray = array_slice($argv, 2);
+	$rez = instaBootVm(...$myArray);
+}
+
+if($argv[1] == "listLockedVersions") {
+	$GLOBALS["__disable_console_out"] = true;
+	$rez = getLockedVersions();
+	// Let them know we actually executed something
+	// and aren't in an error state
+	if(empty($rez)) {
+		echo "EMPTY";
+	}
+	foreach($rez as $r) {
+		$siteId = $r["siteId"];
+		$uuid = $r["uuid"];
+		$ts = $r["ts"];
+		echo "$siteId:$uuid:$ts\n";
+	}
+}
+
+if($argv[1] == "extractMeta") {
+	$rez = engine_getMetaInfoDecoded($argv[2]);
+	$foo = json_encode($rez); 
+	echo "$foo\n";
+}
+if($argv[1] == "encodeMeta") {
+	$json = file_get_contents($argv[2]);
+	$json = trim($json);
+	$rez = engine_getMetaInfoEncoded($json);
+	echo $rez;
+}
+if($argv[1] == "findOrphans") {
+	$timey = getUpgradeTimestamp();
+	$rez = findOrphanSyms($timey);
+	foreach($rez as $r) {
+		echo "$r\n";
+	}
+}
+if($argv[1] == "cleanOrphans") {
+	cleanOrphanSyms();
+}
+if($argv[1] == "chains") {
+	$rez = findVhdChainsFromRestoreFsOnly();
+	var_dump($rez);
+}
+
+
+?>

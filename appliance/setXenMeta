@@ -1,0 +1,266 @@
+#!/usr/bin/php -q
+<?php
+
+include_once("/usr/local/sbin/common_lib");
+include_once("xen_common");
+include_once("insta_common");
+include_once("engine_common");
+
+
+//  echo shell_exec("sudo /usr/local/sbin/startAlike");
+// exec("touch /home/alike/Alike/agentShare/seed");
+
+$me = pathinfo(__FILE__, PATHINFO_FILENAME);
+if(count($argv) < 3) {
+	echo "Usage: $me eclFile hostId xenNet (xenRestoreName)\n";
+	exit();
+}
+$eclFile = $argv[1];
+$srId = $reservedSrId;
+$hostId = $argv[2];
+$xenNet = $argv[3];
+$xenRestoreName = "DEFAULT";
+$templateName ="Other install media";
+if(isset($argv[4])) {
+	if(empty($argv[4]) || $argv[4] == "''") {
+		gen_log(LOG_DEBUG, "Will use VM name from metadata");
+		$XenRestoreName = "DEFAULT";
+	} else {
+		$xenRestoreName = "\"$argv[4]\"";
+		gen_log(LOG_DEBUG, "Using restore name $xenRestoreName");
+	}
+	
+}
+
+
+
+//echo "Ecl is $eclFile\n";
+
+//$meta = engine_getMetaInfo($eclFile);
+//$jason = shell_exec("echo $meta |$metaConverter");
+$xm = engine_getMetaInfoDecoded($eclFile);
+//var_dump($xm);
+//var_dump(engine_getEclHeader($eclFile));
+
+//echo "Sounds like a cool guy\n";
+xen_connect($hostId);
+//echo xen_call("vm-list"); 
+$xen_params = array(
+"VCPUs-max" 		=> "#numCPUs",
+"VCPUs-at-startup" 	=> "#numCPUs",
+"name-label" 		=> "#name",
+"name-description" 	=> "#description",
+"HVM-boot-policy" 	=> "#hVMBootPolicy",
+"HVM-boot-params" 	=> "#hVMBootParams",
+"HVM-shadow-multiplier" => "#hVMShadowMultiplier",
+"PV-args" 		=> "#pVArgs",
+"PV-bootloader" 	=> "pVBootloader",
+"PV-bootloader-args" 	=> "#pVBootloaderArgs",
+"PV-kernel" 		=> "#pVKernel",
+"actions-after-reboot"	=> "restart",
+"platform" 		=> "#platform",
+"memory-static-max" 	=> "#memoryStaticMax",
+"memory-dynamic-max"    => "#memoryDynamicMax",
+"memory-dynamic-min"    => "#memoryDynamicMin",
+"memory-static-min"     => "#memoryStaticMin",
+
+//"memory_limits" => ["#memoryDynamicMin", "#memoryDynamicMax", "#memoryDynamicMin", "#memoryDynamicMax"],
+);
+
+
+/*
+ *  You can call this function with $useHostInternal of true if you 
+ *  hate yourself, or if you just want your VM to sandbox its networking.
+ */	
+function guessAXenNetwork($useHostInternal) {
+	$rez = xen_call("network-list params=uuid");
+	$lines = preg_split("/\r\n|\n|\r/", $rez);
+	$uuids = array();
+	foreach($lines as $l) {
+		//gen_log(LOG_DEBUG, "Line is: $l");
+		$splits = preg_split("/\:/", $l);
+		if(count($splits) > 1){
+			$ud = trim($splits[1]);
+			//echo "Split found! $ud\n";
+			array_push($uuids, $ud);
+		}
+	}
+	$good_uuids = array();
+	foreach($uuids as $u) {
+		$rez = xen_call("network-param-list", "uuid=$u");
+		//gen_log(LOG_DEBUG, $rez);
+		if(stripos($rez, "host internal") || stripos($rez, "host_internal")) {
+			//echo "Skipping host-internal vileness!\n";
+			if($useHostInternal == true) {
+				//gen_log(LOG_DEBUG, "We found a host-internal network, it is $rez");
+				array_push($good_uuids, $u);
+			} else {
+				continue;
+
+			}
+		}
+		if($useHostInternal == false) {
+			array_push($good_uuids, $u);
+		}
+	}
+	if(count($good_uuids) == 0) {
+		return "";
+	}
+	return $good_uuids[0];
+		
+}
+
+function logWarningOnNonEmpty($rez, $deets) {
+	 if(empty(trim($rez)) == false) {
+     		gen_log(LOG_WARNING, "Xen returned error $rez for $deets");
+       	}
+}
+
+function callAllArray($key, $array) {
+	global $uuid;
+	foreach($array as $i) {
+		if(strpos($i, "__efi") !== false) {
+			$res = strstr($i, "=");
+			if ($res !== false) { $res = substr($res, 1); }
+			gen_log(LOG_INFO, "Restoring efi firmware hex (NVRAM)");
+			xen_call("vm-param-set", "uuid=$uuid","NVRAM:EFI-variables=$res");
+			continue;
+		}
+		$rez = xen_call("vm-param-set", "uuid=$uuid", "$key:$i");
+		logWarningOnNonEmpty($rez, "vm-set param $key:$i");
+	}
+}
+
+// Create the VM
+$rez = makeBlankVmXen("__insta_tmp_001", $srId, $templateName);
+$rez = trim($rez);
+if(stripos($rez, "invalid") !== false) {
+	throw new ErrorException("Cannot create a new VM on SR $srId, Xen returned $rez");
+}
+$uuid = $rez;
+gen_log(LOG_INFO, "VM $uuid created");	
+
+
+//var_dump($xen_params);
+//$uuid = $xm->uuid;
+foreach($xen_params as $k => $v) {
+	$val = $v;
+	if(substr($v, 0, 1) == '#') {
+		$val = substr($v, 1);
+		$val = ((array) $xm)[$val];
+		if(is_array($val)) {
+			callAllArray($k, $val);
+			continue;
+		} else if(strpos($val, ' ') !== false) {
+			//echo "BINGO\n";
+			$val = "\"$val\"";
+		}
+	}
+	if($k == "name-label") {
+		if(preg_split("/_/", $val) == 1) {
+			gen_log("Stripping out snapshot meta from from VM name $val");
+			//Strip out snapshot appendage
+			$splitz = array_slice(preg_split("/_/", $val), 0, -1);
+			$val = implode("_", $splitz);
+		} 
+
+		// Mark it
+		$val = "$val"."_INSTABOOT";
+		if($xenRestoreName != "DEFAULT") {
+			$val = $xenRestoreName;
+		}
+		gen_log(LOG_DEBUG, "Assigning VM the name $val");
+	}
+	if($k == "name-label" || $k == "name-description") {
+		// Clean up these guys, as this will fail badly
+		$val = str_replace('"', "", $val);
+		$val = str_replace("'", "", $val);
+	}
+	if(	   strpos($val, ' ') !== false 
+		|| strpos($val, '(') !== false
+		|| strpos($val, ')') !== false
+		|| strpos($val, '#') !== false
+		|| strpos($val, '`') !== false
+		//|| strpos($val, "'") !=- false
+		|| strpos($val, "\$") !== false
+		|| strpos($val, "!") !== false) {
+                        //echo "BINGO\n";
+			$val = "\"$val\"";
+	}
+		
+
+	gen_log(LOG_DEBUG, "Setting Xen param $k=$val");
+	$rez =xen_call("vm-param-set", "uuid=$uuid", "$k=$val");
+	logWarningOnNonEmpty($rez, "vm-param-set $k=$val");
+	//echo xen_call("vm-param-get", "uuid=$uuid", "param-name=$k");
+}
+// Handle VIFS
+gen_log(LOG_DEBUG, "Checking network settings- $xenNet");
+$i = 0;
+$network = "";
+if($xenNet == "sandbox"){ 
+	$network = getInternalNet(); 
+	gen_log(LOG_DEBUG, "Sandbox network requested.  Using: $network");
+} else{
+	$network = xen_call("network-param-get", "param-name=uuid", "uuid=$xenNet");
+	$network = trim($network);
+	if(stripos($network, "invalid") !== false) {
+		gen_log(LOG_INFO, "Requested Xen network for $uuid could not be found. Will attempt to find a suitable network.");
+		$xenNet = "";
+	}
+}
+
+foreach($xm->VIFS as $v) {
+	if($xenNet == ""){
+		$network = xen_call("network-param-get", "param-name=uuid", "uuid=$v->netuuid");
+		$network = trim($network);
+		if(stripos($network, "invalid") !== false) {
+			gen_log(LOG_INFO, "Existing assigned Xen network for VM $uuid with vif $v->mac not found, finding new ones on this host");
+			$needsANewNetwork = true;
+		}
+		if($needsANewNetwork) {
+			$network = guessAXenNetwork($xenNet);	
+		}
+	}
+	if(empty($network)) {
+		gen_log(LOG_WARNING, "No appropriate Xen network found for VM $uuid VIF $v->mac");
+		continue;
+	}
+	gen_log(LOG_INFO, "Creating VIF for device $i on network $network for vm $uuid with mac $v->mac");
+	$rez = xen_call("vif-create", "device=$i", "network-uuid=$network", "vm-uuid=$uuid", "mac=$v->mac");
+	$rez = trim($rez);
+
+	if(stripos($rez, "invalid") !== false) {
+		gen_log(LOG_WARNING, "cannot create a new VIF for VM $uuid, Xen returned $rez");
+		continue;
+	}
+
+		
+	if($v->mtu == 0) { $v->mtu = 1500; }
+	gen_log(LOG_INFO, "VM $uuid has a vif with MTU set to $v->mtu, will set other-config of it...");
+	// Set MTU
+	$rez = xen_call("vif-param-set", "uuid=$rez", "other-config:mtu=$v->mtu");
+	$rez = trim($rez); 
+	if(stripos($rez, "invalid") !== false) {
+               	gen_log(LOG_WARNING, "cannot set MTU for VIF of VM $uuid, Xen returned $rez");
+	}
+	$i++;
+}
+
+//if($disableSecureBoot) {
+//	$rez = xen_call("vm-param-set", "uuid=$uuid", "platform:secureboot=false");
+//	if(stripos($rez, "invalid") !== false) {
+//                gen_log(LOG_WARNING, "cannot disable platform:secureboot for $uuid, Xen returned $rez");
+//        } else {
+//		gen_log(LOG_DEBUG, "Call to disable secure boot (platform:secureboot) returned $rez");
+//	}
+//}
+
+
+// Good exit code
+echo "$uuid\n";
+exit(0);
+
+
+
+?>

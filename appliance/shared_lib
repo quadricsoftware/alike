@@ -1,0 +1,3547 @@
+<?php
+
+include_once("/usr/local/sbin/common_lib");
+include_once('/home/alike/Alike/docroot/config.inc');
+include_once('/home/alike/Alike/docroot/globals.php');
+
+
+
+function logger($lvl, $msg){
+	$logFile = "/home/alike/logs/ws.log";
+}
+
+
+function manageServices($desiredState){
+	if($desiredState=="start"){
+		exec("sudo /usr/local/sbin/startAlike > /tmp/web_start");
+	}else{
+		exec("sudo /usr/local/sbin/stopAlike --no-web > /tmp/web_stop");
+	}
+	return "OK";
+}
+
+function getjobCategory($type){
+	$jobCat=0;
+	if($type==1 || $type==3 || $type==7 || $type==16 ){ $jobCat =2; }
+	else if($type==5 || $type==14){ $jobCat=1;}
+	else if($type==10){ $jobCat =3; }
+	return $jobCat;
+}
+
+function quickUpdateSchedule($d){
+
+}
+function createNewSchedule(&$s){
+	$sql = "INSERT into Schedule (name,scheduleType,isActive) values(?,?,0)";
+	$s->scheduleID = dbSet("nimbus", $sql, array($s->name, $s->scheduleType ));
+	syncDBs();
+}
+
+function updateSchedule(&$s){
+	$sql = "UPDATE Schedule set name=?, timestamp=?, jobType=?, scheduleType=?,interval=?, occurances=?, username=?, password=?, targetPath=?, virtType=?, runBase=?, isActive=?, numConcurrent=? where scheduleID=?";
+	$username = "";
+	$password = "";
+
+	dbSet("nimbus", $sql, array($s->name, $s->timestamp, $s->jobType, $s->scheduleType, $s->interval, $s->occurances, $username, $password, $s->targetPath, $s->virtType, $s->runBase, $s->isActive, $s->numConcurrent, $s->scheduleID ));
+
+	$sql = "DELETE from Schedule_Dates where scheduleID=?";
+	dbSet("nimbus", $sql, array($s->scheduleID));
+	foreach($s->days as $d){
+		$sql = "INSERT into Schedule_Dates values(?, ?)";
+		dbSet("nimbus", $sql, array($s->scheduleID, $d));
+	}
+	$sql = "DELETE from Schedule_Exts where scheduleID=?";
+	dbSet("nimbus", $sql, array($s->scheduleID));
+	foreach($s->jobExtensions as $e){
+		$sql = "INSERT into Schedule_Exts values(?, ?)";
+		dbSet("nimbus", $sql, array($s->scheduleID, $e));
+	}
+	$sql = "DELETE from Schedule_VMS where scheduleID=?";
+	dbSet("nimbus", $sql, array($s->scheduleID));
+	foreach($s->VMs as $v){
+		if(!isset($v->VMID) || $v->VMID ==""){ continue; }
+		if($v->type == 'host'){ continue; }
+
+		$sql = "INSERT into Schedule_VMS values(?, ?, ?)";
+		dbSet("nimbus", $sql, array($s->scheduleID, $v->VMID, $v->version));
+	}
+	$sql = "DELETE from Schedule_Options where scheduleID=?";
+	dbSet("nimbus", $sql, array($s->scheduleID));
+
+	$sql = "INSERT into Schedule_Options values(?, ?, ?)";
+	foreach($s->Options as $k => $v){
+		if($k ==""){ continue; }
+		else if($k =="VMs"){ continue; }
+		else if($k =="replicateItems"){ continue; }
+		else if($k =="restoreItems"){ continue; }
+		else if($k =="policyHosts"){ continue; }
+		else if($k =="vmSite"){ continue; }
+		else if($k =="vmHostSR"){ continue; }
+		else if($k =="vmHostNetwork"){ continue; }
+		else if($k =="vmHost"){ continue; }
+		else if($k =="vmVolume"){ continue; }
+		else if($k =="hostNames"){ continue; }
+		else if($v==""){ continue; }
+		//$stmt->execute(array($s->scheduleID, $k, $v ));
+		dbSet("nimbus", $sql, array($s->scheduleID, $k, $v));
+	}
+	$cat = getJobCategory($s->jobType);
+	foreach ($s->VMs as $v){
+		if($cat !=0){
+			if($v->siteID != ""){
+				$val = "$v->VMID|$v->siteID";
+				$sql = "INSERT into Schedule_Options values(?, 'vmSite', ?)";
+				dbSet("nimbus", $sql, array($s->scheduleID, $val));
+			}
+			if($v->hostID != 0){
+				$val = "$v->VMID|$v->hostID";
+				$sql = "INSERT into Schedule_Options values(?, 'vmHost', ?)";
+				dbSet("nimbus", $sql, array($s->scheduleID, $val));
+			}
+			if($v->srID != ""){
+				$val = "$v->VMID|$v->srID";
+				$sql = "INSERT into Schedule_Options values(?, 'vmHostSR', ?)";
+				dbSet("nimbus", $sql, array($s->scheduleID, $val));
+			}
+			if($v->network != ""){
+				$val = "$v->VMID|$v->network";
+				$sql = "INSERT into Schedule_Options values(?, 'vmHostNetwork', ?)";
+				dbSet("nimbus", $sql, array($s->scheduleID, $val));
+			}
+		}
+		foreach($v->volumes as $vol){
+			$val = "$v->VMID|$vol";
+			$sql = "INSERT into Schedule_Options values(?, 'vmVolume', ?)";
+			dbSet("nimbus", $sql, array($s->scheduleID, $val));
+		}
+	}
+	if(isset($s->Options["policyHosts"])){
+		foreach ($s->Options["policyHosts"] as $h){
+			//$val = "$v->VMID|$v->siteID";
+			$val = "$h";
+			$sql = "INSERT into Schedule_Options values(?, 'policyHost', ?)";
+			dbSet("nimbus", $sql, array($s->scheduleID, $val));
+		}
+	}
+
+	syncDBs();
+
+}
+
+
+////////////////////////////////////// New manager setSchedule stuff
+function setSchedule($d){
+	$msg = "Failed to save schedule";
+
+	$sid = 0;
+	$gfsid = -1;
+	try{
+
+		// TODO: this only saves backup schedules ATM
+		// jobTypes: 0: backup, 1: restore, 5: replicate
+
+		// from the new manager UI
+
+		// backup safety checks
+		if($d->jobType == 0 && empty($d->sources) && empty($d->keyword)){
+			throw new Exception("No backup sources provided!");
+		}else if($d->jobType == 5 && empty($d->sources) ){
+			throw new Exception("No source systems provided!");
+		}else if($d->jobType == 1 && empty($d->sources) ){
+			throw new Exception("No systems provided for restore!");
+		}
+
+		$freq =0;
+		// daily jobs use todays timestamp, and set the hour/min
+		$ts = (new DateTime())->setTime($d->hour, $d->min)->getTimestamp();
+		if($d->stype ==1){
+			// monthly jobs use the day of month timestamp, and set the hour/min
+			$ts = (new DateTime())->setDate(date('Y'), date('n'), $d->monthday)->setTime($d->hour, $d->min)->getTimestamp();
+		}else if($d->stype ==0){
+			//daily 
+			$allEmpty = count(array_filter($d->days)) === 0;
+			if(empty($d->days) || $allEmpty){
+				throw new Exception("No days selected for daily schedule!");
+			}
+			$sun = array_pop($d->days);
+			array_unshift($d->days, $sun);
+		}
+		if($d->stype ==4 || $d->stype ==5){
+			// manual and run now jobs have no scheduling
+		}else{
+			if($d->interval > 0){ $freq = 86400 / $d->interval; }
+		}
+		$sid = $d->id;
+		if($sid ==0){
+			$sql = "INSERT into Schedule(scheduleid, name, timestamp, jobtype, scheduletype,interval, occurances,isactive,numconcurrent) values(NULL,?,?,?,?,?,?,?,?) ";
+			$sid = dbSet("nimbus", $sql, array($d->name, $ts, $d->jobType, $d->stype, $d->interval, $freq, 1, $d->concurrent));
+		}else{
+			$sql = "UPDATE Schedule set name=?, timestamp=?, jobtype=?, scheduletype=?,interval=?, occurances=?,isactive=?,numconcurrent=? where scheduleid=? ";
+			dbSet("nimbus", $sql, array($d->name, $ts, $d->jobType, $d->stype, $d->interval, $freq, 1, $d->concurrent, $sid));
+			$sql = "DELETE from schedule_vms where scheduleid=?";
+			dbSet("nimbus", $sql, array($sid));
+			$sql = "DELETE from schedule_options where scheduleid=?";
+			dbSet("nimbus", $sql, array($sid));
+			$sql = "DELETE from schedule_dates where scheduleid=?";
+			dbSet("nimbus", $sql, array($sid));
+		}
+
+		if($d->policyType ==1){
+			$sql = "INSERT into schedule_options(scheduleID, option, val) values(?,?,?)";
+			foreach($d->sources as $u){
+				$h = getHostByUuid($u);
+				dbSet("nimbus", $sql, array($sid,"policyHost", $h->hostID));
+			}
+		}else if($d->policyType ==2 || $d->policyType ==3){
+			$sql = "INSERT into schedule_options(scheduleID, option, val) values(?,?,?)";
+			dbSet("nimbus", $sql, array($sid,"policyFilterString", $d->keyword));	// insert into the schedule_vms now that we have the vid
+		}else{
+			if($d->jobType ==0){	// backup jobs
+				$sql = "INSERT into schedule_vms(scheduleID, vmid) values(?,?)";		
+				foreach($d->sources as $v){
+					$vid = getVmidByGuid($v->uuid);
+					dbSet("nimbus", $sql, array($sid, $vid));	// insert into the schedule_vms now that we have the vid
+					if(!empty($v->volumes)){
+						setVmDriveExlusion($db, $vid,$sid, $v->volumes);
+					}
+				}
+				$sql = "INSERT into schedule_options(scheduleID, option, val) values(?,?,?)";
+				if($d->method == "qhb"){ dbSet("nimbus", $sql, array($sid,"QHB", 1)); }
+				if($d->cbt){ dbSet("nimbus", $sql, array($sid,"doCBT", 1)); }
+				if($d->diskmem){ dbSet("nimbus", $sql, array($sid,"snapshotType", 2)); }
+				if($d->forcefull){ dbSet("nimbus", $sql, array($sid,"forceFull", 1)); }
+
+			}else if($d->jobType == 5){	// replicate jobs
+				$sql = "INSERT into schedule_vms(scheduleID, vmid) values(?,?)";		
+				$sql2 = "INSERT into schedule_options(scheduleID, option, val) values(?,?,?)";
+				foreach($d->sources as $v){
+					$vid = getVmidByGuid($v->uuid);
+					$h = getSuitableHost( $v->destUuid);
+					dbSet("nimbus", $sql, array($sid, $vid));	// insert into the schedule_vms now that we have the vid
+					dbSet("nimbus", $sql2, array($sid,"vmHost", "$vid|$h->hostID"));
+					if($h->virtType != 3 && !empty($v->sr)){
+						$sr = getSr( $v->sr);
+						dbSet("nimbus", $sql2, array($sid,"vmHostSR", "$vid|$sr->id"));
+					}
+					if(!empty($v->network)){
+						dbSet("nimbus", $sql2, array($sid,"vmHostNetwork", "$vid|$v->network"));
+					}
+				}
+				$sql = "INSERT into schedule_options(scheduleID, option, val) values(?,?,?)";
+				if($d->snapReplica){ dbSet("nimbus", $sql, array($sid,"snapshotTarget", 1)); }
+				if($d->preserveMAC){ dbSet("nimbus", $sql, array($sid,"restore", 1)); }	
+				if($d->bootTarget){ dbSet("nimbus", $sql, array($sid,"boot", 1)); }
+				if($d->QHB){ dbSet("nimbus", $sql, array($sid,"QHB", 1)); }
+				if($d->doCBT){ dbSet("nimbus", $sql, array($sid,"doCBT", 1)); }
+				if($d->enableCache){ dbSet("nimbus", $sql, array($sid,"force", 0)); }
+				else{ dbSet("nimbus", $sql, array($sid,"force", 1)); }
+			}else if($d->jobType == 1){     // Restore jobs
+                                $sql = "INSERT into schedule_vms(scheduleID, vmid, VM_Version) values(?,?,?)";
+                                $sql2 = "INSERT into schedule_options(scheduleID, option, val) values(?,?,?)";
+                                foreach($d->sources as $v){
+                                        $vid = getVmidByGuid($v->uuid);
+                                        $h = getSuitableHost( $v->destUuid);
+                                        dbSet("nimbus", $sql, array($sid, $vid, $v->timestamp));        // insert into the schedule_vms now that we have the vid
+                                        dbSet("nimbus", $sql2, array($sid,"vmHost", "$vid|$h->hostID"));
+                                        if($h->virtType != 3 && !empty($v->sr)){
+						if($v->sr == "AlikeSR"){
+							// instabooters use the reserved sting
+							dbSet("nimbus", $sql2, array($sid,"vmHostSR", "$vid|AlikeSR"));
+						}else{
+							$sr = getSr($v->sr);
+							dbSet("nimbus", $sql2, array($sid,"vmHostSR", "$vid|$sr->id"));
+						}
+                                        }
+                                        if(!empty($v->network)){
+                                                dbSet("nimbus", $sql2, array($sid,"vmHostNetwork", "$vid|$v->network"));
+                                        }
+                                }
+                                $sql = "INSERT into schedule_options(scheduleID, option, val) values(?,?,?)";
+                                if($d->bootTarget){ dbSet("nimbus", $sql, array($sid,"boot", 1)); }
+                                else{ dbSet("nimbus", $sql, array($sid,"force", 1)); }
+
+			}
+		}
+		$sql = "INSERT into schedule_options(scheduleID, option, val) values(?,?,?)";
+		dbSet("nimbus", $sql, array($sid,"policyType", $d->policyType));
+		dbSet("nimbus", $sql, array($sid,"allowJobEmail", $d->email));
+                if(isset($d->vault) && ($d->vault == "true" || $d->vault == 1) ){
+                        dbSet("nimbus", $sql, array($sid,"vaultEnable", 1));
+                }
+
+
+		if(isset($d->gfs)){ $gfsid = $d->gfs; }
+
+
+		$sql = "INSERT into schedule_dates(scheduleID, date) values(?,?)";		
+		for($i=0; $i < count($d->days); $i++){
+			if($d->days[$i]){ dbSet("nimbus", $sql, array($sid, $i));}	// the days of the week
+		}
+
+
+		$msg = "Schedule saved";
+	}catch(Exception $ex){
+		$r = [];
+		$r["result"] = "error";
+		$r["message"] = $ex->getMessage();
+		return $r;
+	}
+
+	updateGfsForSchedule($sid, $gfsid );
+
+	$r = [];
+	$r["result"] = "success";
+	$r["message"] = $msg;
+	$r["Schedule"] = getSchedule($sid);
+
+	return $r;
+}
+
+// guid can be a poolid or a host
+function getSuitableHost( $guid){
+	$sql = "SELECT * from host where (uuid=? or poolID=?) order by role desc limit 1";
+	return dbGetOne("nimbus", $sql, array($guid, $guid));
+}
+function getVmSimple($uuid){
+        haveVM($uuid);
+                $sql = "SELECT * from vm where uuid=?";
+                $vm = dbGetOne("nimbus", $sql, array($uuid));
+                $vm->uuid = $vm->UUID;
+                $vm->guid = $vm->UUID;
+                $vm->vmid = $vm->VMID;
+                $vm->name = $vm->VMName;
+		$vm->type = $vm->virtTech;
+		$vm->ip = $vm->accessIP;
+                return $vm;
+}
+
+function getVmInfo($uuid){
+		// id|uuid|name|osName|powerState|isTemplate|isHidden|hostUUID|poolID|size|ipaddress
+
+                $sql = "SELECT * from tm_vminfo where uuid=?";
+                $vm = dbGetOne("nimbus", $sql, array($uuid));
+                $vm->guid = $vm->uuid;
+                $vm->type = $vm->isHidden;
+                $vm->ip = $vm->ipaddress;
+                return $vm;
+}
+
+
+function getVmidByGuid( $uuid){
+	$sql = "SELECT vmid from vm where uuid=?";
+	$vid = dbGetColumn("nimbus", $sql, array($uuid));
+	if(!isset($vid) || empty($vid)){
+		$vm = makeNewVM($uuid);
+		$vid = $vm->vmid;
+	}
+	return $vid;
+}
+function setVmDriveExlusion($db, $vid,$sid, $drives){
+	$sql = "INSERT into schedule_options VALUES(?,?,?)";
+	$st = $db->prepare($sql);
+	foreach($drives as $d){
+		$st->execute(array($sid, "vmVolume", "$vid|$d"));
+	}
+}
+/////////////////////////////////////////////////////////////////////////////////////
+
+
+function setScheduleOld($d){
+
+	if(isset($d->justUpdate) ){
+		// we should have a way to do quick updates, not full drop and reloads
+
+		// ******** I'm pretty sure nobody usest his
+		return quickUpdateSchedule($d);
+	}
+
+	$isNew=false;
+	$s = getSchedule($d->id, true);
+
+	if(isset($d->scheduleName)){
+		$s->name = $d->scheduleName;
+	}
+	if(isset($d->scheduleType)){
+		$s->scheduleType = $d->scheduleType;
+	}
+
+	if($d->id ==0){ 
+		$isNew =true; 
+		createNewSchedule($s);	
+	}
+	if(isset($d->jobenabled)){
+		$s->isActive = $d->jobenabled;
+	}
+	$s->timestamp = $d->scheduleDate; // For one time jobs
+
+
+	$s->days= array();
+	if(isset($d->dateSun)){ array_push($s->days,0); }
+	if(isset($d->dateMon)){ array_push($s->days,1); }
+	if(isset($d->dateTues)){ array_push($s->days,2); }
+	if(isset($d->dateWed)){ array_push($s->days,3); }
+	if(isset($d->dateThurs)){ array_push($s->days,4); }
+	if(isset($d->dateFri)){ array_push($s->days,5); }
+	if(isset($d->dateSat)){ array_push($s->days,6); }
+
+	// we need to create/edit the epoch "scheduleDate" based on jobStartHour, etc
+
+
+	// 0=backup, 1=fullrestore, 3=filebackup, 5=XVA replicate, 14 = ER, 16 = VHD export
+	$s->jobType = $d->jobType;
+	$s->schedType = $d->scheduleType;
+	$jobCat=getjobCategory($s->jobType);
+	$s->jobExtensions = array();
+
+	$quiesced=false;
+	$diskandmemory=false;
+	$poweroff=false;
+	$useEnhanced=true;
+	$useQHB=false;
+	$s->Options["QHB"]=0;
+	$gfsProfileAds=0;
+	$gfsProfileOds=0;
+	$useGFS=false;
+	$qhbfallback=false;
+	if(isset($d->quiesced)){ $quiesced=true; $diskandmemory=false; $poweroff=false;}
+	if(isset($d->qhbfallback)){ 
+		$qhbfallback=true; 
+	}
+	if(isset($d->useEnhanced)){ $useEnhanced=true; }
+	if(isset($d->useQHB)){ 
+		$useQHB=true; 
+		$s->Options["QHB"]=1;
+	}else{
+			$qhbfallback=false;
+	}
+	if(isset($d->diskandmemory)){ $diskandmemory=true; }
+
+	if(isset($d->policyJobType)){
+		$s->Options["policyType"] = $d->policyJobType;
+	}
+
+	if(isset($d->interval)){ $s->interval = $d->interval; }
+	if(isset($d->occurances)){ $s->occurances = $d->occurances; }
+	if(isset($d->policyKeyword)){ 
+		$s->Options["policyFilterString"] = $d->policyKeyword; 
+	}
+	
+	if(isset($d->pullReplicate)){ $s->Options["push"] =false;}		
+	else{ $s->Options["push"] = true; }
+
+	if(isset($d->repCache)){ $s->Options["force"] = true; }	// this one is backwards
+	else{$s->Options["force"]=false; }
+
+	if(isset($d->forceFull)){ $s->Options["forceFull"]=true; }
+	if(isset($d->jobnotify)){ $s->Options["allowJobEmail"]=true; }
+	if(isset($d->jobnotifyonlyonerrors)){ $s->Options["emailErrorsOnly"]=true; }		
+	if(isset($d->doCBT)){ $s->Options["doCBT"]=true; }
+	if(isset($d->quiescedFallback)){ $s->Options["quiescedFallback"]=true; }
+	
+	$s->Options["backup"]=true; 
+	if(isset($d->backup)){
+	 	if($d->backup == "false"){ $s->Options["backup"]=false; }
+	}
+	if(isset($d->snapshotTarget)){ $s->Options["snapshotTarget"]=true; }		
+	if(isset($d->boot)){ $s->Options["boot"]=true; }
+	if(isset($d->preserveMAC)){ $s->Options["restore"]=true; }
+	if(isset($d->overwrite)){ $s->Options["overwrite"]=true; }
+	if(isset($d->safeRestore)){ $s->Options["safeRestore"]=true; }
+	if(isset($d->preferOffsite)){ $s->Options["preferOffsite"]=true; }
+	if(isset($d->numConcurrent)){ 	$s->numConcurrent = $d->numConcurrent; }
+	if(isset($d->retryCount)){ $s->Options["retryCount"] = $d->retryCount; }
+	else{ $s->Options["retryCount"] = 0; }
+
+	if(isset($d->vaultEnable)){ $s->Options["vaultEnable"]=1; } 
+	else{ $s->Options["vaultEnable"]=0; }
+
+	/// Lets eat various oddball structures here....
+	
+	// Add our VMs
+	if(isset($d->VMs) && count($d->VMs) > 0){
+		digestScheduleVms($d->VMs, $s);
+	}
+
+	// Handle policy stuff
+
+	// Backups
+	if($jobCat == 0){
+		$s->Options["snapshotType"]=0;
+		$s->jobType = jobType::backupJob;
+		if($useQHB){
+			$s->jobType = jobType::backupJob;
+			$s->Options["snapshotType"]=9;
+			$s->Options["QHB"]=1;
+			if($qhbfallback){ 
+				//$s->Options["snapshotType"]=3; 
+				$s->Options["guestFallback"]=true; 
+			}
+		}else{
+			if($quiesced){ $s->Options["snapshotType"]=1;
+			}else if($diskandmemory){ $s->Options["snapshotType"]=2;
+			}else if(isset($d->poweroff) ){
+				$s->Options["shutdownVmBeforeSnap"] =true;
+				$s->Options["powerOnVmAfterSnap"] =false;
+			}
+		}
+	}else if($jobCat == 1){		// replicate
+		if($useQHB){
+			$s->jobType = jobType::replicate;
+			$s->Options["repType"]=1;
+			$s->Options["QHB"]=1;
+			$s->Options["snapshotType"]=9;
+			if($qhbfallback){
+				//$s->Options["snapshotType"]=3;
+				$s->Options["guestFallback"]=true; 
+			}
+		}else if($useEnhanced){
+			$s->jobType = jobType::replicate;
+			$s->Options["repType"]=0;
+			if($diskandmemory){
+				$s->Options["snapshotType"]=2;
+			}else if(isset($d->poweroff) ){
+				$s->Options["shutdownVmBeforeSnap"] =true;
+				$s->Options["powerOnVmAfterSnap"] =true;
+			}else if($quiesced){
+				$s->Options["snapshotType"]=1;
+			}
+
+		} // otherwise wer're an XVA replicate?
+	}
+
+
+
+	if(isset($d->gfsEnable)){ 
+		updateGfsForSchedule($s->scheduleID, $d->gfsProfileAds);
+	}else{
+		updateGfsForSchedule($s->scheduleID, -1);
+	}
+
+
+	updateSchedule($s);
+	return $s;
+}
+// WATCH OUT!  I THROW
+function getGFSDB(){
+	$dbFile = $GLOBALS['settings']->dbPath ."/gfs.db";
+	$gdb = new PDO("sqlite:$dbFile");
+	$gdb->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+	$gdb->exec('PRAGMA journal_mode = wal;');
+	return $gdb;
+}
+
+function getGfsForSchedule($sid, $siteID){
+	try{
+		$inst =0;
+		if($siteID ==0){
+			$inst = getSetting("dsid0");
+		}else{
+			$inst = getSetting("dsid1");
+		}
+                $gdb = getGFSDB();
+		$sql = "SELECT gfsId from gfs_schedule where installId='$inst' and scheduleId=$sid ";
+		$stmt = $gdb->prepare($sql);
+		$stmt->execute();
+		while($j = $stmt->fetchObject()){
+			return $j->gfsId;
+		}
+		return -1;
+
+        }catch(Exception $ex){
+                $msg = "Unable to access gfs DB: ". $ex->getMessage();
+                return -1;
+        }
+
+}
+
+function updateGfsForSchedule($sid, $gfsid ){
+		$sql = "DELETE from gfs_schedule where scheduleId = ?";
+		dbSet("gfs", $sql, array($sid));
+		if($gfsid >= 0){
+			$sql ="INSERT INTO gfs_schedule VALUES(?,?,?, ?)";
+			dbSet("gfs", $sql, array($gfsid, $sid, "ALIKE_ADS", 0));
+			dbSet("gfs", $sql, array($gfsid, $sid, "ALIKE_ODS", 1));
+		}
+}
+
+
+function digestScheduleVms($items, &$s){
+	$cat = getjobCategory($j->jobType);
+	$s->Options["policyType"] = 0;
+	foreach($items as $vm){
+		if($vm->type =="vm"){
+			if(!isset($vm->VMID)){  $vm->VMID = $vm->uuid; }
+			if(is_numeric($vm->VMID)){
+				$vm->uuid = getVMUuid($vm->VMID);
+			}else{
+				$vm->uuid = $vm->VMID;
+				haveVM($vm->uuid);
+				$vm->VMID = getVMID($vm->uuid);
+			}
+			if(!isset($vm->version)){ $vm->version =0; }
+
+		}else if($vm->type == 'host'){
+			$h = getHost($vm->VMID);
+			if($h->type == 10){
+				if($cat != 0){
+					$vm->VMID = $h->physicalVMID;
+				}
+				$vm->siteID = 666;	// the ui does this for some reason
+				$vm->type ==10;
+				if(!isset($s->Options["policyHosts"])){
+					$s->Options["policyHosts"] = array();
+				}
+				array_push($s->Options["policyHosts"],$vm->VMID);
+				$s->Options["policyType"] = 1;
+			}else{
+			// policy host
+				if(!isset($s->Options["policyHosts"])){
+					$s->Options["policyHosts"] = array();
+				}
+				array_push($s->Options["policyHosts"],$vm->hostID);
+				$s->Options["policyType"] = 1;
+			}
+		}
+        }
+
+	$s->VMs = &$items;
+}
+
+function digestScheduleVmVolumes($items, &$s){
+	$items = trim($items);
+	if($items==""){ return; }
+	$vmblocks = explode("|",$items);
+	foreach($vmblocks as $block){
+		$vmbits = explode(";",$block);
+		if(count($vmbits) < 2){ continue; }
+		$uuid = $vmbits[0];
+		$vmid = getVMID($uuid);
+		if($vmid == "" || $vmid ==0){ continue; }
+
+		$vdis = explode("+",$vmbits[1]);
+		if(count($vdis)==0){ continue; }
+
+		addOrUpdateBoVms($s->VMs, $vmid, -1, 0, "", $vdis);
+	}
+}
+
+function digestScheduleRestoreItems($items, &$s){
+	$jobCat=getjobCategory($s->jobType);
+	foreach($items as $v){
+		$v->siteID = -1;
+
+		if($v->type == 'host'){
+			//policHost
+			$v->siteID = 666;
+		}
+
+		if(is_numeric($v->VMID)){
+			$v->uuid = getVMUuid($v->VMID);
+		}else{
+			$v->uuid = $v->VMID;
+			$v->VMID = getVMID($v->uuid);
+		}
+
+		if($v->hostID == -1 && $v->srID != ""){
+                        if($v->srID=="vhd"){
+                                $s->targetPath = getSetting("blockPath") . "\\VHD";
+                        }else if($srid == "xva"){
+                                $s->targetPath = getSetting("blockPath") . "\\XVA";
+                        }else{
+                                $s->targetPath = $v->srID;
+                        }
+                }
+		if($jobCat ==2 && $s->schedType != scheduleType::oneOff && $s->schedType != scheduleType::notScheduled){
+			$v->version =0;
+		}
+
+		// this is annoying, but we need to stuff it here to get it in the DB
+		array_push($s->VMs, $v);
+	}
+
+}
+
+function addOrUpdateBoVms(&$vms,$vmid,  $siteID, $hostID, $srID, $vols){
+	if($vmid == ""){ return; }
+
+	foreach($vms as $v){
+		if($v->VMID == $vmid){
+			$v->siteID = $siteID;
+			$v->hostID = $hostID;
+			$v->srID = $srID;
+			return;
+		}
+	}
+
+	$vm = new BackupVMInfo();
+	$vm->VMID = $vmid;
+	$vm->siteID = $siteID;
+	$vm->hostID = $hostID;
+	$vm->srID = $srID;
+	if(count($vols) > 0){
+		array_push($vm->volumes, $vols);
+	}
+	array_push($vms, $vm);
+}
+function addOrUpdateBoVmsSingle(&$vms, $vmid, $type, $val){
+	foreach($vms as $v){
+                if($v->VMID == $vmid){
+			if($type =="siteID"){ 
+				$v->siteID = $val;
+				return;
+			}else if($type == "hostID"){
+				$v->hostID = $val;
+				return;
+			}else if($type == "srID"){
+				$v->srID = $val;
+				return;
+			}else if($type == "network"){
+				$v->network = $val;
+				return;
+			}else if($type == "vmVolume"){
+				array_push($v->volumes, $val);
+				return;
+			}
+                }
+        }
+
+        $vm = new BackupVMInfo();
+        $vm->VMID = $vmid;
+
+	$sql = "SELECT VMName, UUID, hostID, virtTech as type from VM where vmid=?";
+	$st = dbGetOne("nimbus", $sql, array($vmid));
+
+		if(!is_object($st)){ return; }	// this is blank sometimes and bloats the ws_error.log
+
+		$vm->name =  $st->VMName;
+		$vm->UUID = $st->UUID;
+		$vm->type = $st->type;
+		$vm->hostID = $st->hostID;
+
+		getVMDisksForSchedule($db, $vm);
+		$vm->volumes = array();
+
+		if($type =="siteID"){ 
+			$vm->siteID = $val;
+		}else if($type == "hostID"){
+			$vm->hostID = $val;
+		}else if($type == "srID"){
+			$vm->srID = $val;
+		}else if($type == "vmVolume"){
+			array_push($vm->volumes, $val);
+		}
+		array_push($vms, $vm);
+}
+
+function  makeNewVM($uuid){
+	$vm = new stdClass();
+	$sql ="SELECT tm.*, h.hostID, h.virtType as type from tm_vminfo tm, host h where tm.uuid=? and tm.hostUUID= h.uuid  and tm.poolID = h.poolID";
+	$v = dbGetOne("nimbus", $sql, array($uuid));
+	$vm->uuid = $uuid;
+	$vm->name = $v->name;
+	$vm->poolID = $v->poolID;
+	$vm->hostid = $v->hostID;
+	$vm->virtType = $v->type;
+	$sql = "INSERT into VM (VMName,virtTech,hostID,UUID,poolID) values (?, ?, ?, ?, ?)";
+	$vm->vmid = dbSet("nimbus", $sql, array($v->name,$v->type,$v->hostID,$uuid, $v->poolID));
+	return $vm;
+}
+function deleteJob($id){
+	$sql = "DELETE from Job where jobID=?";
+	dbSet("nimbus", $sql, array($id) );
+	$sql = "DELETE from NimbusJobEntry where jobID=?";
+	dbSet("jobLog", $sql, array($id) );
+
+}
+function deleteSchedule($id){
+	// do the deletes here for:
+	// schedule, schedule_vms, schedule_date, schedule_opts
+	$sql = "DELETE from Schedule where scheduleID=?";
+	dbSet("nimbus", $sql, array($id) );
+	$sql = "DELETE from Schedule_VMS where scheduleID=?";
+	dbSet("nimbus", $sql, array($id) );
+	$sql = "DELETE from Schedule_Dates where scheduleID=?";
+	dbSet("nimbus", $sql, array($id) );
+	$sql = "DELETE from Schedule_Options where scheduleID=?";
+	dbSet("nimbus", $sql, array($id) );
+}
+
+function setScheduleStatus($id, $status){
+	$sql = "UPDATE Schedule set isActive=$status where scheduleID=?";
+	dbSet("nimbus", $sql, array($id));
+}
+
+function makeBlankSchedule(){
+	$j = new stdClass();
+	$j->timestamp = time();
+	$j->state = 1;
+	$dt = new DateTime("@$j->timestamp");
+	$j->runMin = $dt->format('i');
+	$j->runHour = $dt->format('H');
+	$j->targetPath="";
+	$j->virtType = 2;
+	$j->runBase=1;
+	$j->jobExtensions = array();
+	$j->days = array();
+	$j->Options = array();
+	$j->Options["retryCount"]=0;
+	$j->Options["useVss"]=0;
+	$j->Options["doCBT"]=0;
+	$j->Options["quiescedFallback"]=0;
+	$j->Options["shutdownVmBeforeSnap"]=0;
+	$j->Options["powerOnVmAfterSnap"]=0;
+	$j->Options["allowJobEmail"]=0;
+	$j->Options["policyType"]=0;
+	$j->Options["policyFilterString"]="";
+	$j->Options["policyHosts"] = array();
+	$j->Options["restoreItems"] = array();
+	$j->Options["replicateItems"] = array();
+//	$j->Options["VMs"] = array();
+	$j->VMs = array();
+
+	return $j;
+}
+
+function getSchedule($id, $short=false){
+	if($id==0){ return makeBlankSchedule(); }
+
+	$sql ="SELECT * from Schedule WHERE scheduleID=$id ";
+	$scheds = loadScheduleFromDB($sql, $short);
+	if(empty($scheds)){ throw new Exception("Schedule $id not found"); }
+	return $scheds[0];
+}
+
+function getSchedulesToMonitor(){
+	$sql ="SELECT * from Schedule WHERE deleteFlag IS null and isActive = 1  and scheduleType != 4 order by jobType, scheduleType";
+
+	return loadScheduleFromDB($sql,false);
+}
+
+function getAllSchedules($noSystem){
+	$sql ="SELECT * from Schedule WHERE deleteFlag IS null order by jobType, name ";
+	if($noSystem){
+		$sql ="SELECT * from Schedule WHERE deleteFlag IS null and jobType != 17 and jobType != 10  and jobType != 8 order by jobType, name ";
+	}
+	return loadScheduleFromDB($sql,false);
+}
+function loadScheduleFromDB($sql, $short){
+        $out = array();
+	$all = dbGet("nimbus", $sql);
+	foreach($all as $j){
+		$j->ID = $j->scheduleID;
+		$j->state = $j->isActive;
+		try{
+			$dt = new DateTime("@$j->timestamp");
+			$j->runMin = $dt->format('i');
+			$j->runHour = $dt->format('H');
+		}catch(Exception $ex){
+			$j->runMin = 0;
+			$j->runHour = 24;
+		}
+
+	if($short==false){
+
+		$cat = getjobCategory($j->jobType);
+		$j->jobCategory = $cat;
+		// what about policyHosts
+		if($cat ==0 || $cat ==1){
+			$sql = "SELECT j.VMID, j.VM_Version, v.*, tvm.powerState as state FROM Schedule_VMS j, VM v, tm_vminfo tvm WHERE tvm.uuid= v.uuid and j.VMID = v.VMID and j.scheduleID = ?";
+		}else{
+			$sql = "SELECT j.VMID, j.VM_Version, v.*, ver.timestamp FROM Schedule_VMS j, VM v, vm_version ver WHERE ver.VMID = j.VMID and ver.timestamp = j.vm_version and j.VMID = v.VMID and j.scheduleID = ?";
+		}
+		$vms = dbGet("nimbus", $sql, array($j->scheduleID) );
+                $j->VMs = array();
+		foreach($vms as $v){
+			$v->name = $v->VMName;
+			$v->VMID = $v->VMID;
+			$v->uuid = $v->UUID;
+			$v->type = 2;
+			if($cat ==0){
+				$v->version=0;
+			}else{
+				$v->version = $v->VM_Version;
+			}
+			getVMDisksForSchedule( $v);
+			$v->volumes = array();
+                        array_push($j->VMs, $v);
+                }
+
+                $j->Hosts = array();
+
+		$sql = "SELECT ExtID FROM Schedule_Exts WHERE scheduleID=?";//. $j->scheduleID;
+		$exts = dbGet("nimbus", $sql, array($j->scheduleID) );
+                $j->jobExtensions = array();
+		foreach($exts as $v){ array_push($j->jobExtensions,$v->ExtID); }
+		$sql = "SELECT date FROM Schedule_Dates WHERE scheduleID=?"; //. $j->scheduleID;
+		$days = dbGet("nimbus", $sql, array($j->scheduleID) );
+                $j->days = array();
+		foreach($days as $v){
+			array_push($j->days,$v->date);
+		}
+
+		$j->Options = array();
+		$j->Options["hostNames"] = array();	// used for UI to show policyHosts
+		$j->Options["retryCount"]=0;
+		$j->Options["useVss"]=0;
+		$j->Options["doCBT"]=0;
+		$j->Options["QHB"]=0;
+		$j->Options["backup"]=0;
+		$j->Options["snapshotType"]=0;
+		$j->Options["quiescedFallback"]=0;
+		$j->Options["shutdownVmBeforeSnap"]=0;
+		$j->Options["powerOnVmAfterSnap"]=0;
+		$j->Options["allowJobEmail"]=0;
+		$j->Options["policyType"]=0;
+		$j->Options["policyFilterString"]="";
+		if($cat ==0){
+			$j->Options["backup"]=1;
+		}
+
+		$sql = "SELECT option, val from  Schedule_Options WHERE scheduleID=? order by rowid";
+		$opts = dbGet("nimbus", $sql, array($j->scheduleID) );
+		foreach($opts as $v){
+			if($v->option == "vmSite"){
+				$bits = explode("|", $v->val);
+				if(count($bits)> 1){
+					addOrUpdateBoVmsSingle( $j->VMs, $bits[0], "siteID", $bits[1]);
+				}
+			}else if($v->option == "vmVolume"){
+				$bits = explode("|", $v->val);
+				if(count($bits)> 1){
+					addOrUpdateBoVmsSingle($j->VMs, $bits[0], "vmVolume", $bits[1]);
+				}
+			}else if($v->option == "vmHost"){
+				$bits = explode("|", $v->val);
+				if(count($bits)> 1){
+					addOrUpdateBoVmsSingle( $j->VMs, $bits[0], "hostID", $bits[1]);
+				}
+			}else if($v->option == "vmHostSR"){
+				$bits = explode("|", $v->val);
+				if(count($bits)> 1){
+					addOrUpdateBoVmsSingle($j->VMs, $bits[0], "srID", $bits[1]);
+				}
+			}else if($v->option == "vmHostNetwork"){
+				$bits = explode("|", $v->val);
+				if(count($bits)> 1){
+					addOrUpdateBoVmsSingle($j->VMs, $bits[0], "network", $bits[1]);
+				}
+			}else if($v->option == "policyHost"){
+				if(!array_key_exists("policyHosts", $j->Options)){ $j->Options["policyHosts"] = array(); }
+				array_push($j->Options["policyHosts"], $v->val);
+				try{
+					$ph = getHost($v->val);
+					array_push($j->Hosts, $ph);
+				}catch(Exception $ex){ }
+			}else{
+				$j->Options[$v->option]= $v->val;
+			}
+                }
+
+		assignOptionVals($j);	// this digests the options and flips the right bits
+			if($cat ==0 ||  $j->Options["backup"] ==1){
+				$gfsID = getGfsForSchedule($j->scheduleID, 0);
+				$gfsIDOds = getGfsForSchedule($j->scheduleID, 1);
+				if($gfsID != -1){
+					$j->gfsProfileAds = $gfsID;
+					$j->gfsProfileOds = $gfsIDOds;
+				}
+			}
+		}	// end of if $short
+		splicePhysicalVMs($j);
+
+		spliceRepDetails($j);
+
+                array_push($out, $j);
+	}
+	return $out;
+}
+function spliceRepDetails(&$s){
+	if($s->jobType != 5 && $s->jobType !=1){ return; }
+	foreach($s->VMs as $v){
+		try{
+
+			$sql = "SELECT val from schedule_options where scheduleID=? and option='vmHostNetwork' and val like ?";
+			$temp = dbGetColumn("nimbus", $sql, array($s->scheduleID, "$v->VMID|%"));
+			$tempRaw = explode('|',$temp);
+			if(count($tempRaw) > 1){
+				$v->network = $tempRaw[1];
+			}else{ $v->network = ""; }
+
+			$sql = "SELECT val from schedule_options where scheduleID=? and option='vmHostSR' and val like ?";
+			$vmh = dbGetColumn("nimbus", $sql, array($s->scheduleID, "$v->VMID|%"));
+			$srRaw = explode('|',$vmh);
+			if(count($srRaw) > 1){
+				if($srRaw[1] == "AlikeSR"){
+					$guy = new stdClass();
+					$guy->uuid = "AlikeSR";
+					$guy->name = "AlikeSR";
+					$v->destSr = $guy;
+				}else{
+					$v->destSr = getSr( $srRaw[1]);
+				}
+			}else{ $v->destSr = ""; }
+
+			$sql = "SELECT val from schedule_options where scheduleID=? and option='vmHost' and val like ?";
+			$vmh = dbGetColumn("nimbus", $sql, array($s->scheduleID, "$v->VMID|%"));
+			$hostRaw = explode('|',$vmh);
+			$v->destHost = getHost($hostRaw[1]);
+
+		}catch(Exception $ex){
+			$msg = "Error loading schedule $s->scheduleID ($s->name): ".$ex->getMessage();
+                        syslog(LOG_ERR, $msg);
+                        $v->destHost = new stdClass();
+		}
+	}
+}
+
+function splicePhysicalVMs(&$s){
+	if($s->jobType != 5){ return; }
+
+	if(!isset($s->Options["policyHosts"])){ return; }
+
+	foreach($s->Options["policyHosts"] as $ph){
+		try{
+		$h = getHost($ph);	
+		if($h->type != 10){ continue; }
+
+		foreach($s->VMs as $vm){
+			if($vm->VMID == $ph){
+				$vm->VMID = $h->physicalVMID;					
+				$vm->type=10;
+				$vm->virtTech=10;
+				$vm->name = $h->name;
+				$vm->physicalHostID = $ph;
+			}
+		}
+		}catch(Exception $ex){
+                        $msg = "Failed to load hostID $ph from DB for job policyHosts (splicePhysicalVms)";
+                        syslog(LOG_INFO, $msg);
+                }
+
+
+	}
+
+}
+
+function assignOptionVals(&$j){
+	$j->useEnhanced=1;
+	$j->qhbfallback=0;
+	$j->quiesced=0;
+	$j->diskandmemory=0;
+
+	if($j->Options["QHB"]==1 ){
+		$j->useEnhanced=0;
+		if(!array_key_exists("guestFallback", $j->Options) ){ 
+			$j->qhbfallback=1;
+		}
+	} 
+	if($j->Options["snapshotType"]==3 ){
+		$j->Options["QHB"]=1;
+		$j->qhbfallback=1;
+		$j->useEnhanced=0;
+	}else if($j->Options["snapshotType"]==1){
+		$j->quiesced=1;
+	}else if($j->Options["snapshotType"]==2){
+		$j->diskandmemory=1;
+	}
+
+
+}
+
+function getVMDisksForSchedule( &$v){
+	if(!is_object($v)){
+//		echo "getVMDisksForSched pass a non-object\n";
+		return;
+	}
+        $sql = "select name, uuid, size, position from tm_vmdisk where vmuuid=? order by position";
+	$all = dbGet("nimbus", $sql, array($v->UUID) );
+        $v->Disks = array();
+	$v->totalSize =0;
+	foreach($all as $det){
+                array_push($v->Disks,$det);
+		$v->totalSize +=$det->size;
+        }
+}
+
+function getDashStats($days){
+	$t = time();
+	$t -= ($days * 86400);
+
+	$sql = "SELECT s.jobType, strftime('%d',j.timeBegin,'unixepoch') as begin, j.timeBegin, sum(j.sizeSent) as sent, sum(j.sizeOnDisk) as ondisk, sum(j.originalSize) as orig from Job j, Schedule s WHERE j.deleteFlag IS null and j.scheduleid=s.scheduleid and (s.jobtype ==0 or s.jobtype==5)  AND j.timeBegin > $t group by begin order by j.jobID desc";
+
+	$r = new stdClass();
+	$statz = dbGet("nimbus", $sql);
+
+        $r->deltas = array();
+        $r->dedup = array();
+        $r->protected = array();
+        $r->dates = array();
+	$r->jobCount =0;
+
+	$ds = 60 * 60 *24;
+	$curDay =0;
+	$epochDay =0;
+
+	$del=0;
+	$ded=0;
+	$pro=0;
+	foreach($statz as $j){
+		$r->jobCount++;
+			array_push($r->deltas,$j->sent);
+			array_push($r->dedup,$j->ondisk);
+			array_push($r->protected,$j->orig);
+			array_push($r->dates,$j->timeBegin);
+			//$del=0;
+			//$ded=0;
+			//$pro=0;
+		$del += $j->sent;
+		$ded += $j->ondisk;
+		$pro += $j->orig;
+        }
+
+	$r->dates = array_reverse($r->dates);
+	$r->protected = array_reverse($r->protected);
+	$r->dedup = array_reverse($r->dedup);
+	$r->deltas = array_reverse($r->deltas);
+
+	return $r;
+}
+
+function getActiveJobs(){
+	$sql = "SELECT j.*, j.stage as progress, j.originalSize as totalSize, j.sizeSent as deltaSize, j.sizeOnDisk as finalSize, s.name as name, s.jobType as type from Job j, Schedule s";
+	$sql .= " WHERE j.scheduleID = s.scheduleId AND s.jobType != 17 AND j.status <=3  and j.deleteFlag is null order by j.jobID desc";
+	$out = loadJobFromDB($sql ,false);
+
+	foreach($out as $j){
+		$prog = calcJobProgress($j->jobID);
+		if(!empty($prog)){
+			updateJobProgress($j->jobID, $prog);
+		}
+	}
+
+	return $out;
+}
+function getPendingJobs(){
+	$sql ="SELECT * from Schedule WHERE deleteFlag IS null and jobType != 17 and jobType != 10 and isActive =1 order by jobType, name ";
+        $scheds = loadScheduleFromDB($sql,false);
+	$now = time(0);
+	$sz = array();
+	foreach($scheds as $s){
+		if($s->jobType == 17 ){ continue; }	// skip systemHidden (not skipping system (10) jobs? )
+		if($s->scheduleType == 2 && $s->timestamp < $now){ continue; }
+		if($s->jobType == 3){ continue; }	// skip flr
+		if($s->jobType == 15){ continue; }	// skip validate
+
+
+		array_push($sz, $s);
+	}
+
+	return $sz;
+
+	//$sql = "SELECT j.*, j.originalSize as totalSize, j.sizeSent as deltaSize, j.sizeOnDisk as finalSize, s.name as name, s.jobType as type from Job j, Schedule s";
+	//$sql .= " WHERE j.scheduleID = s.scheduleId AND s.jobType != 17 AND j.deleteFlag is null order by j.jobID desc";
+	//return loadJobFromDB($sql ,false);
+}
+
+function getRecentJobs(){
+	$limit = 25;
+
+	$sql = "SELECT j.*,j.stage as progress,  j.originalSize as totalSize, j.sizeSent as deltaSize, j.sizeOnDisk as finalSize, s.name as name, s.jobType as type from Job j, Schedule s";
+	$sql .= " WHERE j.scheduleID = s.scheduleId AND s.jobType != 17  and j.deleteFlag is null order by j.timeBegin desc limit $limit";
+	return loadJobFromDB($sql, false);
+}
+
+function getJobsFromId($id){
+	$sql = "SELECT j.*, j.stage as progress, j.originalSize as totalSize, j.sizeSent as deltaSize, j.sizeOnDisk as finalSize, s.name as name, s.jobType as type from Job j, Schedule s";
+	$sql .= " WHERE j.scheduleID = s.scheduleId AND s.jobType != 17  and j.deleteFlag is null and j.jobID >=?";
+	return dbGet("nimbus", $sql,array($id));
+}
+
+function getJobs($days, $query){
+
+	// 	CASE WHEN s.password = '' THEN s.name ELSE s.password END AS name
+
+	$sql = "SELECT j.*,j.stage as progress,  j.originalSize as totalSize, j.sizeSent as deltaSize, j.sizeOnDisk as finalSize, s.name as name, s.jobType as type from Job j, Schedule s";
+	$sql .= " WHERE j.scheduleID = s.scheduleId AND s.jobType != 17  and j.deleteFlag is null";
+	if($days >= 0 ){
+		$sql .= " AND ";
+		$ago =time();
+		if($days == 0){
+			$date = date_create();
+			$dt   = new DateTime(date_format($date, 'Y-m-d') );
+			$ago = $dt->getTimestamp();
+
+		}else{
+			$ago -= ($days * 86400);
+		}
+		$sql .= " timeBegin > $ago ";
+	}
+
+	if(strlen($query)>0){
+		$s2 = "SELECT distinct jobID from NimbusJobEntry where description like \"%$query%\"";
+		$res = dbGetArray("jobLog", $s2);
+		$jids = implode(",", $res);
+		$sql .= " AND j.jobID IN (". $jids .") ";
+	}
+	$sql  .= " order by jobID desc LIMIT 2000";
+
+
+	return loadJobFromDB($sql, false);
+}
+
+function countJobVMs($jid, &$db){
+	$sql = "SELECT count(*) FROM Job_VMS j, VM v WHERE j.VMID = v.VMID and j.jobID = ". $jid;
+	return dbGetColumn("nimbus", $sql);
+}
+
+function loadJobFromDB($sql, $loadDetails){
+	$out = array();
+		$jerbs = dbGet("nimbus", $sql);
+		foreach($jerbs as $j){
+			$j->VMs = array();
+			if($loadDetails == false){
+				$j->systemsInJob = countJobVMs($j->jobID, $db);
+			}
+			array_push($out, $j);
+		}
+		if($loadDetails ==false){ return $out; }
+
+        foreach($out as $j){
+		loadJobDetails($j);
+        }
+        return $out;
+}
+
+function loadJobDetails(&$j){
+	if(!is_object($j)){ throw new Exception("Job not found in DB"); }
+	$sql = "SELECT j.VMID, j.VM_Version, v.* FROM Job_VMS j, VM v WHERE j.VMID = v.VMID and j.jobID = ? order by j.rowid";
+	$guys = dbGet("nimbus", $sql, array($j->jobID) );
+	$j->vmsInJob = array();
+	$cur =0;
+	foreach($guys as $v){
+		array_push($j->vmsInJob, $v);
+		if(isset($j->currentlyProtecting) && $j->currentlyProtecting == $v->vmid){
+			$j->currentName = $j->VMName;
+			$j->currentPosition = $cur;
+			$j->currentID = $v->vmid;
+		}
+		$cur++;
+	}
+	if(!is_numeric($j->totalSize)){ $j->totalSize =0; }
+	$j->systemsInJob = $cur;
+	$sql = "SELECT ExtID FROM Schedule_Exts WHERE scheduleID=?";
+	$exts = dbGet("nimbus", $sql, array($j->jobID) );
+	$j->jobExtensions = array();
+	foreach($exts as $v){
+		array_push($j->jobExtensions,$v->ExtID);
+	}
+
+	$sql = "SELECT option, val from  Job_Options WHERE jobID=? order by rowid";
+	$opts = dbGet("nimbus", $sql, array($j->jobID) );
+
+	$j->Options = array();
+	$j->Options["retryCount"]=0;
+	$j->Options["useVss"]=0;
+	$j->Options["doCBT"]=0;
+	$j->Options["quiescedFallback"]=0;
+	$j->Options["shutdownVmBeforeSnap"]=0;
+	$j->Options["powerOnVmAfterSnap"]=0;
+	$j->Options["allowJobEmail"]=0;
+	$j->Options["policyType"]=0;
+	$j->Options["policyFilterString"]="";
+	foreach($opts as $v){
+		if($v->option == "policyHost"){
+			if(!array_key_exists("policyHosts", $j->Options) ){ $j->Options["policyHosts"] = array(); }
+			array_push($j->Options["policyHosts"], $v->val);
+		}else if($v->option == "vmVolume"){
+			if(!array_key_exists("vmVolume", $j->Options) ){ $j->Options["vmVolume"] = array(); }
+			array_push($j->Options["vmVolume"], $v->val);
+		}else{
+			$j->Options[$v->option]= $v->val;
+		}
+	}
+
+	$j->compression=0;
+	if($j->sizeOnDisk > 0 && $j->originalSize > 0){
+		$j->compression = round((100 - ($j->sizeOnDisk / $j->originalSize) * 100),2);
+	}
+
+	$j->timeElapsed = $j->timeEnd - $j->timeBegin;
+	if($j->timeEnd ==0){ $j->timeElapsed = time() - $j->timeBegin; }
+
+	// we still need to process all these options... split them and whatnot
+}
+
+function getJob($id){
+	$sql = "SELECT j.*, j.stage as progress, j.originalSize as totalSize, j.sizeSent as deltaSize, j.sizeOnDisk as finalSize, s.name as name, s.jobType as type from Job j, Schedule s";
+        $sql .= " WHERE j.scheduleID = s.scheduleId AND jobID=?";
+	$j = dbGetOne("nimbus", $sql, array($id) );
+	loadJobDetails($j);
+	return $j;
+}
+
+// dhcp or manual
+//
+// DELETES and static ips you may have assigned if you switch to DHCP
+//
+function setABDDhcp($poolid, $xennet, $useDHCP){
+	if($useDHCP){
+		$sql = "delete from ABDNet where poolid = ?";
+		dbSet("nimbus", $sql, array($poolid) );
+		$sql = "INSERT into ABDNet (ip, netID, poolID,MAC,netmask,gateway,dns,publicAddress) values('0.0.0.0',?,?,'','','','','')";
+		dbSet("nimbus", $sql, array($xennet, $poolid) );
+	}else{
+		$sql = "delete from ABDNet where poolid = ? and ip='0.0.0.0'";
+		dbSet("nimbus", $sql, array($poolid) );
+
+		$sql = "UPDATE ABDNet set netID=? where poolID=? ";
+		dbSet("nimbus", $sql, array($xennet, $poolid) );
+	}
+}
+
+// set the xennet to all the networks
+function setABDNet($poolid, $xennet){
+	$sql = "UPDATE ABDNet set netID=? where poolID=?";
+	dbSet("nimbus", $sql, array($xennet, $poolid));
+}
+
+function setABDIP($n){
+	$isUpdate=false;
+	$ip = trim($n->ip);
+	$sql = "SELECT * from ABDNet where ip=? ";
+	$guy = dbGetOne("nimbus", $sql, array($ip) );
+	if(is_object($guy)){ 
+		if($guy->poolID == $n->poolid && $guy->ip == $ip && $guy->gateway == $n->gw){
+			return "Duplicate IP ($ip)";
+		}
+		$isUpdate=true; 
+	}
+
+	$dns='';
+	if($ip != "0.0.0.0"){
+		$dns = "8.8.8.8";
+		$ns = getDNS();
+		if(!empty($ns)){ $dns = $ns[0]; }
+	}
+
+	if($isUpdate==true){
+		$sql = "UPDATE  ABDNet set gateway=?, netmask=?, MAC=?, poolID=?, netID=?, dns=? where ip=? ";
+		dbSet("nimbus", $sql, array($n->gw, $n->netmask, $n->MAC, $n->poolid, $n->xennet, $dns, $ip) );
+	}else{
+		$sql = "INSERT into ABDNet (ip, gateway, netmask, publicAddress, poolID, netID,MAC,netmask,gateway,dns,publicAddress) values(?, ?, ?, '', ?, ?,?,'','',?,'')";
+		dbSet("nimbus", $sql, array($ip, $n->gw, $n->netmask, $n->poolid, $n->xennet, $n->MAC, $dns) );
+	}
+
+	$sql = "delete from ABDNet where poolid = ? and ip='0.0.0.0'";
+	dbSet("nimbus", $sql, array($n->poolid) );
+	if($isUdpdate){ return "updated"; }
+	return "";
+}
+
+function deleteABDNet($id){
+	//$sql = "delete from ABDNet where ID = '$id'";
+	//quickDB("nimbus", $sql);
+	$sql = "delete from ABDNet where ID = ?";
+	dbSet("nimbus", $sql, array($id ));
+}
+
+function getABDNet($id){
+	$net = new stdClass();
+        $sql = "SELECT ID as id, ip, netmask, gateway, MAC, netID from ABDNet where ID=?";
+        return dbGetOne("nimbus", $sql, array($id) );
+}
+
+function getABDs(){
+        $out = array();
+	$sql = "select p.* from tm_pool p, host h where p.uuid=h.poolid and h.virtType=2 group by h.poolid;";
+	$poos = dbGet("nimbus", $sql);
+	foreach($poos as $j){
+		if (strpos($j->uuid, '.') !== false) { continue; }
+
+		$pool = new stdClass();
+		$pool->name = $j->name;
+		$pool->uuid = $j->uuid;
+		$pool->id = $j->id;
+		$sql = "SELECT * from ABDImage where poolid=?";
+		$abz = dbGet("nimbus", $sql, array($j->uuid) );	
+		foreach($abz as $a){
+			$abd = new stdClass();
+			$abd->id = $a->ID;
+			$abd->uuid = $a->uuid;
+			$abd->version = $a->version;
+			$abd->SRID = $a->srid;
+			$pool->ABDImage = $abd;
+		}
+		if(!isset($pool->ABDImage)){
+			$pool->ABDImage = new stdClass();
+		}
+		$pool->vNetworks = array();
+		$sql = "SELECT * from tm_network where PoolID=?";
+		$vnets = dbGet("nimbus", $sql, array($j->uuid) );
+		foreach($vnets as $vn){
+			array_push($pool->vNetworks, $vn);
+		}
+
+		$pool->ABDNets = array();
+		$sql = "SELECT * from ABDNet where poolid=?";
+		$anets = dbGet("nimbus", $sql, array($j->uuid) );
+		foreach($anets as $vn){
+			$vn->id = $vn->ID;
+			if($vn->ip != "0.0.0.0"){
+				$sql = "SELECT * from Appliance where PoolID=? and ip=?";
+				$apps = dbGet("nimbus", $sql, array($j->uuid, $vn->ip) );
+				$vn->abdDeployed=0;
+				foreach($apps as $abd){
+					$vn->abdDeployed=1;
+					$vn->abdName = $abd->name;
+					$vn->abdId = $abd->ID;
+					$vn->abdUuid = $abd->uuid;
+					$vn->vmOwner = 0;
+					if(!empty($abd->vmOwner)){
+						$vn->vmOwner = $abd->vmOwner;
+					}
+				}
+			}
+			array_push($pool->ABDNets, $vn);
+                }
+                $a = array();
+
+                $sql = "SELECT * from Appliance where PoolID=?";
+		$apps = dbGet("nimbus", $sql, array($j->uuid) );
+		foreach($apps as $guy){
+                        array_push($a,$guy );
+                }
+                $pool->ABDs = $a;
+
+		array_push($out, $pool);
+        }
+
+        return $out;
+}
+
+
+function saveAllSettings($s){
+
+	$tellJava=false;
+	$sql = "INSERT OR REPLACE INTO Settings (name,val) VALUES (?, ?)";
+	foreach($s as $name=>$val){
+		if($name == "uiPass"){
+			$cur = getSetting("uiPass");
+			if($cur == $val){ continue; }
+		}
+		if($name == "hostIP"){
+			$cur = getSetting("hostIP");
+			if($cur == $val){ continue; }
+			updateMungeConf($val);
+		}
+
+		if($name == "debugLevel"){ $tellJava=true; }
+		if($name == "uiPass"){ updateAlikePass($val); }
+
+		dbSet("nimbus", $sql, array($name, $val) );
+	}
+	updateHostname();
+	syncDBs();
+	if($tellJava){
+		$arg=array("command"=>"settings");
+                issueJavaCmd($arg, 0, 0,0);
+	}
+}
+
+function setProxyEnv(){
+	$useProx = getSetting("useManualProxy");
+	$env = shell_exec("sed '/proxy/d' /etc/environment");
+	file_put_contents("/etc/environment",$env);
+
+	if($useProx == "true"){
+		$proxyHost = getSetting("proxyHost");
+		$proxyPort = getSetting("proxyPort");
+		$proxyUsername = getSetting("proxyUsername");
+		$proxyPassword = getSetting("proxyPassword");
+		$proxyAuth = getSetting("useProxyAuth");
+		$prox = "http_proxy=http://$proxyHost:$proxyPort";
+		$proxS = "https_proxy=http://$proxyHost:$proxyPort";
+		if($proxyAuth=="true"){
+			$prox = "http_proxy=http://$proxyUsername:$proxyPassword@$proxyHost:$proxyPort";
+			$proxS = "http_proxy=https://$proxyUsername:$proxyPassword@$proxyHost:$proxyPort";
+		}
+		exec("echo $prox >> /etc/environment");
+		exec("echo $proxS >> /etc/environment");
+	}
+
+}
+
+function setSettingSync($name, $val){
+
+	if($name == "smtpPassword"){ $val = obfuscate($val); }
+
+	$sql = "INSERT OR REPLACE INTO Settings (name,val) VALUES (?, ?)";
+	dbSet("nimbus",$sql, array($name, $val));
+
+	syncDBs();
+}
+
+function getStat($stat){
+        $sql = "SELECT val from statistics where name=?";
+	return dbGetColumn("nimbus", $sql, array($stat) );
+}
+
+######################################## Joblog stuff ######################################
+
+function getAlerts2(){
+	//$sql = "SELECT count(*) as num, * from NimbusJobEntry WHERE jobID=0 AND acknowledged=0 order by timestamp desc limit 15";
+	$sql = "SELECT * from NimbusJobEntry WHERE jobID=0 AND acknowledged=0 order by timestamp desc limit 15";
+	return getJobLogsBase($sql);
+}
+function dismissAlert($id){
+	$sql = "UPDATE NimbusJobEntry set acknowledged=1 WHERE entryID=$id";
+	$sql = "DELETE from NimbusJobEntry WHERE entryID=$id and jobID=0";
+	if($id==0){
+		$sql = "UPDATE NimbusJobEntry set acknowledged=1";
+		$sql = "DELETE from NimbusJobEntry where jobID=0";
+	}
+	//quickDB("jobLog", $sql);
+	dbSet("jobLog", $sql, array( ));
+}
+
+function updateJobLogStatus( $status, $eid){
+	$now = time();
+	$sql = "UPDATE NimbusJobEntry set timestamp=?, status =? where entryID=?";
+	dbSet("jobLog",$sql,  array($now, $status, $eid ));
+}
+function updateJobLog($msg, $status, $eid){
+	if($msg == ""){ $msg = "me"; }
+	$msg = str_replace("}<}100", "100%", $msg);
+	$now = time();
+	$sql = "UPDATE NimbusJobEntry set timestamp=?, status =?, description=?  where entryID=?";
+	dbSet("jobLog", $sql, array($now, $status, $msg, $eid ));
+}
+function addJobLog($msg, $status, $jobID, $vmid, $msgid=0){
+	$syslogMsg = "Job $jobID VM $vmid $msg";
+	if($status == 4) {
+		syslog(LOG_DEBUG, $syslogMsg);
+	} else if($status == 0 || $status == 3) {
+		syslog(LOG_INFO, $syslogMsg);
+	} else if($status == 2) {
+		syslog(LOG_WARNING, $syslogMsg);
+	} else {
+		syslog(LOG_ERR, $syslogMsg);
+	}
+	if($status ==4 && !showTraceLogs()){ return; }
+	// STATUS: 0= success, 1= fail, 2= warn, 3= in progress, 4= trace
+
+	// entryID|jobID|status|timestamp|description|messageID|acknowledged|vmid
+	// 	2|1|0|1521663852|System}<}1}<}Metainfo job for 172.16.1.13|17100206|1|0
+	// 	3|1|0|1521663853|Beginning enumeration for host: 172.16.1.13|0|1|0
+	if($msgid > 0){ $msgid=0; }
+
+	$now = time();
+	$sql = "INSERT into NimbusJobEntry (timestamp, acknowledged, messageID, status, jobID, vmID, description) values( ?,?,?,?,?,?,?)";
+	return dbSet("jobLog", $sql, array($now, 1, $msgid, $status, $jobID, $vmid, $msg ));
+}
+
+
+function showTraceLogs(){
+	if(isset($GLOBALS["showTraceMessages"])){ return $GLOBALS["showTraceMessages"]; }
+	$GLOBALS["showTraceMessages"] = false;
+	if(getSetting("showTraceMessages") == 1){ $GLOBALS["showTraceMessages"] = true; }
+	return $GLOBALS["showTraceMessages"];
+}
+
+function checkWsCache($obj, $ts){
+	$wsCacheDir = "/tmp/wscache";
+	$cacheObject = $wsCacheDir ."/$obj";
+	if(!file_exists($wsCacheDir)){
+		mkdir($wsCacheDir, 0777, true);
+		return null;
+	}else if(!file_exists($cacheObject)){
+		return null;
+	}
+
+	if($ts ==0){
+#exec("echo \"getting $cacheObject from cache (perma)\n\" >> /tmp/cache.log");
+		return json_decode(file_get_contents($cacheObject));
+	}
+
+	$cacheTs = filemtime($cacheObject);
+	$dbTime  = filemtime($GLOBALS['settings']->joblogDB);
+	if($dbTime <= $cacheTs || $ts <= $cacheTs){
+#exec("echo \"getting $cacheObject from cache\n\" >> /tmp/cache.log");
+		return json_decode(file_get_contents($cacheObject));
+	}
+}
+function writeToCache($cacheFile, $obj){
+	$jlCacheDir = "/tmp/wscache";
+	if(!file_exists($jlCacheDir)){
+		mkdir($jlCacheDir, 0777, true);
+	}
+
+	$fn = $jlCacheDir ."/$cacheFile";
+	$enc = json_encode($obj);
+	file_put_contents($fn,$enc);
+#exec("echo \"WROTE  $fn to cache\n\" >> /tmp/cache.log");
+}
+
+function getJobLogs($jid, $ago){
+	$sql = "SELECT * from NimbusJobEntry WHERE jobID=$jid AND timestamp > $ago  AND status < 10 AND status > -10 order by timestamp desc";
+	return getJobLogsBase($sql);
+}
+function getJobLogsWithStatus($jid, $stat){
+	$sql = "SELECT * from NimbusJobEntry WHERE jobID=$jid  and status = $stat and description not like 'TRACE:%' order by timestamp desc";
+	return getJobLogsBase($sql);
+}
+
+function getJobLogsBase($sql){
+//	$msgs = include 'allMsgs.php';
+
+	$out = array();
+	$guys = dbGet("jobLog", $sql);
+	foreach($guys as $j){
+		$ent = new stdClass();
+		$ent->id = $j->entryID;
+		$ent->status = $j->status;
+		if($j->vmid ==0){
+			if($j->messageID >0){
+				$ent->description = getMsgEntry($msgs[$j->messageID], $j->description, $j);
+			}else{
+				$ent->description = $j->description;
+			}
+		}
+		$ent->messageID = $j->messageID;
+		if($ent->messageID >0){
+			$ent->description = getMsgEntry($msgs[$ent->messageID], $j->description, $j);
+		}else{
+			$ent->description = $j->description;
+		}
+		$ent->timestamp = $j->timestamp;
+		$ent->vmid = $j->vmid;
+                array_push($out, $ent);
+        }
+	return $out;
+}
+
+function getMsgEntry($template, $msg, &$j){
+	$template = str_replace("%.2f%","%z",$template);
+	$parts = explode("}<}", $msg);	
+	foreach($parts as $p){
+		if($p == ""){ continue; }
+		if($p == "100.00"){ $p = "100"; }
+
+		if (preg_match ('/(\%.)/i', $template, $matches)) { 
+			if($matches[0] == '%z'){
+				$p = "<span class='localize_num'>$p</span>"; 
+			}
+		}
+
+		$template = preg_replace("/(\%.)/",$p,$template, 1);	
+	}
+	if (preg_match ('/(\%z)/', $template, $matches)) {
+		$prog_file = $GLOBALS['settings']->tempPath."/prog/".$j->entryID;
+		$prog = "0";
+		if(file_exists($prog_file)){
+			$prog = trim(file_get_contents($prog_file));
+			$prog = "<span class='localize_num'>$prog</span>";
+			$j->timestamp = time() - 2;
+		}
+		$template = preg_replace("/(\%.)/",$prog,$template, 1);
+	}
+
+	return $template;
+}
+
+function getJoblogDetails($id, $since){
+
+	// this is just for jobs.  It should look like this:
+	//
+	// ["systemEntries"] = array()
+	// ["vmEntries"] = { name, id, ["entries"] array() }
+	$out = new stdClass();
+	$out->vmEntries = array();
+	$sql = "SELECT * from NimbusJobEntry WHERE jobID=$id and vmid=0 and timestamp > $since";
+	$out->systemEntries = array();
+	$out->systemEntries = getJobLogsBase($sql);
+	$sql = "SELECT * from NimbusJobEntry WHERE jobID=$id and vmid > 0 and timestamp > $since order by vmid, timestamp";
+	$allvms = getJobLogsBase($sql);
+	$seenid=0;
+	$curGuy = new stdClass();
+	foreach($allvms as $ent){
+		if($ent->vmid != $seenid){
+			if($seenid > 0){
+				array_push($out->vmEntries,$curGuy);
+			}
+			$curGuy = new stdClass();
+			$curGuy->id = $ent->vmid;
+			$seenid = $curGuy->id;
+			$curGuy->name = getVMName($curGuy->id);
+			$curGuy->entries = array();
+		}
+		array_push($curGuy->entries, $ent);
+	}
+	if(count($allvms) >0){
+		array_push($out->vmEntries,$curGuy);
+	}
+
+	return $out;
+}
+
+// Currently just used for the jobLog loop so we can resolve the vm name
+function getVMName($id){
+	$sql = "SELECT VMName from VM where vmid=?";
+	return dbGetColumn("nimbus", $sql, array($id) );
+}
+
+
+#################################################################################################
+
+
+
+
+function getHostCount($justLicensed){
+	$sql = "SELECT count(*) as num from Host where deleteFlag is null and key != 'revoked' and key != ''";
+	if($justLicensed==false){
+		$sql = "SELECT count(*) as num from Host where deleteFlag is null and key != 'revoked' ";
+	}
+	return dbGetColumn("nimbus", $sql);
+}
+
+
+function getSubscriptionDetails(){
+	$l = new stdClass();
+	$l->available=0;
+	$l->total=0;
+	$l->granted=0;
+	$l->edition=-1;
+	$l->type=0;
+	$l->lifespan =365;
+	$l->renewDate =time() + (86400 *7);
+
+	$inf = getSubInfo();
+	$l->granted=$inf->sockets;
+	$l->available=$inf->sockets;
+	$l->type=$inf->type;
+	$l->edition=$inf->edition;
+
+	$sql = 'select ifnull(sum(vh.numcpu),0) as num from tm_vhost vh, host h where vh.uuid = h.uuid and h.deleteFlag is null and h.key = "licensed"'; 
+	$st = dbGetColumn("nimbus", $sql);
+	$l->available = $l->total - $st;
+
+        return $l;
+}
+
+function editHost($host){
+	$pass = obfuscate($host->password);
+	$sql = "UPDATE host set hostName=?, username=?, password=?, key=? where uuid=?";
+	$lic = "";
+	if($host->licensed){ $lic = "licensed"; }
+	dbSet("nimbus", $sql, array($host->ip,  $host->username, $pass, $lic, $host->guid ));
+	syncDBs();
+	return true;
+}
+
+
+function delAuthProfile($id){
+        $sql = "delete from AuthProfile where ID=?";
+	dbSet("nimbus", $sql, array($id) );
+	$sql = "SELECT count(*) from AuthProfile";
+        $numProfs= dbGetColumn("nimbus", $sql);
+	if($numProfs ==1){ 
+		$sql= "UPDATE authprofile set isDefault=1";
+		dbSet("nimbus", $sql);
+	}
+}
+
+function editAuthProfile($ap){
+	$def = 0;
+	$sql = "SELECT count(*) from AuthProfile";
+        $numProfs= dbGetColumn("nimbus", $sql);
+	if($numProfs ==0){ $ap->isDefault= "true"; }
+	
+	if($ap->isDefault=="true"){
+		$def=1;
+		$sql = "UPDATE AuthProfile set isDefault=0";
+		dbSet("nimbus", $sql);
+	}
+	$pass = obfuscate($ap->password);
+	if($ap->id==0){ 
+		$sql = "INSERT into AuthProfile VALUES (NULL, ?, ?, ?, ?, ?)";
+		dbSet("nimbus", $sql, array($ap->profileName, $ap->username, $pass, $ap->domain, $def ));
+	}else{
+		$sql = "update AuthProfile set name=?, username=?, password=?, context=?, isDefault=? where ID=?";
+		dbSet("nimbus", $sql, array($ap->profileName, $ap->username, $pass, $ap->domain, $def, $ap->id ));
+	}
+}
+
+#################################################### GFS Profiles
+function getGFSProfiles(){
+        $out = array();
+        $sql = "SELECT gfsId, name from gfs";
+	$guys = dbGet("gfs", $sql);
+	foreach($guys as $g){
+		$sql ="SELECT * from gfs_instance WHERE gfsId=?";
+		$j = new stdClass();
+		$j->instances = dbGet("gfs", $sql, array($g->gfsId));
+		$j->gfsId = $g->gfsId;
+		$j->name = $g->name;
+                array_push($out, $j);
+        }
+        return $out;
+}
+function getGfs($id){
+        $sql = "SELECT * from gfs where gfsId=?";
+        $gfs = dbGetOne("gfs", $sql, array($id));
+        if(!is_object($gfs)){ return null; }
+        $sql = "SELECT * from gfs_instance where gfsId=?";
+        $gfs->instances = dbGet("gfs", $sql, array($id));
+        return $gfs;
+}
+
+// the manager needs us to change a gfsId so it won't conflict
+function remixGfsId($old, $new){
+	$sql = "UPDATE gfs set gfsId=? where gfsId=?";
+	dbSet("gfs", $sql, array($new, $old));
+	$sql = "UPDATE gfs_instance set gfsId=? where gfsId=?";
+	dbSet("gfs", $sql, array($new, $old));
+	$sql = "UPDATE gfs_schedule set gfsId=? where gfsId=?";
+	dbSet("gfs", $sql, array($new, $old));
+}
+
+// used by push WS call, the mgr can batch over all the gfs profiles, and we store what we don't have
+//
+// or it can be a single profile, when someone adds a new one from the mgr
+function setGFSProfile($gfs){
+	$res = 0;
+
+	if(haveGfsProfile($gfs->gfsId)){
+		$sql = "UPDATE gfs set name=?  where gfsid=?";
+		dbSet("gfs", $sql, array($gfs->name, $gfs->gfsId));
+	}else{
+		$sql = "INSERT into gfs VALUES(?,? )";
+		dbSet("gfs", $sql, array($gfs->gfsId, $gfs->name));
+		$res=1;
+	}
+
+	$sql = "INSERT OR REPLACE INTO gfs_instance VALUES(?,?,?,?)";
+	foreach($gfs->instances as $i){
+		dbSet("gfs", $sql, array($gfs->gfsId, $i->card, $i->versions, $i->policy));
+	}
+	return $res;
+}
+
+function haveGfsProfile( $id){
+        $sql = "SELECT count(gfsId) from gfs where gfsId=?";
+	$cnt = dbGetColumn("gfs", $sql, array($id) );
+	if($cnt >=1){ return true; }
+	return false;
+}
+
+
+
+function delGFSProfile($id){
+        $sql = "delete from gfs where gfsId=?";
+	dbSet("gfs", $sql, array($id) );
+        $sql = "delete from gfs_instance where gfsId=?";
+	dbSet("gfs", $sql, array($id) );
+}
+
+#######################################################
+
+
+function getVMID($vmuuid){
+	$vmuuid = trim($vmuuid);
+        $sql = "SELECT VMID from VM where UUID=?";
+	return dbGetColumn("nimbus", $sql, array($vmuuid) );
+}
+
+function getVMUuid($vmid){
+	$sql = "SELECT UUID from VM where VMID=?";
+	$uuid = dbGetColumn("nimbus", $sql, array($vmid) );
+        if(!isset($uuid) ){ $uuid= 0; }
+        return $uuid;
+}
+
+function getVaults($uuid=null){
+        $out = array();
+
+	$sql = "select v.VMName as name, v.VMID, v.UUID as uuid, vs.timestamp,vv.processingTime,vv.size as totalSize, vf.deltaSize as delta, vf.deltaPostDedup as dedup,  vv.jobID, vv.action from vm v, version_site vs, vm_version vv, vm_files vf where vs.vmid=v.vmid and vs.siteid=1 and vv.timestamp=vs.timestamp and vv.vmversion = vf.vmversion and v.vmid = vf.vmid ";
+
+	if($uuid != null){
+		$sql .= " and v.uuid = '$uuid'";
+	}
+
+	$vs = dbGet("nimbus", $sql);
+	foreach($vs as $j){
+		$sql = "SELECT count(*) from version_site where vmid=? and timestamp=? and siteid=0";
+		$j->isOnsite = dbGetColumn("nimbus", $sql, array($j->VMID, $j->timestamp) );
+		$j->isOffsite=1;
+                array_push($out, $j);
+        }
+        return $out;
+
+}
+function getVersionsByDay($uuid=null ){
+	$sql = "SELECT vv.VMVersion as version,
+            v.VMName as name,
+            v.VMID, 
+            v.UUID as uuid,
+            vv.timestamp,
+            vv.processingTime,
+            vv.action,
+            vv.committed as status, 
+            vv.size as totalSize,
+            vv.jobID,
+            SUM(vf.deltaSize) as delta,
+            SUM(vf.deltaPostDedup) as dedup,
+            vg.onsite as gfsPolicyOn,
+                vg.offsite as gfsPolicyOff
+                FROM VM_Version vv
+                JOIN vm v ON vv.vmid = v.vmid
+                LEFT JOIN vm_files vf ON vf.vmversion = vv.vmversion AND vf.vmid = vv.vmid
+                LEFT JOIN version_gfs_cache vg ON vg.vmid = vv.vmid AND vg.version = vv.vmversion";
+
+        if($uuid){ $sql .= " WHERE v.UUID = '$uuid' "; }
+                $sql .= " GROUP BY vv.VMVersion, v.VMName, v.VMID, v.UUID, vv.timestamp, vv.processingTime,
+                    vv.action, vv.committed, vv.size, vv.jobID order by v.uuid, vv.timestamp desc";
+
+	return getVmVersionImpl($sql);
+}
+
+function getVersions($uuid ){
+	$sql ="select distinct vv.VMVersion as version,
+                v.VMName as name,
+                v.VMID,
+                v.UUID as uuid,
+                vv.timestamp,
+                vv.processingTime,
+                vv.action,
+                vv.committed as status,
+                vv.size as totalSize,
+                vv.jobID,
+                vg.onsite as gfsPolicyOn,
+                vg.offsite as gfsPolicyOff
+                from VM_Version vv, vm_files vf, vm v
+                left join version_gfs_cache vg on
+                vg.vmid = vv.vmid
+                and vg.version = vv.vmversion
+                WHERE vf.vmversion = vv.vmversion
+                and vf.vmid = vv.vmid
+                and v.uuid = '$uuid'
+                and vv.vmid=v.vmid";	// This one shows all the VM disks, but hides any version that doesn't have VM_Files
+
+        $sql ="select distinct vv.VMVersion as version,
+                v.VMName as name,
+                v.VMID,
+                v.UUID as uuid,
+                vv.timestamp,
+                vv.processingTime,
+                vv.action,
+                vv.committed as status,
+                vv.size as totalSize,
+                vv.jobID,
+                vg.onsite as gfsPolicyOn,
+                vg.offsite as gfsPolicyOff
+                from VM_Version vv, vm v
+                left join version_gfs_cache vg on
+                vg.vmid = vv.vmid
+                and vg.version = vv.vmversion
+                WHERE v.uuid = '$uuid'
+                and vv.vmid=v.vmid order by vv.timestamp desc";	// this one shows all the 'hidden' versions, but they don't have any disks (VM_Files) b/c the db doesn't have them
+
+
+	return getVmVersionImpl($sql, $uuid);
+}
+function getVmVersionImpl($sql){
+        $out = array();
+	$guys = dbGet("nimbus", $sql);
+	foreach($guys as $j){
+		$sql = "SELECT count(*) from version_site where vmid=? and timestamp=? and siteid=0";
+		$j->isOnsite  = dbGetColumn("nimbus", $sql, array($j->VMID, $j->timestamp) );
+
+		$sql = "SELECT count(*) from version_site where vmid=? and timestamp=? and siteid=1";
+		$j->isOffsite  = dbGetColumn("nimbus", $sql, array($j->VMID, $j->timestamp) );
+
+		$j->Disks = array();
+		getVMDrives($j);
+		array_push($out, $j);
+	}
+
+	return $out;
+}
+
+function getVmVersion($uuid, $ts){
+        $j = new stdClass();
+        $j->totalSize =0;
+        $j->Disks = getVMDrivesImpl($uuid, $ts);
+        foreach($j->Disks as $d){
+                $j->totalSize += $d->size;
+        }
+        return $j;
+}
+
+function getVMDrives(&$vm){
+	$uuid = null;
+	if(isset($vm->UUID)){ $uuid = $vm->UUID; }
+	else if(isset($vm->uuid)){ $uuid = $vm->uuid; }
+	if(!isset($vm->versions)){ return; }
+        $vm->Disks = getVMDrivesImpl($uuid, $vm->versions);
+        foreach($vm->Disks as $d){
+                $vm->totalSize += $d->size;
+        }
+}
+function getVMDrivesImpl($uuid, $ts){
+        $sql = "select vf.fileSize as size, vf.deltaSize, vf.deltaPostDedup as storedSize, vf.filename, vf.committed, vf.timestamp, v.timestamp   from VM_Files vf, vm_version v, vm  where vf.vmid=v.vmid and vf.vmversion=v.vmversion and v.timestamp = ? and v.vmid = vm.vmid and vm.uuid=?";
+        return dbGet("nimbus", $sql, array($ts, $uuid) );
+}
+
+// This is used (only) for the WS for tag searching
+function getDisksForVM($uuid){
+        $sql = "select * from tm_vmdisk where vmuuid=?";
+	return dbGet("nimbus", $sql, array($uuid) );
+}
+
+function haveVM($uuid){
+        $sql = "SELECT count(uuid) from VM where uuid=?";
+        $cnt = dbGetColumn("nimbus", $sql, array($uuid) );
+        if($cnt ==0){
+                makeNewVM($uuid);
+        }
+}
+
+
+function getVM($uuid){
+	haveVM($uuid);
+
+	$sql = "SELECT vm.vmid, v.*, vm.*, h.virttype as type, vm.VMName as name, h.hostName as hostName,vm.maxVersionsOffsite as maxOffsiteVersions, 
+			vm.maxVersions as maxOnsiteVersions, h.hostID as hostID
+			from tm_vminfo v, Host h, VM vm
+			where v.hostUUID = h.uuid 
+			and h.deleteFlag is null 
+			AND v.uuid =? 
+			and vm.UUID=v.uuid
+			order by h.virttype, v.poolID, v.name, v.size";
+	$v = dbGetOne("nimbus", $sql, array($uuid) );
+
+	// sometimes the VM is no longer there, so tm_vminfo isn't available.  Handle this:
+	if($v == false){
+		$sql = "SELECT vm.VMName as name, vm.uuid as uuid, vm.virtTech as type, vm.accessIP, vm.authProfile, vm.VMID, vm.VMID as id, vm.maxVersionsOffsite as maxOffsiteVersions, vm.maxVersions as maxOnsiteVersions, vm.poolID, vm.authProfile, h.hostName, h.hostID from vm, host h where h.hostID = vm.hostID and vm.uuid = ?";
+		$v = dbGetOne("nimbus", $sql, array($uuid) );
+	}
+	if(isset($v->UUID)){ $v->uuid = $v->UUID; }
+
+	if(!empty($v->ipaddress)){ $v->ip = $v->ipaddress; }
+	if(!empty($v->accessIP)){ $v->ip = $v->accessIP; }
+
+	return $v;
+}
+
+// used exclusively by the Mgr to sync it's manager.db vms table
+function getAllVMsForMgr(){
+	$sql = "SELECT i.*,  COALESCE(vm.authprofile, '') AS authProfile, COALESCE(vm.accessIP, '') AS accessIP, COALESCE(vm.maxVersionsOffsite, '') AS maxVersionsOffsite, COALESCE(vm.maxVersions, '') AS maxVersions FROM tm_vminfo i LEFT JOIN vm ON i.uuid = vm.uuid";
+
+	$sql = "SELECT 
+    COALESCE(vm.uuid, tm_vminfo.uuid) AS uuid,
+    COALESCE(vm.VMID, 0) AS VMID,
+    COALESCE(vm.VMName, '') AS VMName,
+    COALESCE(vm.virttech, tm_vminfo.isHidden) AS type,
+    COALESCE(vm.authProfile, '') AS authProfile,
+    COALESCE(vm.hostid, '') AS hostid,
+    COALESCE(vm.accessIP, '') AS accessIP,
+    COALESCE(vm.maxVersions, '') AS maxVersions,
+    COALESCE(vm.maxVersionsOffsite, '') AS maxVersionsOffsite,
+    COALESCE(tm_vminfo.name, '') AS name,
+    COALESCE(tm_vminfo.powerState, '') AS powerState,
+    COALESCE(tm_vminfo.hostUUID, '') AS hostUUID,
+    COALESCE(tm_vminfo.poolID, '') AS poolID,
+    COALESCE(tm_vminfo.ipaddress, '') AS ipaddress,
+    COALESCE(tm_vminfo.size, '-1') AS size
+FROM vm
+LEFT JOIN tm_vminfo ON vm.uuid = tm_vminfo.uuid
+UNION
+SELECT 
+    COALESCE(vm.uuid, tm_vminfo.uuid) AS uuid,
+    COALESCE(vm.VMID, 0) AS VMID,
+    COALESCE(vm.VMName, 'Name') AS VMName,
+    COALESCE(vm.virttech, tm_vminfo.isHidden) AS type,
+    COALESCE(vm.authProfile, '') AS authProfile,
+    COALESCE(vm.hostid, '') AS hostid,
+    COALESCE(vm.accessIP, '') AS accessIP,
+    COALESCE(vm.maxVersions, '') AS maxVersions,
+    COALESCE(vm.maxVersionsOffsite, '') AS maxVersionsOffsite,
+    COALESCE(tm_vminfo.name, '') AS name,
+    COALESCE(tm_vminfo.powerState, '') AS powerState,
+    COALESCE(tm_vminfo.hostUUID, '') AS hostUUID,
+    COALESCE(tm_vminfo.poolID, '') AS poolID,
+    COALESCE(tm_vminfo.ipaddress, '') AS ipaddress,
+    COALESCE(tm_vminfo.size, '-1') AS size
+FROM tm_vminfo
+LEFT JOIN vm ON vm.uuid = tm_vminfo.uuid
+WHERE vm.uuid IS NULL";
+	$things = dbGet("nimbus", $sql);
+	foreach($things as $v){
+		$sql = "select count(*) from vm_version where vmid =?";	
+		$cnt = dbGetColumn("nimbus", $sql, array($v->VMID) );
+		$v->numBackups = $cnt;
+	}
+        return $things;
+}
+
+// we need to list only VMs that can be backed up
+// Also, perhaps, agents we know of?
+function getAllSources($q=null){
+	if($q == null){
+		$sql = "SELECT name, uuid, hostUUID, poolID, size, isHidden from tm_vminfo order by poolid, name";
+		return dbGet("nimbus", $sql);
+	}else{
+		$sql = "SELECT name, uuid, hostUUID, poolID, size, isHidden from tm_vminfo where name like ? order by poolid, name";
+		return dbGet("nimbus", $sql, array("%$q%") );
+	}
+}
+
+function getAllVMsWithBackups(){
+	$sql = "SELECT distinct v.VMID as vmid, v.UUID as uuid, v.VMName as name, v.virtTech as type, vv.timestamp, vm.size  from vm v, vm_version vv LEFT JOIN  tm_vminfo vm ON vm.uuid = v.uuid   LEFT JOIN Host h ON v.hostID = h.hostID WHERE h.deleteFlag is null and vv.vmid = v.VMID group by v.uuid order by v.VMname, h.virttype, v.poolID, vm.size";
+	return dbGet("nimbus", $sql);
+}
+function getAllPhysicalVms(){
+        $sql = "SELECT * from VM where virttech=10";
+	return dbGet("nimbus", $sql);
+}
+
+
+
+function getAllVMs(){
+	$sql ="SELECT
+        COALESCE(vm.uuid, tm_vminfo.uuid) as uuid,
+        COALESCE(vm.VMName, tm_vminfo.name) AS name,
+        tm_vminfo.osname,
+        tm_vminfo.powerstate,
+        tm_vminfo.poolid,
+        tm_vminfo.size,
+        tm_vminfo.ipaddress,
+        tm_vminfo.hostUUID,
+        vm.virttech as type,
+        vm.maxVersions as maxVersions,
+        vm.maxVersionsOffsite as maxVersionsOffsite,
+        vm.authProfile as authProfile,
+        vm.accessIP as accessIP
+FROM vm LEFT JOIN tm_vminfo ON vm.uuid = tm_vminfo.uuid
+
+UNION
+SELECT
+        COALESCE(vm.uuid, tm_vminfo.uuid) as uuid,
+        COALESCE(vm.VMName, tm_vminfo.name) AS name,
+        tm_vminfo.osname,
+        tm_vminfo.powerstate,
+        tm_vminfo.poolid,
+        tm_vminfo.size,
+        tm_vminfo.ipaddress,
+        tm_vminfo.hostUUID,
+        vm.virttech as type,
+        vm.maxVersions as maxVersions,
+        vm.maxVersionsOffsite as maxVersionsOffsite,
+        vm.authProfile as authProfile,
+        vm.accessIP as accessIP
+FROM  tm_vminfo  LEFT JOIN vm ON vm.uuid = tm_vminfo.uuid;";
+
+	return getVMInfos($sql, true);
+}
+
+function getVMsByHost($uuid){
+	$sql = "SELECT distinct v.*, h.virttype as type from tm_vminfo v, Host h where v.hostUUID = h.uuid and h.uuid ='$uuid' and h.deleteFlag is null order by h.virttype, v.poolID, v.name, v.size";
+	return getVMInfos($sql, false);
+}
+
+function getVMInfos($sql, $includeLastBackup){
+	$out = array();
+	$all = dbGet("nimbus", $sql);
+	foreach($all as $j){
+		$j->state = $j->powerState;
+		$j->totalSize = -1;
+		if(isset($j->size)){ $j->totalSize = $j->size; }
+
+		$j->timestamp =0; 	// last backup time?
+		$j->lastJobResult=0;	// 1 = good, other = fail
+		$j->lastJobID=0;
+		$j->lastFailJobID=0;
+		$j->failRatio=0;
+		if($j->type == null){ 
+			$j->type = 10;
+		}
+		if($includeLastBackup){	
+			getVMLastBackupInfo($j);
+		}
+                array_push($out, $j);
+        }
+        return $out;
+}
+
+function getVMLastBackupInfo(&$vm){
+	$sql = "select j.jobid, jv.vm_version, v.VMname, v.uuid, vv.timestamp, vv.committed from job_vms jv, job j, schedule s, vm v, vm_version vv
+		where j.jobID = jv.jobID and (j.status != 0 or j.status != 1 or j.status != 2 or j.status != 3)
+		and s.scheduleID = j.scheduleID and jv.vmid = v.vmid and v.uuid = '$vm->uuid' and vv.vmid=v.vmid and vv.vmversion = jv.vm_version
+		and (j.status != 0 and j.status != 1 and j.status != 2 and j.status != 3)
+		and s.jobType != 14 order by jv.jobID desc limit 5";
+	$guys = dbGet("nimbus", $sql);
+	$tots=0;
+	$vm->lastSuccess =0;
+	foreach($guys as $det){
+		if($vm->timestamp==0){
+			$vm->timestamp =$det->timestamp;         // last backup time?
+		}
+		if($vm->lastJobID==0 ){
+			$vm->lastJobResult=$det->committed;      // 1 = good, other = fail
+			$vm->lastJobID=$det->jobID;
+		}
+		if($det->committed !=1){
+			if( $vm->lastFailJobID==0 ){
+				$vm->lastFailJobID=$det->jobID;
+			}
+		}else if($vm->lastSuccess==0){
+			$vm->lastSuccess= $det->timestamp;
+		}
+	}
+	$sql = "select jv.* from job_vms jv, vm v where v.uuid='$vm->uuid' and v.vmid=jv.vmid order by jobid desc limit 5";
+	$tots=0;
+	$vm->failRatio =0;
+	$things = dbGet("nimbus", $sql);
+	foreach($things as $det){
+		if($det->VM_Version < 0){
+			$vm->failRatio++;
+		}
+		$tots++;
+	}
+	
+	if($vm->failRatio > 0 && $tots >0){ $vm->failRatio = round(($vm->failRatio/$tots) * 100); }
+}
+
+function convertVMInfoObject($o){
+	$h = new stdClass();
+        $h->uuid = $j->uuid;
+        $h->name = $j->hostName;
+        $h->type = $j->virtType;
+        $h->username = $j->username;
+        $h->password = $j->password;
+        $h->lastUsed = $j->lastUsed;
+        $h->uuid = $j->uuid;
+        $h->poolID = $j->poolID;
+        $h->poolName = $j->poolID;
+        return $h;
+}
+
+
+function updateVM($uuid, $what, $value){
+	if($what== "offsitemax"){
+		$sql = "update VM set maxVersionsOffsite=? where UUID=?";
+		dbSet("nimbus", $sql, array($value, $uuid));
+	}	
+	if($what== "onsitemax"){
+		$sql = "update VM set maxVersions=? where UUID=?";
+		dbSet("nimbus", $sql, array($value, $uuid));
+	}	
+	if($what== "authprofile"){
+		$sql = "update VM set authProfile=? where UUID=?";
+		dbSet("nimbus", $sql, array($value, $uuid));
+	}	
+	if($what== "accessip"){
+		$sql = "update VM set accessIP=? where UUID=?";
+		dbSet("nimbus", $sql, array($value, $uuid));
+	}	
+	syncDBs();
+
+}
+function deleteVM($id, $site=0){
+
+	try{
+		$uuid = getVMUuid($id);
+		//$sql = "DELETE from schedule_vms where VMID=$id";	
+		//quickDB("nimbus", $sql);
+		$sql = "DELETE from schedule_vms where VMID=?";
+		dbSet("nimbus", $sql, array($id ));
+                $arg = array();
+                $arg["command"] = "deleteVm";
+                $arg["site"] = "$site";
+                $arg["uuid"] = "$uuid";
+
+                issueJavaCmd($arg, 0, 0,0);
+
+        }catch(Exception $ex){
+                throw new Exception("Failed to delete VM: ".$ex->getMessage());
+        }
+}
+
+
+function getSRsForHost($h){
+	$out = array();
+	$ours = json_decode(file_get_contents("/mnt/instaboot/sr.id"),true);	// exclude our NFS SR
+	$sql = "select sr.* from tm_sr sr, tm_vhost th, host h, host_sr hsr where sr.poolid = th.poolid and th.uuid=? and hsr.srid = sr.id and th.uuid=h.uuid and h.hostID = hsr.hostid and isShared != 1 order by sr.free desc";
+	$guys = dbGet("nimbus", $sql, array($h->uuid));
+	foreach($guys as $j){
+		if($j->uuid == $ours["sr-uuid"]){ continue; }
+		$j->poolID = $j->poolid;
+		$j->name = "[Local] $j->name (". bytesToString($j->free)." Free)";
+		array_push($out, $j);
+        }
+	$sql = "select sr.* from tm_sr sr where sr.poolid = ? and isShared=1 order by sr.free desc";
+	$guys = dbGet("nimbus", $sql, array($h->poolID));
+	foreach($guys as $j){
+		if($j->uuid == $ours["sr-uuid"]){ continue; }
+		$j->poolID = $j->poolid;
+		$j->name = "[Shared] $j->name (". bytesToString($j->free)." Free)";
+		array_push($out, $j);
+	}
+
+        return $out;
+
+	
+}
+
+function haveHost($uuid){
+		$sql = "SELECT count(uuid) from host where uuid=?";
+		$cnt = dbGetColumn("nimbus", $sql, array($uuid));
+		if($cnt ==0){ return false; }
+		return true;
+}
+
+function haveHostbyIP($ip){
+                $sql = "SELECT count(hostName) from host where hostName=?";
+		$cnt = dbGetColumn("nimbus", $sql, array($ip));
+                if($cnt ==0){ return false; }
+                return true;
+}
+
+function getAllTmPools(){
+	$sql = "SELECT * from tm_pool" ;
+	return dbGet("nimbus", $sql);
+}
+
+function getHosts($notXen=false){
+        $out = array();
+	$sql = "SELECT * from Host where deleteFlag is null" ;
+	if($notXen){
+		$sql = "SELECT * from Host where deleteFlag is null and virtType != 2" ;
+	}
+	$all = dbGet("nimbus", $sql);
+	foreach($all as $j){
+                array_push($out, convertHostObject($j));
+        }
+        return $out;
+}
+
+function getHost($id){
+	$h = new stdClass();
+        $sql = "SELECT * from Host where deleteFlag is null and hostID=?" ;
+	if(!is_numeric($id)){
+		$sql = "SELECT * from Host where deleteFlag is null and hostName=?" ;
+	}
+	$j = dbGetOne("nimbus", $sql, array($id) );
+	if(!is_object($j)){
+		throw new Exception("Could not find a host with ID $id in DB.");
+	}
+	$h =  convertHostObject($j);
+	if($h->type ==10){
+		$sql = "SELECT accessIP, authProfile from VM where hostid=?";
+		$v = dbGetOne("nimbus", $sql, array($id) );
+		$h->accessIP = $v->accessIP;
+		$h->authProfile = $v->authProfile;
+	}
+
+	return $h;
+}
+
+function getHostByUuid($uuid){
+	$h = new stdClass();
+        $sql = "SELECT * from Host where deleteFlag is null and uuid=?" ;
+	$j = dbGetOne("nimbus", $sql, array($uuid) );
+	if(!is_object($j)){ throw new Exception("Could not find a host with UUID $uuid in DB."); }
+	return convertHostObject($j);
+}
+
+function getAllHosts(){
+        $sql = "SELECT * from Host order by virtType, poolID, role desc";
+	return dbGet("nimbus", $sql);
+}
+
+
+function getHostForPool($poolID){
+        $hostid =0;
+        $sql = "SELECT hostID from host where poolID=? and deleteFlag is null" ;
+	$hostid = dbGetColumn("nimbus", $sql, array($poolID) );
+        return getHost($hostid);
+}
+
+
+function getHostForPhysVM($vmid){
+        $sql = "SELECT hostID from VM where VMID=?" ;
+	$hostid = dbGetColumn("nimbus", $sql, array($vmid) );
+	return getHost($hostid);
+}
+
+function convertHostObject($j){
+	$h = new stdClass();
+	$h->hostID = $j->hostID;
+	$h->name = $j->hostName;
+	$h->type = $j->virtType;
+	$h->role = $j->role;
+	$h->username = $j->username;
+	$h->password = unobfuscate($j->password);
+	$h->lastUsed = $j->lastUsed;
+	$h->uuid = $j->uuid;
+	$h->poolID = $j->poolID;
+	$h->poolName = $j->poolID;
+	$h->useSSL = true;
+	if($j->port == 443){ $h->useSSL=true; }
+	$h->isLicensed=0;
+	if(isset($j->key) && $j->key != null && $j->key == "licensed"){
+		$h->isLicensed=1;
+	}
+        $h->nativeName = $h->name;
+        $h->numCPU=2;
+        $h->freeMem = 0;
+        $h->totalMem = 0;
+        $h->osName = "TBD";
+	if($h->type ==10){
+		$h->osName = "Windows (Agent)";
+	}else if ($h->type ==3){
+		$h->osName = "Hyper-v";
+	}else if ($h->type ==2){
+		$h->osName = "Xen";
+	}
+	
+
+        $sql = "SELECT * from tm_vhost where uuid =?" ;
+	$det = dbGetOne("nimbus", $sql, array($h->uuid) );
+	if(is_object($det)){
+		$h->nativeName = $det->nativeName;
+		$h->numCPU = $det->numcpu;
+		$h->freeMem = $det->freeMemory;
+		$h->totalMem = $det->totalMemory;
+		$h->osName = $det->osName;
+	}
+
+        if($h->type ==2){
+                $sql = "SELECT name from tm_pool where uuid=?";
+                $h->poolName = dbGetColumn("nimbus", $sql, array($h->poolID));
+        }
+
+
+	$h->physicalVMID =0;
+	if($h->type ==10){
+		$sql = "SELECT VMID from VM where virtTech=10 and hostID=?";
+		$vem = dbGetOne("nimbus", $sql, array($h->hostID) );
+		if(isset($vem) && is_object($vem)){
+			$h->physicalVMID=$vem->VMID; 
+		}
+	}
+
+	return $h;
+}
+
+function delHost($guid){
+        $h = getHostByUuid($guid);
+        if($h->type == 2){
+                syslog(LOG_INFO,"About to run /usr/local/sbin/instaAdmin unplugSrToHost $h->hostID");
+                $res = shell_exec("/usr/local/sbin/instaAdmin unplugSrToHost $h->hostID");
+                syslog(LOG_INFO,"unplug results: $res");
+        }
+
+	$h = getHostByUuid($guid);
+        $sql = "delete from host where uuid = ?";
+	dbSet("nimbus", $sql, array($guid) );
+        $sql = "delete from tm_vhost where uuid = ?";
+	dbSet("nimbus", $sql, array($guid) );
+	if($h->type == 10){
+		$sql = "select vmid from VM where hostID = ?";
+		$vmid = dbGetColumn("nimbus", $sql, array($h->hostID) );
+		$sql = "DELETE from schedule_vms where VMID=?";
+		dbSet("nimbus", $sql, array($vmid) );
+		$sql = "UPDATE VM set hostid=0 where vmid=?";
+		dbSet("nimbus", $sql, array($vmid) );
+	}
+	return "Host deleted successfully";
+}
+
+function doAddHost($h){
+	$id=0;
+	$base = $GLOBALS['settings']->alikeRoot;
+	$tcp =443;
+	$key="";
+	if($h->licensed){ $key = "licensed"; }
+
+	$pass = "";
+	// scramble it for ourselves
+	if($h->type != 10){ $pass = obfuscate($h->password); }
+
+	if(haveHost($h->guid)){
+		$sql = "UPDATE HOST set hostname=?, username=?, password=?, key=?  where uuid=?";
+		dbSet("nimbus", $sql, array($h->ip, $h->username, $pass, $key, $h->guid ));
+		return;
+	}
+
+	$sql = "INSERT INTO Host (hostID, hostName, virtType, username, password, role, key, port, uuid, poolid, lastUsed) VALUES (NULL,?,?, ?, ?, ?, ?, ?, ?, ?, ?)";
+	$id = dbSet("nimbus", $sql, array($h->ip, $h->type, $h->username, $pass, 0, $key, $tcp, $h->guid,$h->poolid,0 ) );
+	if($h->type ==10){
+		// VMID|VMName|virtTech|hostID|deleteFlag|maxVersions|UUID|poolID|maxVersionsOffsite|authProfile|accessIP
+		$sql = "INSERT into VM (VMName,virtTech,hostID,deleteFlag,UUID,poolID, accessIP) values (?,10,$id,NULL,?,?,?)";
+		$uuid = "tmp_uuid $id";
+		$vmid =dbSet("nimbus", $sql, array($h->ip, $uuid, $h->ip, $h->authProfile, $h->accessIP ));
+
+		$uuid = getOrMakeAlikeGuid($h->ip, false);
+		$sql = "UPDATE host set uuid=?, poolid=?, role=1 where hostid = ?";
+		dbSet("nimbus", $sql, array($uuid, $uuid, $id) );
+
+		$testid = getVMID($uuid);
+		if($testid > 0){	
+			// there is already a vm with this guid.  reconnect us
+			$sql = "UPDATE VM set hostid=?, vmname=? where vmid = ?";
+			dbSet("nimbus", $sql, array($id, $h->hostname, $testid) );
+
+			$sql = "DELETE from VM where vmid = ?";
+			dbSet("nimbus", $sql, array($vmid) );
+		}else{
+			// we're new
+			$sql = "UPDATE VM set uuid=? where vmid = ?";
+			dbSet("nimbus", $sql, array($uuid, $vmid) );
+		}
+	}else if($h->type == 3){
+		$uuid = getOrMakeAlikeGuid($h->ip, true);
+		$sql = "UPDATE host set uuid=?, poolid=?, role=1 where hostid = ?";
+		dbSet("nimbus", $sql, array($uuid,$uuid, $id) );
+	}
+
+        if($h->type == 2){
+                exec("sudo /usr/local/sbin/setupNfs /dev/null ");
+                $res = shell_exec("/usr/local/sbin/instaAdmin plugSrToHost $id");
+                syslog(LOG_INFO,"Ran plugSrToHost $id, results: $res");
+                $cmd = "sudo /usr/local/sbin/abdAdmin import $id > /dev/null &";
+                exec($cmd);
+        }
+
+        $cmd = "$base/hooks/jobRunner -g $id > /dev/null &";
+        exec($cmd);
+
+	return "Host Added Successfully";
+}
+
+function getOrMakeAlikeGuidOld($id, $isHV=true){
+
+	$remoteFN = "guid.id";
+	$host = getHost($id);
+	$ip = "";
+	if($isHV){ 
+		$remoteFN = "guid.hv.id"; 
+		$ip = $host->name;
+	}else{
+		$ip = $host->accessIP;	// physical hosts use the vm's accessip
+	}
+	$uuid = $host->uuid;
+
+
+	if (agentFileExists($ip, $remoteFN)){
+		$theirs = agentFileGetContents($ip, $remoteFN);
+		if($theirs != $uuid && strlen($uuid) > 20){
+			throw new Exception("Remote host ($host->name) has a guid file mismatch: $uuid vs $theirs");
+		}
+		$uuid = $theirs;
+	}else{
+		if(strlen($uuid) < 20 ){ $uuid = makeGuid(); }
+		agentFilePutContents($ip,$remoteFN, $uuid);
+	}
+	return $uuid;
+}
+function getOrMakeAlikeGuid($ip, $isHV=true){
+
+        $remoteFN = "guid.id";
+        if($isHV){
+                $remoteFN = "guid.hv.id";
+        }
+        $uuid = "";
+
+
+        if (agentFileExists($ip, $remoteFN)){
+                $theirs = agentFileGetContents($ip, $remoteFN);
+                $uuid = $theirs;
+        }else{
+                $uuid = makeGuid(); 
+                agentFilePutContents($ip,$remoteFN, $uuid);
+        }
+        return $uuid;
+}
+
+function getSr($id){
+        if(is_numeric($id) ){
+                $sql = "SELECT * from tm_sr where id=?";
+        }else{
+                $sql = "SELECT * from tm_sr where uuid=?";
+        }
+	return dbGetOne("nimbus", $sql, array($id) );
+}
+
+function getAllSrs(){
+        $sql = "SELECT * from tm_sr";
+	return dbGet("nimbus", $sql);
+}
+function getAllNets(){
+        $sql = "SELECT * from tm_network";
+	return dbGet("nimbus", $sql);
+}
+
+function getAvailableLicenseEst($type=1){
+	// type: 1 = virt, 2 = phys
+	$flav =0;
+	if($type == 2){ $flav =10; }
+        $lics = array();
+        $sql = "SELECT * from licenses where product =7 and flavor=$flav";
+	$all = dbGet("nimbus", $sql);
+	$now = time();
+	$total=0;
+	foreach($all as $l){
+		if($l->flavor == 5){ return 9999; }
+		if($l->lifespan > 0){ if ( ($l->lifespan * 86400) + $l->timestamp < $now){ continue; } }
+		$total += $l->quantity;
+        }
+	if($flav ==0){ $flav =2; } // ugly inconsistent flavor types
+	$sql = "SELECT sum(numcpu) from tm_vhost tm, host h where h.hostName = tm.name and h.virtType = $flav and h.key = 'licensed'";
+        $used = dbGetColumn("nimbus", $sql);
+	$total -= $used;
+
+	
+        return $total;
+}
+
+
+function getTotalVMSize(){
+	$sql = "SELECT sum(size) from tm_vmdisk";
+	return dbGetColumn("nimbus", $sql);
+}
+
+function getVMCount($justCommitted){
+	$sql = "SELECT distinct count(*) as num from tm_vminfo ";
+	if($justCommitted){
+		$sql = "SELECT count(distinct vmid) as num from vm_version where committed=1";
+	}
+	return dbGetColumn("nimbus", $sql);
+}
+
+function packageLogs(){
+	// copy nimbus to tmp
+	// perhaps drop host passwords
+	// zip up Alike logs folder
+	// zip up ADS logs
+	// zip up DBs 
+
+	$tmpDir = "/tmp/package_tmp";
+	if(file_exists($tmpDir)){
+		exec("rm -fr $tmpDir");
+	}
+	$outFile = "/home/alike/Alike/temp/support.7z";
+	if(file_exists($outFile)){
+		unlink($outFile);
+	}
+	exec("mkdir $tmpDir");
+	exec("mkdir $tmpDir/dbs");
+	exec("mkdir $tmpDir/logs");
+
+	$pdb = "/home/alike/Alike/DBs";
+
+	exec("cp $pdb/nimbusdb.db $tmpDir/dbs/");
+	exec("cp $pdb/nimbusjobs.db $tmpDir/dbs/");
+	$tmpDB = "$tmpDir/dbs/nimbusjobs.db";
+	if(file_exists($tmpDB) && filesize($tmpDB) > 1024 * 1024 ){
+		try{
+			$db = new PDO("sqlite:$tmpDB");
+			$db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+			$cutoff = time() - (86400 * 60);	// 60 days?
+			$db->exec("delete from NimbusJobEntry where timestamp < $cutoff");
+			$db->exec('PRAGMA VACCUUM;');
+		}catch(Exception $ex){ }
+	}
+
+
+
+	exec("cp /home/alike/logs/*.log /$tmpDir/logs/");
+	exec("cp /home/alike/logs/syslog /$tmpDir/logs/");
+	exec("cp /home/alike/a3.rev $tmpDir/");
+	exec("cp /home/alike/Alike/build.num $tmpDir/");
+	exec("cp /home/alike/Alike/inst.id $tmpDir/");
+	exec("df -h > /$tmpDir/du.txt");
+	exec("cat /proc/meminfo > /$tmpDir/meminfo.txt");
+	exec("ps aux > /$tmpDir/procs.txt");
+	exec("sudo dmesg > /$tmpDir/dmesg.txt");
+	exec("cp /home/alike/.bash_history /$tmpDir/hist.txt");
+	exec("uptime > /$tmpDir/uptime.txt");
+	exec("date > /$tmpDir/localtime.txt");
+
+	$zipPass = "[INSERT A PASSWORD HERE]";
+	$tar = "/home/alike/Alike/temp/support".time().".tar";
+	$outTar = "/home/alike/Alike/temp/support.tar";
+	exec("tar -cf $tar $tmpDir /home/alike/Alike/agentShare/logs/");
+	exec("mv $tar $outTar");
+	exec("/usr/bin/7z a -p$zipPass $outFile $outTar");
+	exec("rm -fr $tmpDir");
+	exec("rm -f $outTar");
+	
+	return $outFile;
+}
+
+function testADSPath(){
+
+	$tst = "/mnt/ads/";
+
+        if(file_exists($tst)== false){ return "ADS not mounted"; }	// not even there
+        if(is_dir($tst)==false){ return "ADS is not a folder"; }	// not a directory
+
+        $sac = $tst."blocks/test.file";
+        $rnd = rand(0,100);
+        if(file_put_contents($sac, $rnd)===false){
+                return "Write Failure";
+        }
+        if(file_get_contents($sac) != $rnd){
+                return "Write Error";
+        }
+        unlink($sac);
+
+	
+	$stat = getADSStatus();
+	if($stat->status ==0){
+		$msg = $stat->message;
+		return $msg;	// FAILED TO OPEN... BAD
+	}
+
+        if($stat->freeBytes < 1024 * 1024 * 50){
+		$fr =  bytesToString($use->free)." Free";
+                $msg = "ADS is Full!  <b>$fr</b>";
+                return $msg;
+        }
+
+        return "OK";
+}
+function syncDBs($both=false){
+	if($both){
+		exec("/usr/local/sbin/dbSyncer /home/alike/Alike/DBs/nimbusdb.db");
+		exec("/usr/local/sbin/dbSyncer /home/alike/Alike/DBs/gfs.db");
+	}else{
+		$res = shell_exec("/usr/local/sbin/dbSyncer /home/alike/Alike/DBs/nimbusdb.db");
+	}
+}
+
+// used only for the dashboard
+function getVMsInJobs(){
+	$out = array();
+	// we're going to get a list of vmids from java
+	// we will take these, and look in the AH/temp/prog/ folder for the files:
+	// <vmid>_<diskNum>.map (eg. 6_0.map)
+	// each VM might have multiple map files
+	// these map files containt the eid for the progress for that disk, which lives in the same folder
+	$sql ="select s.name, j.jobID, vm.VMID, vm.uuid as uuid, vm.vmname as vmname from Job j, Schedule s, job_vms jvm, vm where (j.status = 0 or j.status=2 or j.status =3)  and j.scheduleID=s.scheduleID and (s.jobType=0 or s.jobType = 1 or s.jobType=5 or s.jobType=8 ) and jvm.jobID=j.jobID and vm.vmid=jvm.vmid and jvm.vm_version=0;";
+
+	$guys = dbGet("nimbus", $sql);
+	foreach($guys as $v){
+		$it = new stdClass();
+		$it->name = $v->vmname;
+		$it->jobName = $v->name;
+		$it->jobID = $v->jobID;
+		$it->VMID = $v->VMID;
+		$it->uuid = $v->uuid;
+		$it->progress = getProgFromVMMap($it->VMID);
+		array_push($out, $it);
+	}
+	return $out;
+}
+
+function cleanTempFolder(){
+	$pfolder = $GLOBALS['settings']->tempPath."/prog";
+
+	exec("rm -f $pfolder/*");
+
+}
+
+function getProgFromVMMap($vmid){
+	$pfolder = $GLOBALS['settings']->tempPath."/prog";
+	$ids = explode("\n",trim(shell_exec("cat $pfolder/".$vmid."_*.map")) );
+	$cnt=0;
+	$gperc=0;
+	foreach($ids as $id){
+                $f = trim("$pfolder/$id");
+		if(!file_exists($f) || is_dir($f)){ continue; }
+                $perc = file_get_contents($f);
+                $gperc += $perc;
+                $cnt++;
+
+	}
+	if($cnt ==0){ return 0; }
+	return ($gperc / $cnt);
+}
+
+function sendTestEmail(){
+	$s = getSubInfo();
+	$guid = getInstallID();
+	$bod = "Hello!<br>This is a test email from your A3 ($s->a3Name, guid:$guid ).  <br>If you're reading this, then everything is working well.  ";
+	$bod .="<br>If you didn't get this message, then I think we're both a little confused.";
+	return sysmail("A3 Test Email", $bod, true);
+}
+
+function getSimiarVMs($uuid){
+	$out = array();
+	$v = getVMSimple($uuid);
+	if(!isset($v->size)){ return array(); }
+	$sql = "select uuid from  vm WHERE vmid in (select vmid from vm_version) and uuid in (select uuid from tm_vminfo where uuid=vm.uuid and size=?);";
+	return dbGet("nimbus", $sql, array($v->size) );
+}
+
+function getJobCount($sid, $pend){
+        $sql = "SELECT count(jobID) from job where scheduleID = ? and (status = 2 or status=3 )";
+        if($pend){
+                $sql = "SELECT count(jobID) from job where scheduleID = ? and status <= 1";
+        }
+	return dbGetColumn("nimbus", $sql, array($sid) );
+}
+
+function getJobResult($jid){
+	$sql= "SELECT SUM(CASE WHEN status = 2 THEN 1 ELSE 0 END) AS warnings, SUM(CASE WHEN status = 1 THEN 1 ELSE 0 END) AS errors from nimbusjobentry WHERE jobID=?";
+	return dbGetOne("jobLog", $sql, array($jid) );
+}
+
+
+// if a job is in progress, we need to loop over the vms and figure the estimated total job completion %
+//
+//	to do this we need to get the VMs size from meta
+//	and any active vms we call a function to get their % progress
+function calcJobProgress($jid){
+	// get vmid and totalSize for each vm in job
+	// add all the sizes of completed vms
+		$sql = "select vmid from job_vms where jobid=? and vm_version !=0";
+		$done = dbGetColumn("nimbus", $sql, array($jid) );
+
+		$sql = "select v.vmid, vi.size from tm_vminfo vi, job_vms jv, vm v where jv.jobid=? and v.vmid=jv.vmid and v.uuid=vi.uuid;";
+		$guys = dbGet("nimbus", $sql, array($jid));
+		// we have VMID and size
+		$total = 0;
+		$completed = 0;
+		foreach($guys as $g){
+			$total += $g->size;
+			if(property_exists($g, "VMID") && $g->VMID == $done){ 
+				$completed += $g->size;
+			}else{
+				// this VM isn't done.  could be in progress.
+				$prog = getJobVmProgress($jid, $g->VMID);
+				if($prog > 0){
+					$completed += ($prog / 100) * $g->size;				
+				}
+			}
+		}
+		if($total ==0){ return 0; }
+		$estProg = ($completed / $total) * 100;
+		$estProg = fixFloat($estProg);
+//echo "completed: $completed\n";
+//echo "total: $total\n";
+//echo "Prog: $estProg\n";
+		return $estProg;
+}
+
+function getJobVmProgressAll($jid){
+		// make negative versions the progress the vm got to when it failed?
+                $sql = "select vmid, vm_version from job_vms where jobid=?";
+                $all = dbGet("nimbus", $sql, array($jid));
+		$done = array();
+		foreach($all as $a){ 
+			$done[$a->VMID] = $a->VM_Version;
+		}
+                if(!is_array($done)){ $done = array(); }
+                $sql = "select v.vmid, vi.size from tm_vminfo vi, job_vms jv, vm v where jv.jobid=? and v.vmid=jv.vmid and v.uuid=vi.uuid;";
+                $guys = dbGet("nimbus", $sql, array($jid));
+		$out = [];
+                foreach($guys as $g){
+                        if(array_key_exists($g->VMID, $done)){
+				// positive is the version number, so it's done
+				if($done[$g->VMID] > 0){
+					$out[$g->VMID] = 100;
+				}else if($done[$g->VMID] < 0){
+					// negative is a premature failure (percentage)
+					$out[$g->VMID] = $done[$g->VMID];
+				}else{
+					// zero is in progress, maybe
+					$prog = getJobVmProgress($jid, $g->VMID);
+					$out[$g->VMID] = $prog;
+				}
+                        }else{
+                                // this VM isn't done.  could be in progress.
+                                $prog = getJobVmProgress($jid, $g->VMID);
+				$out[$g->VMID] = $prog;
+                        }
+                }
+                return $out;
+}
+
+// these are produced by the backupTool and friends.
+// one per job, they have data on each vm and their disks.
+// they are only important during a job, after which 
+// all vm progress info is either 100% when a vm_version is updated in the job_vms
+// or, if they fail, their percent is recorded as a negative value in the vm_version of the job_vms
+// only active jobs will try to look for these, otherwise the DB is used
+function getJobVmProgress($jid, $vmid){
+	// open the /tmp/job_ctl/jrb_prog.[jobid].dat
+	$dat = "/tmp/job_ctl/jrb_prog.".$jid.".dat";
+	if(!file_exists($dat)){ 
+//		echo "No prog file.  VMID $vmid isnt in progress\n";
+		return 0; 
+	}
+	$inf = unserialize(file_get_contents($dat));
+	if(!is_array($inf)){ return 0; }
+
+	foreach($inf as $k => $v){
+		if($k == $vmid){
+			// this is us.  get the disk prog
+			// $progressPercentage = ($completedWork / $totalWork) * 100;
+			$tot =0;
+			$comp = 0;
+			foreach($v->disks as $d){
+				$tot += $d->size;
+				$comp += round($d->size * ($d->prog / 100));
+			}
+			$prg = ($comp / $tot) * 100;
+			return fixFloat($prg);
+
+		}
+	}
+	return 0;
+}
+function fixFloat($num){
+	$rnd = number_format($num, 2, '.', '');
+	if (substr($rnd, -3) === '.00') {
+		$rnd = number_format($rnd, 0, '.', ''); 
+	}
+	return $rnd;
+}
+
+function updateJobProcessTime($jid, $tme){
+        //$sql = "UPDATE job set username=$tme where jobID=$jid";
+	//quickDB("nimbus",$sql );
+        $sql = "UPDATE job set username=? where jobID=?";
+	dbSet("nimbus", $sql, array($tme, $jid ));
+}
+function updateJobProgress($jid, $prg){
+        //$sql = "UPDATE job set stage=$prg where jobID=$jid";
+	//quickDB("nimbus",$sql );
+        $sql = "UPDATE job set stage=? where jobID=?";
+	dbSet("nimbus", $sql, array($prg, $jid ));
+}
+function updateJobStatus($jid, $stat){
+        //$sql = "UPDATE job set status=$stat where jobID=$jid";
+	//quickDB("nimbus",$sql );
+        $sql = "UPDATE job set status=? where jobID=?";
+	dbSet("nimbus", $sql, array($stat, $jid ));
+}
+function getJobSizeTotal($jid ){
+	$sql =" select sum(vi.size) from tm_vminfo vi, vm v, job_vms jv where jv.jobid=? and jv.vmid = v.vmid and v.uuid = vi.uuid";
+	return dbGetColumn("nimbus", $sql, array($jid));
+}
+function updateJobSizeTotal($jid ){
+	$sz = getJobSizeTotal($jid);
+        $sql = "UPDATE job set originalSize=? where jobID=?";
+	dbSet("nimbus", $sql, array($sz, $jid));
+}
+
+/// looks like this method isn't used
+function updateJobSizes($jobID, $originalSize, $sizeSent){
+        //$sql = "UPDATE job set sizeSent=$sizeSent, originalSize=$originalSize where jobID=$jobID";
+        $sql = "UPDATE job set sizeSent=?, originalSize=? where jobID=?";
+	dbSet("nimbus", $sql, array($sizeSent, $originalSize, $jobID ));
+}
+function updateJobVaultPID($jid, $pid){
+        //$sql = "UPDATE job set target=$pid where jobID=$jid";
+	//quickDB("nimbus",$sql );
+        $sql = "UPDATE job set target=? where jobID=?";
+	dbSet("nimbus", $sql, array($pid, $jid));
+}
+
+function getVMForVault($vmid, $jobid){
+	$sql = "SELECT v.*, vv.* from vm v, vm_version vv, job_vms jv where jv.jobid=? and vv.vmversion=jv.vm_version and vv.vmid=? and v.vmid=vv.vmid";
+        return dbGetOne("nimbus", $sql, array($jobid, $vmid) );
+}
+
+////////////////////////////////////////// start job control functions //////////////////////////////////////////
+function getCancelPath(){
+        $jcp = "/tmp/job_ctl";
+	$jcp =  $GLOBALS['settings']->tempPath;
+	return $jcp;
+}
+function getJobLockFile($id){
+        $jcp = "/tmp/job_ctl";
+        if (!file_exists($jcp)) { mkdir($jcp, 0777, true); }
+        $fl = "$jcp/job_".$id;
+        return $fl;
+}
+function checkForCancel($id){
+        $jcp = getCancelPath();
+        if (!file_exists($jcp)) { mkdir($jcp, 0777, true); }
+        $fl = "$jcp/job_".$id."-cancel";
+        return file_exists($fl);
+}
+function cancelJob($id){
+        $jcp = getCancelPath();
+        if (!file_exists($jcp)) { mkdir($jcp, 0777, true); }
+        $fl = "$jcp/job_".$id."-cancel";
+	exec("echo 1 > $fl");
+
+	$stat = 3;	// don't immediately set it to cancel, to avoid UI confusion
+	$j = getJob($id);
+	$cmd ="pgrep jobRunner -s $j->scheduleID";	
+	if(empty(trim(shell_exec($cmd))) ){
+		$stat = 5;
+	}
+	try{
+		//$sql = "UPDATE job set status = $stat where jobID=$id";
+		//quickDB("nimbus", $sql );
+		$sql = "UPDATE job set status = ? where jobID=?";
+		dbSet("nimbus", $sql, array($stat, $id));
+	}catch(Exception $ex){
+		syslog(LOG_WARNING, "Failed to get jobID that we were cancelling ($id)");
+	}
+}
+function deleteCancel($id){
+        $jcp = getCancelPath() ."/job_".$id."-cancel";
+	if(file_exists($jcp)){
+		unlink($jcp);
+	}
+}
+function readLocked($fp, $fl){
+        flock($fp,LOCK_SH);
+        $nv = trim(file_get_contents($fl));
+        flock($fp,LOCK_UN);
+        return $nv;
+}
+function incrementLocked($fp,$fl){
+        flock($fp,LOCK_EX);
+        $nv = trim(file_get_contents($fl));
+        $nv++;
+        exec("echo $nv > $fl");
+        flock($fp,LOCK_UN);
+        return $nv;
+}
+function decrementLocked($fp,$fl){
+        $fp = fopen($fl, "r+");
+        if(!$fp){ return 0; }
+        flock($fp,LOCK_EX);
+        $nv = trim(file_get_contents($fl));
+        $nv--;
+        exec("echo $nv > $fl");
+        flock($fp,LOCK_UN);
+        return $nv;
+}
+////////////////////////////////////////// end job control functions //////////////////////////////////////////
+
+function issueJavaCmd($cmd, $jobID, $vmid, $eid){
+        $cmdPath = $GLOBALS["settings"]->jvPath ."/";
+        $cmdFile="";
+        do{
+                $rd = rand(0,1000);
+                $cmdFile = $cmdPath . getInstallID() ."_". time() ."_".$rd.".kg";
+        }while(file_exists($cmdFile .".cmd" ));
+
+        $o = json_encode($cmd, 64);
+        file_put_contents($cmdFile.".cmd", $o);
+
+	if($eid > 0){
+		$pfile = $GLOBALS['settings']->tempPath."/prog/$eid";
+		$inpfile = $cmdFile.".progress";
+		$prog = 0;
+		file_put_contents($pfile,$prog);
+	}
+	$javaTimeout = 300;
+        $compFile = $cmdFile .".result";
+        while(!file_exists($compFile)){
+		if($eid>0){
+			if(file_exists($inpfile)){
+				$np = trim(file_get_contents($inpfile));
+				if($np != $prog && is_numeric($np) && $np > 0 && $np <=100){
+					file_put_contents($pfile, fixNum($np) );
+				}
+			}else{
+				if($javaTimeout==0){ throw new Exception("Timed out waiting for data engine to respond to command"); }
+				$javaTimeout--;
+			}
+		}
+                sleep(1);
+        }
+
+	if(!file_exists($compFile)){ throw new Exception("Data engine provided no output for command"); }
+	$rez= trim(file_get_contents($compFile));
+
+	exec("rm ".$cmdFile."*");	// cleanup our mess
+
+	if(substr($rez,0,2) !== "0:"){
+		$ln = explode(PHP_EOL,$rez);
+		throw new Exception("Data engine encountered errors: ".$ln[0] );
+	}
+	return $rez;
+}
+
+function getVersionJava($vmid, $version, $site){
+	$sql = "SELECT v.*, vv.* from VM v, VM_Version vv where v.vmid=? and v.vmid == vv.vmid and vv.vmversion=?";
+	$guy = dbGetOne("nimbus", $sql, array($vmid, $version) );
+	$guy->site = $site;
+	return $guy;
+}
+
+function getVersionFromJob($vmid, $jobID){
+        $sql = "SELECT vmversion from vm_version where vmid=? and jobid=?";
+	return dbGetColumn("nimbus", $sql, array($vmid, $jobID) );
+}
+
+
+function purgeVersion($uuid, $ts, $site=0){
+	try{
+		$arg = array();
+		$arg["command"] = "delete";
+		$arg["site"] = "$site";
+		$arg["uuid"] = $uuid;
+		$arg["version"] = $ts;
+		issueJavaCmd($arg, 0, 0,0);
+	}catch(Exception $ex){
+		throw new Exception("Failed to delete version: ".$ex->getMessage());
+	}
+}
+function setVersionRetention($vmid, $version, $site=0){
+
+                $sql = "SELECT v.*, vv.* from VM v, VM_Version vv where v.vmid=? and v.vmid == vv.vmid and vv.vmversion=?";
+		$guy = dbGetOne("nimbus", $sql, array($vmid, $version) );
+
+		$act = $guy->action;	// this is the onsite/offsite state thingy
+		if($site ==1){
+			if($act == 2){ $act=3; }	// retain everywhere
+			else if($act ==1){ $act=0; }	// no retention setting
+			else if($act ==3){ $act=2; }	// only onsite
+			else if($act ==0){ $act=1; }	// only offsite
+		}else{
+			if($act == 1){ $act=3; }	// retain everywhere
+			else if($act ==2){ $act=0; }	// no retention setting
+			else if($act ==3){ $act=1; }	// only offsite
+			else if($act ==0){ $act=2; }	// only onsite
+		}
+
+		$sql ="UPDATE VM_version set action=? where vmid=? and vmversion=?";
+		dbSet("nimbus", $sql, array($act, $vmid, $version) );
+	$str = "";
+	if($act ==0){ $str = "retention settings removed"; }
+	else if($act ==1){ $str = " will be retained in Vault (only)"; }
+	else if($act ==2){ $str = " will be retained Locally (only)"; }
+	else if($act ==3){ $str = " will be retained in all sites"; }
+
+	return $str;
+}
+
+function testHVWMI($ip, $user, $pass, $isHV=true){
+
+	$user = str_replace("\\","\\\\",$user);
+
+        $q = "SELECT CSName FROM Win32_OperatingSystem";
+        $cmd = "/home/alike/Alike/linbin/wmic.exe -U$user%'$pass' //$ip \"$q\" 2>&1";
+        $rez =-1;
+        $out=array();
+        exec($cmd,$out,$res);
+        if($res !=0){ 
+                $err = "WMI Failure";
+                foreach($out as $l){
+                        if(strpos($l, "NTSTATUS") !== false){
+                                $err = substr($l, 10);
+                                break;
+                        }
+                }
+		if(strpos($err,"ACCESS_DENIED") !== false){
+			$err = "Incorrect username/password.   (Access denied)";
+		}else if(strpos($err,"CONNECTION_REFUSED") !== false){
+			$err = "Connection refused.  Networking or firewall error.";
+		}
+                throw new Exception("WMI failure. $err");
+        }
+	if($isHV){
+		$q = "SELECT Name from Msvm_ComputerSystem";
+		$cmd = "/home/alike/Alike/linbin/wmic.exe -U$user%'$pass' --namespace=\"root\\virtualization\\v2\" //$ip \"$q\" 2>&1";
+		$rez =-1;
+		$out=array();
+		exec($cmd,$out,$res);
+		if($res ==0){ return true; }
+
+		$q = "SELECT ElementName from Msvm_ComputerSystem";
+		$cmd = "/home/alike/Alike/linbin/wmic.exe -U$user%'$pass' --namespace=\"root\\virtualization\" //$ip \"$q\" 2>&1";
+		$rez =-1;
+		$out=array();
+		exec($cmd,$out,$res);
+		if($res ==0){ return true; }
+
+		throw new Exception("Unable to detect Hyper-v (no v1 or v2) namespace on host.  $vm->name");
+	}
+	return true;
+
+}
+
+function getVmOptsFromSchedule($sid, $vmid){
+	$s =getSchedule($sid);
+        foreach($s->VMs as $v){
+                if($v->VMID == $vmid){
+			return $v;
+                }else if($v->vmID == $vmid){
+			return $v;
+                }
+        }
+	return null;
+}
+
+function updateJobStats($jid){
+	try{
+		$sql = "select sum(vf.fileSize) as total, sum(vf.deltaSize) as delta, sum(vf.deltaPostDedup) as dedup from vm_files vf, vm_version vv where vf.vmid = vv.vmid and vf.vmversion = vv.vmversion and vv.jobid=?";
+		$js = dbGetOne("nimbus", $sql, array($jid) );
+		if(is_object($js)){
+			if(!is_numeric($js->total)){ $js->total=0; }
+			if(!is_numeric($js->dedup)){ $js->dedup=0; }
+			if(!is_numeric($js->delta)){ $js->delta=0; }
+			$sql = "UPDATE job set sizeOnDisk=?, sizeSent=?, originalSize=? where jobid=?";
+			dbSet("nimbus", $sql, array($js->dedup, $js->delta, $js->total, $jid) );
+		}
+	}catch(Exception $ex){
+		if(strpos($ex->getMessage(), "is locked") ){
+			syslog(LOG_INFO, "UpdateJobStats got a DB busy.  Sleeping and retrying...");
+			sleep(1);
+			return updateJobStats($jid);
+		} 
+	}
+}
+
+function fixNum($np){
+	if( ($np - floor($np)) == 0){ $np = round($np); }
+	else{ $np = round($np,2); }
+	return $np;
+}
+
+
+function listDir($dir) {
+	$out = [];
+
+	if(substr($dir, -1) != "/") { $dir .= "/"; }	// we need a trailing slash
+
+	// open pointer to directory and read list of files
+	$d = @dir($dir);// or throw new Exception("Failed opening directory {$dir} for reading");
+
+	if($d === false){ 
+		array_push($out, "/FAILED TO READ PATH: $dir");
+		$out[] = [
+                          'name' => "FAILED TO READ PATH: $dir",
+                          'type' => "",
+                          'size' => 0,
+                          'md5' => 0,
+                          'icon' => '',
+                          'lastmod' => 0
+                        ];
+
+		return $out;
+	}
+
+	while(FALSE !== ($entry = $d->read())) {
+		if($entry == ".") { continue; }
+		else if($entry == "..") { continue; }
+
+		if(is_dir("{$dir}{$entry}")) {
+			$out[] = [
+			  'name' => "{$dir}{$entry}/",
+			  'type' => filetype("{$dir}{$entry}"),
+			  'size' => 0,
+			  'lastmod' => filemtime("{$dir}{$entry}")
+			];
+		} elseif(is_readable("{$dir}{$entry}")) {
+			$sz = filesize("{$dir}{$entry}");
+			$md5=0;
+//			if ($sz <= 1024 * 1024){
+//				$md5= md5_file("{$dir}{$entry}");	
+//			}
+			$icon = getFileIcon($entry);
+			$out[] = [
+			  'name' => "{$dir}{$entry}",
+			  'type' => mime_content_type("{$dir}{$entry}"),
+			  'size' => $sz,
+			  'md5' => $md5,
+			  'icon' => $icon,
+			  'lastmod' => filemtime("{$dir}{$entry}")
+			];
+		}
+	} // for each file
+	$d->close();
+	// sort folders, then files
+	usort($out, function($a, $b) {
+		$isFolderA = ($a['type'] == 'dir') ? true : false;;
+		$isFolderB = ($b['type'] == 'dir') ? true : false;;
+
+		if ($isFolderA && !$isFolderB) {
+			return -1;
+		} elseif (!$isFolderA && $isFolderB) {
+			return 1;
+		}
+		return strcmp($a["name"], $b["name"]);
+	});
+	return $out;
+}
+
+function getFileIcon($filePath){
+	$ext = strtolower(pathinfo($filePath, PATHINFO_EXTENSION));
+	
+	$icons = [
+        '7z' => 'fas fa-file-archive',
+        'aac' => 'fas fa-music',
+        'accdb' => 'fas fa-database',
+        'ai' => 'fas fa-image',
+        'aif' => 'fas fa-music',
+        'apk' => 'fab fa-android',
+        'app' => 'fas fa-window',
+        'avi' => 'fas fa-video',
+        'bak' => 'fas fa-save',
+        'bat' => 'fas fa-terminal',
+        'bmp' => 'fas fa-image',
+        'box' => 'fas fa-archive',
+        'bz' => 'fas fa-file-archive',
+        'c' => 'fas fa-code',
+        'cfg' => 'fas fa-file-alt',
+        'class' => 'fas fa-code',
+        'cmd' => 'fas fa-terminal',
+        'com' => 'fas fa-window',
+        'cpp' => 'fas fa-code',
+        'css' => 'fab fab fa-css3',
+        'csv' => 'fas fa-file-csv',
+        'db' => 'fas fa-database',
+        'dbf' => 'fas fa-database',
+        'deb' => 'fas fa-archive',
+        'doc' => 'fas fa-file-word',
+        'docx' => 'fas fa-file-word',
+        'drw' => 'fas fa-image',
+        'email' => 'fas fa-envelope',
+        'eot' => 'fas fa-font-case',
+        'eps' => 'fas fa-image',
+        'erb' => 'fas fa-code',
+        'exe' => 'fab fa-windows',
+        'flac' => 'fas fa-music',
+        'flv' => 'fas fa-video',
+        'gam' => 'fas fa-gamepad',
+        'gif' => 'fas fa-image',
+        'gz' => 'fas fa-file-archive',
+        'htm' => 'fab fa-html5',
+        'html' => 'fab fa-html5',
+        'ico' => 'fas fa-image',
+        'ini' => 'fas fa-file-alt',
+        'iso' => 'fas fa-compact-disc',
+        'jar' => 'fas fa-window',
+        'java' => 'fab fa-java',
+        'jpeg' => 'fas fa-image',
+        'jpg' => 'fas fa-image',
+        'js' => 'fab fa-js',
+        'json' => 'fas fa-file-alt',
+        'lock' => 'fas fa-lock',
+        'log' => 'fas fa-file-alt',
+        'mail' => 'fas fa-envelope',
+        'md' => 'fab fa-markdown',
+        'mdb' => 'fas fa-database',
+        'mid' => 'fas fa-music',
+        'midi' => 'fas fa-music',
+        'mkv' => 'fas fa-video',
+        'mov' => 'fas fa-video',
+        'mp3' => 'fas fa-music',
+        'mp4' => 'fas fa-video',
+        'mpa' => 'fas fa-music',
+        'mpg' => 'fas fa-video',
+        'msg' => 'fas fa-envelope',
+        'msi' => 'fas fa-window',
+        'nes' => 'fas fa-gamepad',
+        'odt' => 'fas fa-file-alt',
+        'ogg' => 'fas fa-music',
+        'ogv' => 'fas fa-video',
+        'otf' => 'fas fa-font-case',
+        'pdb' => 'fas fa-database',
+        'pdf' => 'fas fa-file-pdf',
+        'php' => 'fab fa-php',
+        'phtml' => 'fab fa-html5',
+        'pl' => 'fas fa-code',
+        'png' => 'fas fa-image',
+        'ppt' => 'fas fa-file-powerpoint',
+        'pptx' => 'fas fa-file-powerpoint',
+        'ps' => 'fas fa-image',
+        'psd' => 'fas fa-image',
+        'py' => 'fab fa-python',
+        'rar' => 'fas fa-file-archive',
+        'rb' => 'fas fa-code',
+        'rom' => 'fas fa-gamepad',
+        'rpm' => 'fas fa-archive',
+        'rtf' => 'fas fa-file-alt',
+        'sav' => 'fas fa-save',
+        'sh' => 'fas fa-terminal',
+        'sql' => 'fas fa-database',
+        'svg' => 'fas fa-image',
+        'swf' => 'fas fa-video',
+        'tar' => 'fas fa-file-archive',
+        'tga' => 'fas fa-image',
+        'tif' => 'fas fa-image',
+        'tiff' => 'fas fa-image',
+        'ttf' => 'fas fa-font-case',
+        'twig' => 'fab fa-php',
+        'txt' => 'fas fa-file-alt',
+        'vb' => 'fas fa-window',
+        'wav' => 'fas fa-music',
+        'webm' => 'fas fa-video',
+        'wma' => 'fas fa-music',
+        'wmv' => 'fas fa-video',
+        'woff' => 'fas fa-font-case',
+        'xhtml' => 'fas fa-code',
+        'xls' => 'fas fa-file-excel',
+        'xlsx' => 'fas fa-file-excel',
+        'xml' => 'fas fa-code',
+        'xz' => 'fas fa-file-archive',
+        'yaml' => 'fas fa-file-alt',
+        'zip' => 'fas fa-file-archive',
+	];
+
+	$ret = "far fa-file";
+	if (array_key_exists($ext, $icons)){
+		$ret = $icons[$ext];
+	}
+	return $ret;
+}
+
+function getLogSummary($which){
+        if($which == "all"){ $which = '*'; }
+        $fn = "/home/alike/logs/".$which .".log";
+
+        $max = 15;
+
+        $cmd = "grep -e '^0' -e '^1' -e '^2' -e '^3' $fn | grep -v 'Running from local cache' | grep -v ws_";
+        $lines = explode(PHP_EOL, shell_exec($cmd) );
+        $lines = array_reverse(array_filter($lines));
+        $out = array();
+        foreach($lines as $line){
+                if($max ==0){ break; }
+                if($which == "*"){
+                        $parts = explode(':', $line);
+                        array_shift($parts);
+                        $line = implode(":", $parts);
+                }
+                $parts = explode(' ', $line, 6);
+                $level = $parts[0];
+                $date = $parts[1] . ' ' . $parts[2] . ' ' . $parts[3];
+                $message = $parts[4] . ' ' . $parts[5];
+                $g = new stdClass();
+                $g->status = $parts[0];
+                $g->timestamp = strtotime($date);
+                $g->message = $message;
+                array_push($out, $g);
+                $max--;
+        }
+        return $out;
+}
+
+// get all the known xen networks for the UI
+function getXenNetworks(){
+	$sql = "select uuid, name, poolid, isShared from tm_network order by poolid";
+	$nets = dbGet("nimbus", $sql);
+	return $nets;
+}
+
+/// specialized call to get all usable groups for each host and pool
+// used by the restore wiz
+function getSrGroups(){
+	$us = json_decode(file_get_contents("/mnt/instaboot/sr.id"));
+	$us = $us->{"sr-uuid"};
+
+	// get the shared SRs by pool
+	$sql = "select name,uuid,poolid, free from tm_sr where isShared=1 order by poolid";
+	$pools = dbGet("nimbus", $sql);
+	$guys = [];
+	$active = [];
+	$cur = "";
+	foreach($pools as $p){
+		if($cur != $p->poolid){ 
+			$cur = $p->poolid;
+			$guys[$cur] = array();
+		}
+		if($p->uuid == $us){ continue; }
+		else if(strpos($p->name, "Alike_SR") !== false){ continue; }
+		$tmp = new stdClass();
+		$tmp->uuid = $p->uuid;
+		$tmp->name = $p->name;
+		$tmp->free = $p->free;
+		array_push($guys[$cur], $tmp);
+	}
+	// host specific SRs (no pool shared)
+	$sql ="select th.nativename, th.uuid as hostUuid,th.poolid, sr.name, sr.uuid, sr.free from host h, tm_sr sr, host_sr hl, tm_vhost th where h.hostid=hl.hostid and hl.srid = sr.id and th.uuid = h.uuid";
+	// nativeName|uuid|poolid|name|uuid|free
+	$hosts = dbGet("nimbus", $sql);
+	$cur = "";
+	foreach($hosts as $h){
+		if($cur != $h->hostUuid){ 
+			$cur = $h->hostUuid;
+			$guys[$cur] = array();
+			foreach($guys[$h->poolid] as $p){ array_push($guys[$cur], $p); }
+		}
+		if($h->uuid == $us){ continue; }
+		else if(strpos($h->name, "Alike_SR") !== false){ continue; }
+		$tmp = new stdClass();
+		$tmp->uuid = $h->uuid;	
+		$tmp->name = $h->name;	
+		$tmp->free = $h->free;	
+		array_push($guys[$cur], $tmp);
+	}
+	return $guys;
+}
+
+function doTestAuth($type, $ip, $user, $pass){
+        $r = array();
+        $res = "success";
+        $message ="Testing...";
+
+        if($type ==2){
+                if(empty($ip)){
+                        $res = "error";
+                        $message = "Invalid IP:  $ip";
+                }else{
+                        $out = testXenAuth($ip, $user, $pass);
+                        if($out ===true){
+                                $res = "success";
+                                $message = "Successfully connected to Xen host";
+                        }else{
+                                $res = "error";
+                                $message = "Failed to connect to Xen host: $out";
+                        }
+                }
+        }else{
+                if(empty($ip)){
+                        $res = "error";
+                        $message = "Agent, invalid IP:  $ip";
+                }else{
+                        $out = agentStatus($ip);
+                        if(empty($out) || !is_object($out)){
+                                $res = "error";
+                                $message = "Failed to connect to remote agent ($ip) Please check the Agent is installed and running.";
+                        }else{
+                                $message = "Successfully connected to agent ($ip), status:".$out->version;
+                        }
+                }
+        }
+
+	$r["result"] = $res;
+	$r["message"] = $message;
+	return $r;
+}
+
+function getBuild(){
+	$fn = "/home/alike/Alike/build.num";
+	$bld = trim(file_get_contents($fn));
+	return $bld;
+}
+
+function getVMRaw($uuid){
+	$sql = "SELECT *, accessip as ip from vm where uuid=?";
+	return dbGetOne("nimbus", $sql, array($uuid));
+}
+
+function updateVMAgent($a){
+	$sql = "INSERT or REPLACE into vm values(NULL,?,?,?,?,?,?,?,?,?,?)";
+	dbSet("nimbus", $sql, array($a->name, $a->type, $a->hostID, null, $a->maxOnsite, $a->guid, $a->poolID, $a->maxOffsite, $a->authProfile, $a->accessIP));
+}
+function deleteAgent($guid){
+	$sql = "DELETE from VM where uuid=?";
+	dbSet("nimbus", $sql, array($guid));
+}
+
+?>
