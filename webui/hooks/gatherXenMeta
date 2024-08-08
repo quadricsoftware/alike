@@ -1,0 +1,547 @@
+#!/usr/bin/php -q
+<?php
+include_once("/usr/local/sbin/xen_common");
+
+
+if( (count($argv) == 2 && $argv[1] == "-h") ){
+        echo "Usage:\n";
+        echo "gatherXenMeta <hostID>\n";
+        echo "If hostID is 0, or omitted, all Xen hosts will be included.\n\n";
+        exit(0);
+}
+
+$hid =0;
+if(count($argv) >=2){
+	$hid = $argv[1];
+	if(!is_numeric($hid)){
+		echo "Invalid hostID: $hid\n";
+		exit(1);
+	}
+	if(count($argv) > 3 && $argv[2] == '-j'){
+		echo "I got jobid: $argv[3]\n";
+		$GLOBALS["__insta_job_id"] = $argv[3];
+		gen_log(LOG_INFO, "Starting enumeration for hostID: $hid");
+	}
+}
+
+/*
+	-check if initial
+	-getHostDetails (include vms & disks)
+		tm_vhost:	id|uuid|name|poolid|nativeName|numcpu|totalMemory|freeMemory|osName
+		host:		hostID|hostName|virtType|username|password|role|key|port|deleteFlag|uuid|poolID|lastUsed
+
+		tm_network:	id|uuid|name|poolid|isShared|isDefault
+		tm_sr:		id|uuid|name|poolid|isShared|size|free
+		tm_pool:	id|uuid|name
+
+	get all VMs
+		tm_vminfo: 	id|uuid|name|osName|powerState|isTemplate|isHidden|hostUUID|poolID|size|ipaddress
+		tm_vmdisk:	id|vmuuid|uuid|name|size|position
+		VM:		VMID|VMName|virtTech|hostID|deleteFlag|maxVersions|UUID|poolID|maxVersionsOffsite|authProfile|accessIP
+
+	// 
+		
+	-set pool master
+	-add/update host in DB
+
+	-check for unknown hosts in pool & add them to DB
+
+	if no ABD template, deploy	
+*/
+$start = microtime(true);
+
+setGlobals();
+
+
+if($hid==0){
+	gen_log(LOG_INFO, "Collecting metainfo for all known xen pools");
+	$seen = array();
+	$masters = getPoolMasters();
+	foreach($masters as $m){
+		echo "$m\n";
+	}
+	$hosts = getHosts();
+	foreach($hosts as $h){
+		if($h->type != 2){ continue; }
+		if(in_array($h->poolID, $seen)){ continue; }
+		array_push($seen, $h->poolID);
+		updateFromHost($h);
+	}
+}else{
+	echo "Updating 1 host/pool\n";
+	try{
+		$test = getHost($hid);
+		updateFromHost($test );
+	}catch(Exception $ex){
+		gen_log(LOG_ERR,"Error accessing host $hid. ". $ex->getMessage());
+		die($ex->getMessage(). "\n");
+	}
+}
+
+$t1 = microtime(true);
+$sec = ($t1 - $start);
+echo "Completed xapi stuff in $sec seconds.\n";
+
+$GLOBALS["host-sr"] = [];
+$GLOBALS["host-name"] = [];
+
+
+function updateFromHost($h, $isInitial=false){
+	$hid = $h->hostID;
+	xen_connect($hid);
+
+	$vmVirt =2;
+	if( stripos($h->osName, "xcp") !== false){ $vmVirt =22; }	// set the vm_info's isHidden to 22 for xcp, for ui display purposes
+
+	gen_log(LOG_INFO,"Getting Xen Pool information");
+	$pool = getXenPool();
+	gen_log(LOG_INFO,"Getting All VMs and their meta-info");
+	$vms = getPoolVMs($pool->master);
+	gen_log(LOG_INFO,"Getting All Hosts and their meta-info");
+	$host = getXenHosts($pool);
+	$orig = getHost($hid);
+
+	if(count($host) == 1 && empty($pool->name)){
+		$pool->name = "Pool for ". $host[0]->name;
+		$host[0]->role = 1;
+	}
+
+	mapHostsToSRs($GLOBALS["host-name"], $GLOBALS["host-sr"], $pool);
+	mapHostsToNets();
+
+	gen_log(LOG_INFO,"Updating local DBs");
+		foreach($host as $h){
+			if($h->uuid == null){ continue; }	
+			if($h->uuid == $pool->master){ $h->role =1; }
+			if(!haveHostbyIP($h->ip)){
+				$sql = "INSERT into Host (hostName, virtType, username, password, port, key, poolID, uuid) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+				dbSet("nimbus", $sql, array($h->ip, $orig->type, $orig->username, obfuscate($orig->password), "443", "licensed", $orig->poolID, $h->uuid ));
+
+			}
+			$test = getHost($h->ip);
+			if($h->ip == $test->name && ($h->uuid != $test->uuid) || $h->poolID != $test->poolID ){
+				$sql = "UPDATE host set uuid=?, poolID=?, lastUsed=? where hostID=?";
+				dbSet("nimbus", $sql, array($h->uuid, $h->poolID, time(), $test->hostID) );
+			}
+			if($h->role != $test->role ){
+				$sql = "UPDATE host set role=? where hostID=?";
+				dbSet("nimbus", $sql, array($h->role, $test->hostID) );
+			}
+		}
+		updatePoolDB($pool);
+		updateVMDB($vms, $pool->uuid, $vmVirt);
+		foreach($host as $h){
+			updateHostDB($h);
+		}
+
+
+		echo "updating orphaned vm hosts\n";
+		$sql = "UPDATE tm_vminfo set hostuuid=? where poolid =? and hostuuid not in (select uuid from host)";
+		dbSet("nimbus",$sql, array($pool->uuid, $pool->master) );
+
+		echo "culling orphaned tm_vminfos\n";
+		dbSet("nimbus", "delete from tm_vminfo where hostUUID NOT IN (select uuid from host) and uuid not in (select uuid from vm where virttech=10)") ;
+
+	$sql = "UPDATE host set lastUsed=? where hostID=?";
+	dbSet("nimbus", $sql, array(time(), $hid) );
+
+	gen_log(LOG_INFO,"Complete");
+}
+
+
+
+function getXenPool(){
+	$res = xen_call("pool-list" ); 
+	$pool = json_decode(parse_xen_result($res), true);
+
+	$p = new stdClass();
+	$p->uuid = $pool[0]["uuid"];
+	$p->name = $pool[0]["name-label"];
+	$p->master = $pool[0]["master"];
+	$p->defaultSR = "none";
+	if($pool[0]["default-SR"] != "<not in database>"){
+		$p->defaultSR = $pool[0]["default-SR"];
+	}
+
+	$res = xen_call("network-list" ); 
+	$guy = json_decode(parse_xen_result($res), true);
+	$p->nets = array();
+	foreach($guy as $g){
+		if($g["name-label"] == "Host internal management network"){
+//			echo "Skipping host internal\n";
+		}else{
+			$g["default"] = false;
+
+	$res2 = xen_call("network-param-list", "uuid=".$g["uuid"] ); 
+	$g2 = json_decode(parse_xen_result($res2), true);
+			$oc = $g2[0]["other-config"];
+			$g["default"] = 0; 
+			if(isset($oc["automatic"]) ){
+				if($oc["automatic"] == "true"){ 
+					$g["default"] = 1; 
+				}
+			}
+			array_push($p->nets,$g);
+		}
+	}
+	$res1 = xen_call("sr-list" ); 
+	$srz = json_decode(parse_xen_result($res1), true);
+	$p->srs = array();
+	foreach($srz as $s){
+		if($s["type"] == "iso" || $s["content-type"] == "iso"){
+//			echo "Skipping iso SR\n";
+		}else{
+			$sr = new stdClass();
+			$q = "sr-param-list uuid=".$s["uuid"]." params=host,virtual-allocation,physical-size,shared,physical-utilisation";
+			$res2 = xen_call($q ); 
+			$deets = json_decode(parse_xen_result($res2), true);
+			if($deets[0]["virtual-allocation"] == "0" && $deets[0]["physical-size"] == "0"){ continue; }
+			$sr->uuid = $s["uuid"];
+			$sr->host = $deets[0]["host"];
+			$sr->shared = 0;
+			$sr->default = false;
+			if($sr->uuid == $p->defaultSR){ $sr->default = true; }
+			if($deets[0]["shared"] == "true"){ 
+				$sr->shared= 1; 
+			}else{
+				if(!isset($GLOBALS["host-sr"][$sr->host])){
+					$GLOBALS["host-sr"][$sr->host] = array();
+				}
+				array_push($GLOBALS["host-sr"][$deets[0]["host"]], $sr->uuid);
+			}
+			$sr->name = $s["name-label"];
+			$sr->size = $deets[0]["physical-size"];
+			$sr->free = $sr->size - $deets[0]["physical-utilisation"];
+			array_push($p->srs,$sr);
+		}
+	}
+
+
+	return $p;
+}
+
+function getXenHosts($pool){
+
+	$res = xen_call("host-list" ); 
+	$guy = json_decode(parse_xen_result($res), true);
+	$poolHosts = array();
+	foreach($guy as $g){
+
+		$res = xen_call("host-param-list", "uuid=".$g["uuid"] ); 
+		$resp = json_decode(parse_xen_result($res), true);
+		$det = $resp[0];
+		$h = new stdClass();
+		$h->uuid = $det["uuid"];
+		$h->name = $det["name-label"];
+		$h->virtType = 2;
+		$h->poolID = $pool->uuid;
+		$h->role = 0;
+		$h->ip = $det["address"];
+		if($h->uuid == $pool->master){ $h->role =1; }
+
+		$cpu = $det["cpu_info"];
+		$soft = $det["software-version"];
+		$h->numcpu = $cpu["socket_count"];
+		$h->totalMemory = $det["memory-total"];
+		$h->freeMemory = $det["memory-free"];
+		$h->osName = $soft["product_brand"] ." ".$soft["product_version_text"];
+
+echo "Setting global host for pool $pool->uuid (from xapi): $h->name = $h->uuid\n";
+		$GLOBALS["host-name"][$h->name] = $h->uuid;
+
+		array_push($poolHosts,$h);
+	}
+
+	return $poolHosts;
+}
+
+function getPoolVMs($master){
+	$out = array();
+	$res = xen_call("vm-list" ); 
+	$vms = json_decode(parse_xen_result($res), true);
+
+
+	$ignore = $GLOBALS["ignoreVMs"];
+
+	foreach($vms as $vm){
+		if(in_array($vm["uuid"], $ignore)){ continue; }	// skip ignored VMs
+
+		array_push($out, getVMMeta($vm["uuid"], $master) );
+	}
+
+	return $out;
+}
+
+function getVMMeta($uuid, $master){
+	$res = xen_call("vm-param-list uuid=$uuid" ); 
+	if (strpos($res, "uuid you supplied was invalid") !== false) { return false; }
+		
+	$tmp = json_decode(parse_xen_result($res), true);
+	$guy = $tmp[0];
+
+	if($guy["is-control-domain"] == "true"){ return; }
+	
+	$vm = new stdClass();
+	$vm->uuid = $uuid;
+	$vm->name = $guy["name-label"];
+	$vm->osName = "Undefined";
+	$vm->powerState = $guy["power-state"];
+	if(isset($guy["os-version"]["name"])){
+		$vm->osName = $guy["os-version"]["name"];
+	}
+	$vm->isTemplate = false;
+	$vm->isHidden = false;
+	if($guy["is-a-template"] == "true" ){ 
+		$vm->isTemplate = true;
+	}
+	if(isset($guy["other-config"]["HideFromXenCenter"])  ){ 
+		$vm->isHidden = true;
+	}
+	$vm->hostUUID = $master;
+	if(isset($guy["resident-on"]) && $guy["resident-on"] != "<not in database>"){
+		$vm->hostUUID = $guy["resident-on"];
+	}
+	else if(isset($guy["affinity"]) && $guy["affinity"] != "<not in database>"){
+		$vm->hostUUID = $guy["affinity"];
+	}
+
+	// networks (MRO): 0/ip: 192.168.203.15; 0/ipv4/0: 192.168.203.15
+	$vm->ipaddress="";
+	if(isset($guy["networks"]["0/ip"])){
+		$vm->ipaddress = $guy["networks"]["0/ip"];
+	}
+
+	$vm->size = 0; // need disks
+	$vm->virtTech =2;
+
+	$vm->disks = getDisksXen($vm->uuid, false);
+	foreach ($vm->disks as $d){
+		$vm->size += $d->size;
+		$d->name = $d->name_label;
+		$d->position = $d->userdevice;
+	}
+	
+	return $vm;
+}
+
+function updateHostDB($h){
+	if($h->uuid == null){
+		$msg = "Enum given null host to update!";
+		syslog(LOG_WARNING,"$msg");
+		return;
+	}
+	$haveHost = haveHost($h->uuid);
+	$other;
+	$availLic= getAvailableLicenseEst();
+	if(!$haveHost){
+		$other = getHostForPool($h->poolID);
+	}
+
+        try{
+		$lic= "";
+		// host:		hostID|hostName|virtType|username|password|role|key|port|deleteFlag|uuid|poolID|lastUsed
+		if($haveHost){
+			echo "Updating existing host $h->name\n";
+			$sql = "UPDATE host set hostName=?, poolID=?, lastUsed=? where uuid = ?";
+			dbSet("nimbus", $sql, array($h->ip,$h->poolID,time(), $h->uuid ) );
+		}else{
+			if($availLic > $h->numcpu){
+				$lic = "licensed";	// courtesy license the host (can be crushed by licenseCop)
+			}
+			$msg =  "Adding a NEW host $h->uuid (basing it on poolmate: $other->name)";
+			syslog(LOG_NOTICE,"$msg");
+			echo "$msg\n";
+			$q =  "INSERT INTO host (hostname,virtType,username,password, role,key, port, deleteFlag, uuid,poolID,lastUsed) VALUES (?,?,?,?,?,?,?,?,?,?,?)";
+			dbSet("nimbus", $q, array($h->ip,"2",$other->username,obfuscate($other->password),$h->role,"$lic",443,NULL,$h->uuid,$h->poolID,time() ) );
+		}
+
+		// tm_vhost:	id|uuid|name|poolid|nativeName|numcpu|totalMemory|freeMemory|osName
+		$q =  "INSERT OR REPLACE INTO tm_vhost (uuid,name,poolid,nativeName,numcpu,totalMemory,freeMemory,osName) VALUES (?,?,?,?,?,?,?,?)";
+		dbSet("nimbus", $q, array( $h->uuid,$h->ip,$h->poolID,$h->name,$h->numcpu,$h->totalMemory,$h->freeMemory,$h->osName  ) );
+		echo "Updated tm_vhost for $h->name ($lic)\n";
+
+	}catch(Exception $ex){
+		$msg = "Failure updating host info in DB: ". $ex->getMessage();
+		syslog(LOG_WARNING,"$msg");
+		echo "$msg\n";
+	}
+}
+function updatePoolDB($p){
+	// we can update/add to the tm_pool DB here
+	// tm_pool:	id|uuid|name
+	// tm_network:	id|uuid|name|poolid|isShared|isDefault
+	// tm_sr:	id|uuid|name|poolid|isShared|size|free
+
+	$allSrs = getAllSrs();
+
+        try{
+		$q =  "DELETE from Host WHERE uuid = '' or uuid is null ";
+		dbSet("nimbus", $q);
+
+		$q =  "INSERT OR REPLACE INTO tm_pool (uuid,name) VALUES (?, ?)";
+		dbSet("nimbus", $q, array($p->uuid, $p->name) );
+
+		foreach($p->nets as $net){
+			if(!isset($GLOBALS["net-id-map"][$net["uuid"] ]) ){
+				$q =  "INSERT INTO tm_network (uuid,name,poolid,isShared,isDefault) VALUES (?, ?,?,?,?)";
+				dbSet("nimbus", $q, array($net["uuid"], $net["name-label"],$p->uuid, 0 ,$net["default"] ) );
+			}else{
+				$q =  "UPDATE tm_network set name=?, poolid=?, isShared=?,isdefault=? where uuid=?";
+				dbSet("nimbus", $q, array($net["name-label"],$p->uuid, 0 ,$net["default"],  $net["uuid"]) );
+			}
+		}
+		foreach($p->srs as $sr){
+			if(!isset($GLOBALS["sr-id-map"][$sr->uuid]) ){
+				$q =  "INSERT INTO tm_sr (uuid,name,poolid,isShared,size,free) VALUES (?, ?,?,?,?,?)";
+				dbSet("nimbus", $q, array($sr->uuid, $sr->name,$p->uuid, $sr->shared,$sr->size, $sr->free) );
+			}else{
+				$q =  "UPDATE tm_sr set name=?, poolid=?, isShared=?,size=?,free=? where uuid=?";
+				dbSet("nimbus", $q, array($sr->name,$p->uuid, $sr->shared,$sr->size, $sr->free, $sr->uuid) );
+			}
+			
+		}
+		echo "Updated pool: $p->uuid ($p->name)\n";
+
+	}catch(Exception $ex){
+		echo "Failure updating pool info in DB: ". $ex->getMessage();
+	}
+}
+
+function updateVMDB($vms, $poolID, $virtType){
+
+//	tm_vminfo: 	id|uuid|name|osName|powerState|isTemplate|isHidden|hostUUID|poolID|size|ipaddress
+//	tm_vmdisk:	id|vmuuid|uuid|name|size|position
+//	VM:		VMID|VMName|virtTech|hostID|deleteFlag|maxVersions|UUID|poolID|maxVersionsOffsite|authProfile|accessIP
+
+        try{
+		$needCleanup = false;
+		$q =  "SELECT count(*) FROM VM where poolID=''";
+		$num  = dbGetColumn("nimbus", $q);
+		echo "Found $num VMs with missing POOLIDs\n";
+		$needCleanup=true;
+
+		dbSet("nimbus", "delete from tm_vminfo where poolid='$poolID'");
+		dbSet("nimbus", "delete from tm_vmdisk where vmuuid not in (select uuid from tm_vminfo)");
+
+		foreach($vms as $vm){
+if(!isset($vm->uuid)){
+	echo "Skipping blank vm\n";
+	print_r($vm);
+	continue;
+}
+			// isHidden is the new virttype!
+			$q =  "INSERT INTO tm_vminfo (uuid,name,osName,powerState,isTemplate,isHidden,hostUUID,poolid,size,ipaddress) VALUES (?,?,?,?,?,?,?,?,?,?)";
+			dbSet("nimbus", $q, array( $vm->uuid, $vm->name, $vm->osName,$vm->powerState, $vm->isTemplate, $virtType,$vm->hostUUID, $poolID,$vm->size,$vm->ipaddress  ) );
+			foreach($vm->disks as $v){
+				$q =  "INSERT INTO tm_vmdisk (vmuuid, uuid,name,size,position) VALUES (?,?,?,?,?)";
+				dbSet("nimbus", $q, array( $vm->uuid, $v->vbd_uuid, $v->name_label, $v->size,$v->userdevice  ) );
+			}
+			if($needCleanup){
+				$q =  "SELECT * FROM VM where uuid=? and poolID=''";
+				$q =  "SELECT * FROM VM where uuid=?";
+				dbGetOne("nimbus", $q, array( $vm->uuid,) );
+				if(!empty($guy)){
+					$q = "UPDATE VM set poolID=? WHERE uuid=?";
+					dbSet("nimbus", $q, array( $poolID, $vm->uuid,) );
+				}
+			}
+		}
+	}catch(Exception $ex){
+		echo "Failure updating pool info in DB: ". $ex->getMessage();
+	}
+}
+
+function setGlobals(){
+	$GLOBALS["ignoreVMs"] = array();
+	$iggy = getVmsByTag("AlikeIgnore");
+	foreach($iggy as $ig){
+		array_push($GLOBALS["ignoreVMs"],$ig->uuid);
+	}
+	$a3Guid = "/home/alike/configs/a3.vm.guid";
+	if(file_exists($a3Guid)){
+		array_push($GLOBALS["ignoreVMs"], trim(file_get_contents("$a3Guid")));
+	}
+	$allHosts = getAllHosts();
+	$allNets = getAllNets();
+	$allSrs = getAllSrs();
+	// make our SR lookup
+	$GLOBALS["sr-id-map"] = [];
+	foreach ($allSrs as $sr){
+		$GLOBALS["sr-id-map"][$sr->uuid] = $sr->id;
+	}
+	// make our Host lookup
+	$GLOBALS["host-id-map"] = [];
+	foreach ($allHosts as $h){
+		$GLOBALS["host-id-map"][$h->uuid] = $h->hostID;
+	}
+	// make our Host lookup
+	$GLOBALS["net-id-map"] = [];
+	foreach ($allNets as $h){
+		$GLOBALS["net-id-map"][$h->uuid] = $h->id;
+	}
+}
+
+function mapHostsToSRs($hosts, $srs, $p){
+	// hosts: [name] => uuid
+	// srs:  array([host]array(uuids))
+	// Add in all the shared pool SRs to each host
+
+	$HostToId = $GLOBALS["host-id-map"];
+	$SrToId = $GLOBALS["sr-id-map"];
+
+	foreach($p->srs as $s){
+		foreach($srs as $g => $v ){
+			if($s->shared ==1){
+				array_push($srs[$g], $s->uuid);
+			}
+		}
+	}
+
+	try{
+		// loop thru each host, drop their SRs, then add them back in
+		foreach($srs as $k => $v){
+			// delete all SRs for hid
+			if(!array_key_exists($hosts[$k], $HostToId)){ continue; }
+
+			$hid = $HostToId[$hosts[$k]];
+			if(empty($hid)){ continue; }
+			$sql = "DELETE from Host_SR where hostID=$hid";
+			dbSet("nimbus", $sql);
+			//echo "name: $k, uuid:". $hosts[$k] ."\n";
+			foreach($v as $sr){
+				if(!array_key_exists($sr, $SrToId)){ continue; }
+				$srid = $SrToId[$sr];
+				$sql = "INSERT into Host_SR values($hid, $srid)";
+				dbSet("nimbus", $sql);
+			}
+		}
+	}catch(Exception $ex){
+		echo "Failure in DB Host_SR update: ". $ex->getMessage();
+	}
+}
+
+function mapHostsToNets(){
+	$hosts = getAllHosts();
+
+        try{
+		$sql = "DELETE from Host_Net"; // where netid=$net->id";
+		dbSet("nimbus", $sql);
+
+		$sql = "SELECT id, poolid from tm_network";
+		$all = dbGet("nimbus", $sql);
+		foreach($all as $net){
+			foreach($hosts as $h){
+				if($h->poolID == $net->poolid){
+					$sql = "INSERT into Host_Net values($h->hostID, $net->id)";
+					dbSet("nimbus", $sql);
+				}
+			}
+		}
+        }catch(Exception $ex){
+                echo "Failure in DB Host_Net update: ". $ex->getMessage();
+        }
+
+
+}
+
+?>

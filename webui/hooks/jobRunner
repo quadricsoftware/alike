@@ -1,0 +1,1016 @@
+#!/usr/bin/php -q
+<?php
+
+include_once("/usr/local/sbin/shared_lib");
+include_once("/usr/local/sbin/common_lib");
+include_once("/usr/local/sbin/insta_common");
+include_once("/usr/local/sbin/abd_common");
+
+$GLOBALS['curJob'] = null;
+
+$argc = count($argv);
+
+if($argc <= 1){
+	usage();
+}
+$cmd = $argv[1];
+
+try{
+	if($cmd == "-s"){
+		if($argc != 3){ usage(); }
+		// spawn job from scheduleID
+		$id = $argv[2];
+		spawnScheduleID($id);
+	}else if($cmd == "-c"){
+		if($argc < 4){ usage(); }
+		// args are: vmid, versionid, (optional) parentSchedID
+		$vmid = $argv[2];
+		$version = $argv[3];
+		$site=0;
+		if($argc == 5){ $site=$argv[4]; }	// grab the parent schedule id 
+		spawnSystemJob("validate",$vmid, $version, $site);
+	}else if($cmd == "-g"){
+		$hid=0;
+		if($argc == 3){ $hid=$argv[2]; }	// just a specific host
+		// re-enumerate metainfo
+		spawnSystemJob("meta",$hid, 0);
+	}else if($cmd == "-a"){
+		$pid=0;
+		if($argc == 3){ $pid=$argv[2]; }	// just a specific pool
+		// do abd deploy
+		spawnSystemJob("deploy",$pid, 0);
+	}else if($cmd == "-X"){
+		$poolid=0;
+		if($argc == 3){ $poolid=$argv[2]; }
+		// do abd delete per pool
+		spawnSystemJob("cull-idle",$poolid, 0);
+	}else if($cmd == "-x"){
+		$pid=0;
+		if($argc == 3){ $pid=$argv[2]; }
+		// do abd delete
+		spawnSystemJob("cull",$pid, 0);
+	}else if($cmd == "-w"){
+		$pid=0;
+		if($argc == 3){ $pid=$argv[2]; }
+		// do abd delete
+		spawnSystemJob("provisionABD",$pid, 0);
+	}else if($cmd == "-d"){
+		if($argc != 3){ usage(); }
+		$id = $argv[2];
+		// do abd delete
+		spawnSystemJob("delete",$id, 0);
+	}else if($cmd == "-t"){
+		if($argc != 3){ usage(); }
+		// do abd diag
+		$pid = $argv[2];
+		spawnSystemJob("diag",$pid, 0);
+	} else if($cmd == "-i") {
+		if(!isset($argv[2])){
+			echo "Failed to start job- No magic provided\n";
+			return 1;
+		}
+		$magic = $argv[2];
+		spawnSystemJob("instaboot",$magic, 0);
+	} else if($cmd == "-q") {
+		if(!isset($argv[2])){
+			echo "Failed to start job- No magic provided\n";
+			return 1;
+		}
+		$magic = $argv[2];
+		spawnSystemJob("quickRestore",$magic, 0);
+	} else if($cmd == "-qv") {
+		spawnSystemJob("quickVault",$argv[2], $argv[3]);
+	} else if($cmd == "-qvr") {
+		spawnSystemJob("quickVaultReverse",$argv[2], $argv[3]);
+	} else if($cmd == "-b") {
+		if(!isset($argv[2])){ die("No uuid provided for quickBackup\n"); }
+		$magic = $argv[2];
+		spawnSystemJob("quickBackup",$magic, 0);
+	}else if($cmd == "-v"){
+		if($argc < 4){ usage(); }
+		// do vault now
+		// args are: vmid, versionid, (optional) parentSchedID
+		$vmid = $argv[2];
+		$version = $argv[3];
+		$pid =-1;
+		if($argc == 5){ $pid=$argv[4]; }	// grab the parent schedule id 
+
+		spawnVaultJob($vmid, $version, $pid, 0);
+	}else if($cmd == "-u"){
+		if($argc < 4){ usage(); }
+		// do reverse vault now
+		// args are: vmid, versionid, (optional) parentSchedID
+		$vmid = $argv[2];
+		$version = $argv[3];
+		$pid =-1;
+		if($argc == 5){ $pid=$argv[4]; }	// grab the parent schedule id 
+
+		spawnVaultJob($vmid, $version, $pid, 1);
+		
+	}else if($cmd == "-r"){
+		if($argc < 4){ usage(); }
+		$jobid = $argv[2];
+		$vmid = $argv[3];
+
+		resumeJob($jobid, $vmid );
+	}
+
+//	}else if($cmd == "-q"){
+//		if($argc != 3){ usage(); }
+//		// do abd diag
+//		$uuid = $argv[2];
+//		doQuickBackup($uuid);
+//	}
+}catch(Exception $ex){
+echo "Top exception: ". $ex->getMessage();
+	$id = "";
+	if(is_object($GLOBALS['curJob'])){ $id = $GLOBALS['curJob']->jobID; }
+	$msg = "jobRunner failed in job $id:". $ex->getMessage();
+	syslog(LOG_ERR, $msg);
+	$msg2 = "Failed to start job $id: ". $ex->getMessage();
+	addAlarm($msg2, 2);
+	if($id != ""){
+		addJobLog($msg, 2, $id, 0);
+	}
+}
+exit(0);
+
+function usage(){
+        $msg = "Insufficient parameters\n\n";
+        $msg .= "Usage: jobRunner <cmd> <arg> \n";
+	$msg .= "\tSpawn job from schedule: -s <scheduleID>\n";
+	$msg .= "\tSpawn vault job for VM: -v <vmid> <versionid> <parent schedID*>\n";
+	$msg .= "\tResume job for VM: -r <jobid> <vmid> \n";
+	$msg .= "\tRun Quick Backup for VM: -q <uuid>\n";
+	$msg .= "\tRun ABD Deploy job: -a <poolID> (if no pool, then all)\n";
+	$msg .= "\tRun ABD Diag job: -t <poolID>\n";
+	$msg .= "\tRun ABD Delete job: -d <poolID>\n";
+	$msg .= "\tRun (TM) Meta refresh job: -g -h <hostid or 0 for all>\n";
+	$msg .= "\tClear Idle ABDs: -X <abdID>\n";
+        print $msg;
+        exit(1);
+}
+
+
+function spawnScheduleID($id){
+	$s = null;
+	try{
+		$s = getSchedule($id);
+	}catch(Exception $ex){
+		$msg = "Error: " .$ex->getMessage();
+		syslog(LOG_ERR, $msg);
+		addAlarm($msg, 2);
+		exit(1);
+	}
+
+	$doit = shouldSpawn($s);
+
+	try{
+		if( $doit ==0){
+			echo "Not spawning job for schedule ($s->scheduleID) $s->name\n";
+		}else if($doit==1){
+			echo "Spawning new job for schedule ($s->scheduleID) $s->name\n";
+			$j =spawnJob($s, false);
+			runJob($j);
+		}else if($doit==2){
+			echo "Spawning new job (pended) for schedule ($s->scheduleID) $s->name\n";
+			$j =spawnJob($s, true);
+			pendedWait($j);	// wait (for a while) for the previous job to oomplete.  There can only be 1 pended job per schedule
+		}
+	}catch(Exception $ex){
+		// we have nowhere to send this error message!
+		$msg = "Error in spawnSchedID: ". $ex->getMessage();
+		addJobLog($msg, 2, 0, 0);
+		syslog(LOG_WARN, $msg);
+	}
+}
+
+function spawnSystemJob($type, $id, $version, $site=0){
+
+	$j = new stdClass();
+	$j->type = jobType::system;
+        $status = 2;
+        $st = time();
+
+	$name = "A3 System Job";
+	if($type == "meta"){ $name = "A3 MetaInfo Refresh"; }
+	else if($type == "deploy"){ $name = "ABD Deployment"; }
+	else if($type == "diag"){ $name = "ABD Diagnostic"; }
+	else if($type == "cull"){ $name = "ABD Cleanup"; }
+	else if($type == "cull-idle"){ $name = "Idle ABD Cleanup"; }
+	else if($type == "provisionABD"){ $name = "ABD Provision"; }
+	else if($type == "validate"){ $name = "Backup Validation"; }
+	else if($type == "instaboot"){ $name ="Instant Restore"; }
+	else if($type == "quickRestore"){ 
+		// gorp job, so we need to parse the gorp ($id) to get the vmname, etc
+		$myJson = file_get_contents($id);
+		$myGorp = json_decode($myJson);
+		$vm = getVmSimple($myGorp->vmUuid);
+		$name = "Quick Restore of $vm->name";
+
+		$j->type =101; 
+	} else if($type == "quickBackup"){ 
+		$vmid = getVmidByGuid($id);
+		$vm = getVMSimple($id);
+		$name ="Quick Backup of $vm->name"; $j->type =100; 
+	} else if($type == "quickVault"){ 
+		$vmid = getVmidByGuid($id);
+		if(empty($vmid)){
+			throw new Exception("Could not find VM with guid $id in DB for Quick Vault");
+		}
+		$vm = getVMSimple($id);
+		$name ="Manual Vault of ".$vm->name; 
+		$j->type =200; 
+	}else if($type == "quickVaultReverse"){ 
+		$vmid = getVmidByGuid($id);
+		if(empty($vmid)){
+			throw new Exception("Could not find VM with guid $id in DB for Reverse Vault");
+		}
+		$vm = getVMSimple($id);
+		$name ="Reverse Vault of ".$vm->name; 
+		$j->type =201; 
+	}
+
+	$sid  = getOrMakeBaseSched($name, $j->type);
+	$jobid = 0;
+
+	// NB: there are a few commandeered fields:
+	//	target - used for VHD restore paths in restore jobs
+	//	username - used for job progress %
+	//	password - used for "Quick" jobs names so they include the VM in question (overriding the Schedule name in the UI)
+	$sql = "INSERT INTO Job (scheduleID, timeBegin, timeEnd, password, status, username, stage, deleteFlag, sizeOnDisk, sizeSent) VALUES (?, ?, 0, ?, ?,'', 0, NULL,0,0)";
+	$jobid = dbSet("nimbus", $sql, array($sid, $st, $name, $status) );
+
+        $jerb = getJob($jobid);
+	$jerb->name = $name;
+
+	startJob($jerb);
+	
+	if($type == "validate"){ return doValidate($jobid, $id, $version, $site); }
+	if($type == "instaboot") { return doInstaboot($jobid, $id); }
+	if($type == "quickRestore") { return doQuickRestore($jobid, $id); }
+	if($type == "quickBackup") { return doQuickBackup($jobid, $id); }
+	if($type == "quickVault") { return doQuickVault($jobid, $id, $version, 0); }
+	if($type == "quickVaultReverse") { return doQuickVault($jobid, $id, $version, 1); }
+
+	$args = "";
+	if($type == "meta"){
+		// mount HV hosts as needed
+		$args = " $id";
+	}
+
+	$args .= " -j $jobid";
+
+	if($type == "deploy"){
+		echo "Deploying...\n";
+		$cmd = "sudo /usr/local/sbin/setupNfs";
+		exec($cmd);
+		$cmd = "sudo /usr/local/sbin/abdAdmin import 0 -j $jobid";	// do 'em all
+		$rez = managedRun($cmd);
+		if($rez->code != 0) {	endJob($jobid, 7);
+		}else{ endJob($jobid); }
+	}else if($type == "provisionABD"){
+		$net = getABDNetFromDB($id);
+		$cmd = "sudo /usr/local/sbin/abdAdmin provision $net->poolID $id -j $jobid";
+		$msg = "Deploying ABD...";
+		$veid =addJobLog($msg, 3, $jobid, 0);
+
+		$rez = managedRun($cmd);
+		updateJobLog($msg.", Complete",0, $veid);
+		if($rez->code != 0) {	endJob($jobid, 7);
+		}else{ endJob($jobid); }
+
+	}else if($type == "diag"){
+		$net = getABDNetFromDB($id);
+		$cmd = "sudo /usr/local/sbin/abdAdmin run-diag $id -j $jobid";
+		$msg = "Running diagnostic job...";
+		$veid =addJobLog($msg, 3, $jobid, 0);
+		$rez = managedRun($cmd);
+
+		updateJobLog($msg.", Complete",0, $veid);
+		if($rez->code != 0) {	endJob($jobid, 7);
+		}else{ endJob($jobid); }
+        }else if($type == "cull-idle"){
+                $cmd = "sudo /usr/local/sbin/abdAdmin delete-idle -j $jobid";
+                $msg = "Cleaning idle ABDs...";
+                if($id > 0){
+                        $cmd = "sudo /usr/local/sbin/abdAdmin delete-idle $id -j $jobid";
+                        $msg = "Cleaning ABD $id";
+                }
+                $veid =addJobLog($msg, 3, $jobid, 0);
+                $rez = managedRun($cmd);
+                updateJobLog($msg." Complete",0, $veid);
+                if($rez->code != 0) {   endJob($jobid, 7);
+                }else{ endJob($jobid); }
+	}else if($type == "cull"){	// kill a specific ABD
+		$cmd = "sudo /usr/local/sbin/abdAdmin delete-idle -j $jobid";
+		$msg = "Cleaning idle ABDs...";
+		if($id > 0){
+			$cmd = "sudo /usr/local/sbin/abdAdmin abd delete $id -j $jobid";
+			$msg = "Cleaning ABD $id";
+		}
+		$veid =addJobLog($msg, 3, $jobid, 0);
+		$rez = managedRun($cmd);
+		updateJobLog($msg." Complete",0, $veid);
+		if($rez->code != 0) {	endJob($jobid, 7);
+		}else{ endJob($jobid); }
+	}else{
+		// now run XT with the args, and we're good, right?
+		$cmd = "wine ". $GLOBALS["settings"]->alikeRoot."/XenTool.exe $args";
+		if($type == "meta"){
+			if($id == 0){
+				$cmd = $GLOBALS["settings"]->alikeRoot."/hooks/gatherMeta $args";
+			}else{
+				$h = getHost($id);
+				if($h->type ==2){
+					$cmd = $GLOBALS["settings"]->alikeRoot."/hooks/gatherXenMeta $args";
+				}else if($h->type == 3){
+					$cmd = $GLOBALS["settings"]->alikeRoot."/hooks/gatherHVMeta $args";
+				}else if($h->type == 10){
+					$cmd = $GLOBALS["settings"]->alikeRoot."/hooks/gatherPhyMeta $args";
+				}
+			}
+		}
+		$msg= "Gathering meta-information from host server... ";
+		echo "$msg\n";
+		$veid =addJobLog($msg, 3, $jobid, 0);
+
+		$rez = managedRun($cmd);
+                if($rez->code != 0) {   
+			// mark job as bad
+			updateJobLog($msg." Complete with errors",1, $veid);
+			updateJobLog("Error: $rez->stdErr",1, $veid);
+			endJob($jobid, 7);
+		}else{
+			updateJobLog($msg." Complete",0, $veid);
+			endJob($jobid);
+		}
+	}
+}
+
+function doInstaboot($jobId, $magic) {
+	syslog(LOG_INFO, "doInstaboot called in jobRunner with jobId $jobId and magic $magic");
+	if(file_exists($magic) == false) {
+		throw new ErrorException("Instaboot magic file $magic not found");
+	}
+	$myJson = file_get_contents($magic);
+	syslog(LOG_INFO, $myJson);
+	$myGorp = json_decode($myJson);
+	$vm = getVM($myGorp->vmId);
+	// Add a little extra noogie to the job so we can find it later
+		$sql = "UPDATE job SET target=? WHERE jobId=?";
+		dbSet("nimbus", $sql, array($myGorp->crc, $jobId));
+	$hasFailed = true;
+	try {
+		$GLOBALS["__insta_job_id"] = $jobId;
+		$disableNic = false;
+		if($myGorp->disableNic) { $disableNic = true; }
+		addJobLog("Calling instaBootVm with $myGorp->vmId, $myGorp->hostId, var_export($disableNic,true), true, 
+				$myGorp->timestamp, $myGorp->siteId, \"\", true, $myGorp->template", 0, $jobId, 0, 0);
+		instaBootVm($myGorp->vmId, $myGorp->hostId, $disableNic, true, 
+				$myGorp->timestamp, $myGorp->siteId, "", true, $myGorp->template);
+                $hasFailed = false;
+	}catch(Exception $ex){
+		addJobLog($ex->getMessage(), 1, $jobId, 0, 0);
+		syslog(LOG_ERR, "Instaboot job failed with error $ex");
+	} finally {
+		if(file_exists($magic)){
+			$rez = unlink($magic);
+		}
+	}
+	if($hasFailed) {
+		endJob($jobId, 7);
+	} else {
+		endJob($jobId);
+	}
+}
+
+function doQuickVault($jobid, $uuid, $ts, $site){
+        syslog(LOG_INFO, "Running a manual vault [jobid $jobid] of vm $uuid ts $ts to site $site");
+        $res = licenseCheck(null, null, null, "vault");
+        if($res->status == "error"){ throw new Exception("Licensing error: $res->message"); }   // no plan
+        if($res->status == "denied"){ throw new Exception("Licensing error- $res->message."); } // no DR
+
+	$vmid = getVmidByGuid($uuid);
+	$vm = getVmSimple($uuid);
+	$vmName = $vm->VMName;
+
+        $vmsg = "Vaulting: $vmName (ID $vmid): ";
+        $veid = addJobLog($vmsg.", ",3, $jobid, 0, 17100222);
+	$dest = 1;
+	if($site == 1) { $dest=0; }
+        $cmd = array();
+        $cmd["command"] = "vault";
+        $cmd["site"] = "$dest";
+        $cmd["source"] = "$site";
+        $cmd["version"] = "$ts";
+        $cmd["uuid"] = "$uuid";
+        $cmd["vm"] = "$vmid";
+        $cmd["job"] = "$jobid";
+
+        try{
+                $barf = issueJavaCmd($cmd, $jobid, $vmid, $veid);
+                $msg = "$vmsg}<}100";
+                updateJobLog($msg, 0, $veid);
+                addJobLog("Vault is complete for $vmName", 0, $jobid, 0);
+        }catch(Exception $ex){
+                $msg = "Failed to send vault data: ".$ex->getMessage();
+echo $msg;
+                addJobLog($msg, 1, $jobid, 0);
+                $msg = "Vaulting: $vmName (ID $vmid): Failed";
+		endJob($jobid,7);
+                throw new Exception($msg);
+        }
+	endJob($jobid);
+}
+
+function doQuickRestore($jobId, $magic) {
+        syslog(LOG_INFO, "doQuickRestore called in jobRunner with jobId $jobId and magic $magic");
+        if(file_exists($magic) == false) {
+                addJobLog("Missing restore data file for job", 1, $jobId, 0, 0);
+                endJob($jobId, 7);
+                throw new ErrorException("QuickRestore magic file $magic not found");
+        }
+        $myJson = file_get_contents($magic);
+        $myGorp = json_decode($myJson);
+//        syslog(LOG_INFO, $myJson);
+        $hasFailed = true;
+        try {
+
+		$vmid = getVmidByGuid($myGorp->vmUuid);
+		// do a little bit of maint work since we're gorping it now
+		// needed for joblogdetails rendering to show vms in groups
+		dbSet("nimbus", "INSERT into job_vms values(?, ?, 0)", array($jobId, $vmid));
+		$vminf = getVmInfo($myGorp->vmUuid);
+		dbSet("nimbus", "update job set password=?, originalSize=? where jobid=?", array($name, $vminf->size, $jobId) );
+
+		$res =managedRun("/usr/local/sbin/restoreTool -j $jobId -r $magic");
+		$jprog = getJobVmProgress($jobId, $vmid);
+		updateJobProgress($jobId, $jprog);
+		if($res->code !=0){ 
+			addJobLog("Error running restore. ". print_r($res, true), 1, $jobId, 0, 0);
+			updateJobStatus($jobId, 3); 
+			$prg = $jprog * -1;
+			dbSet("nimbus", "UPDATE job_vms set vm_version=? where jobid=? and vmid=?", array($prg, $jobId, $vmid) );
+		} else{ 
+			updateJobStatus($jobId, 2); 
+			dbSet("nimbus", "UPDATE job_vms set vm_version=100 where jobid=? and vmid=?", array($jobId, $vmid) );
+			$hasFailed = false;
+		}
+
+        }catch(Exception $ex){
+                addJobLog($ex->getMessage(), 1, $jobId, 0, 0);
+                syslog(LOG_ERR, "QuickRestore job failed with error $ex");
+        } finally {
+                if(file_exists($magic)){
+//                        $rez = unlink($magic);
+                }
+        }
+        if($hasFailed) {
+                endJob($jobId, 7);
+        } else {
+                endJob($jobId);
+        }
+}
+
+
+function doValidate($jobid, $uuid, $ts, $site){
+	// we are given an already running job, so we must end it one way or another
+	$errorFile = $GLOBALS["tempPath"] ."/$jobid.validate.errors";
+	$vmid = getVmidByGuid($uuid);
+	
+	$cmd = array();
+	$cmd["command"] = "validate";
+	$cmd["version"] = $ts;
+	$cmd["uuid"] = $uuid;
+	$cmd["site"] = "$site";
+	$cmd["errorFile"] = $errorFile;
+
+	if($site ==1){
+		addJobLog("Analyzing Offsite Backup", 0, $jobid, 0, 0);
+	}
+
+	// I need to fork a child that monitors the file, and pukes them to the jld
+	$prog = $GLOBALS["AR"] ."/hooks/validateParser";
+	$cmdy = "$prog $jobid $errorFile > /dev/null & echo $!";	// this will return our pid
+        $pid = exec($cmdy);
+
+	try{
+		$msg = "Validation  ";
+		$eid = addJobLog($msg, 0, $jobid, 0, 17100222);
+		$res = issueJavaCmd($cmd, $jobid, $vmid, $eid);
+		endJob($jobid);
+	}catch(Exception $ex){
+		endJob($jobid, 7);
+	}finally{
+		posix_kill($pid, SIGTERM);	// ends our error harvester pid
+		if(file_exists($errorFile)){ unlink($errorFile); }
+	}
+}
+
+function doQuickBackup($jobId, $uuid) {
+        syslog(LOG_INFO, "doQuickBackup called in jobRunner with jobId $jobId and uuid $uuid");
+        $hasFailed = true;
+        try {
+		$vmid = getVmidByGuid($uuid);
+                // do a little bit of maint work since we're gorping it now
+                // needed for joblogdetails rendering to show vms in groups
+                dbSet("nimbus", "INSERT into job_vms values(?, ?, 0)", array($jobId, $vmid) );
+
+                $cmd = $GLOBALS["AR"]."/hooks/preJob $jobId";
+                $msg = "Running PreJob: $cmd";
+                addJobLog($msg, 4, $jobId, 0);
+                $res = managedRun($cmd);
+                if($res->code !=0 ){
+                        $err = "Job failed in preJob";
+                        addJobLog($err ,1,$jobId,0);
+                        endJob($jobId, 7);
+                        throw new Exception($err);
+                }
+
+
+                $res =managedRun("/usr/local/sbin/backupTool -j $jobId -v $vmid");
+                $jprog = getJobVmProgress($jobId, $vmid);
+                updateJobProgress($jobId, $jprog);
+                if($res->code !=0){ 
+                        addJobLog("Backup job failed." , 1, $jobId, 0, 0);
+                        updateJobStatus($jobId, 3);
+                        $prg = $jprog * -1;
+                } else{
+                        updateJobStatus($jobId, 2); 
+                        $hasFailed = false;
+                }
+        }catch(Exception $ex){
+                addJobLog($ex->getMessage(), 1, $jobId, 0, 0);
+                syslog(LOG_ERR, "QuickBackup job failed with error $ex");
+        }
+        if($hasFailed) {
+                endJob($jobId, 7);
+        } else {
+                endJob($jobId);
+        }
+}
+
+
+
+function startJob($j){
+	$bld = getA3Build();
+	$vers = getAlikeVersion();
+        $rev = getA3Rev();
+	$msg  = "A3 v$vers ($rev), Build: $bld";
+	addJobLog($msg, 0, $j->jobID, 0);
+	$msg = "Beginning new job: $j->name (ID: $j->jobID)";
+	addJobLog($msg, 0, $j->jobID, 0);
+	$sql = "UPDATE job set status =2 where jobID = ?";
+	dbSet("nimbus", $sql, array($j->jobID) );
+	updateJobSizeTotal($j->jobID );
+	// sometimes we're cancelled before we get started
+        if(checkForCancel($j->jobID) ){ endJob($j->jobID); }
+}
+
+function endJob($jid, $forceStatus=0){
+	$j = getJob($jid); // the processVM task can flip a job status to errored (but nothing else)
+        $j->timeEnd = time();
+
+	try{
+                $prog = calcJobProgress($jid);
+                updateJobProgress($jid, $prog);			// record the final progress for VMs
+		$jobTimeFile = "/tmp/job_ctl/". $j->jobID .".proctime";
+		$ttime=0;
+		if(file_exists($jobTimeFile)){ $ttime = file_get_contents($jobTimeFile); }
+		updateJobProcessTime($j->jobID, $ttime);
+
+		$dat = "/tmp/job_ctl/jrb_prog.".$jid.".*";
+		exec("rm $dat");				// clean out the job junk
+		$j->status = getJobFinalStatus($j->jobID);	// determine the final status for the job
+		if($j->status ==5){
+			deleteCancel($j->jobID);
+		}
+
+	}catch (Exception $ex){
+		$msg= "Error setting status: ". $ex->getMessage();
+		addJobLog("endJob: $msg", 4, $jid, 0);
+	}
+	if($forceStatus > 0){ $j->status =$forceStatus; }
+
+	$sql ="UPDATE job set status =?, timeEnd=? where jobID = ?";
+	dbSet("nimbus", $sql, array($j->status, $j->timeEnd, $jid) );
+        $cmd = $GLOBALS["AR"]."/hooks/postJob $jid";
+	addJobLog("Running PostJob: $cmd ($j->status)", 4, $jid, 0);
+        exec($cmd);
+
+	exit(0);
+}
+function getJobFinalStatus($id){
+        $j = getJob($id);
+        echo "Job Type: $j->type\n";
+        $stats = getJobResult($id);
+        if($j->type != 0){
+
+                if($stats->errors > 0){
+                        $st = 7;
+                }else if($stats->warnings > 0){
+                        $st = 4;
+                        $st = 8;        // no errors, but warnings
+                }else{
+                        $st = 6;
+                }
+                if(checkForCancel($id) ){
+                        $st = 5;
+                }
+                return $st;
+        }
+        // backup jobs get special treatment
+        $sql = "select VMID, VM_Version from job_vms where jobid=?";
+        $out = dbGet("nimbus", $sql, array($id) );
+        $err=0;
+        $tot = count($out);
+        foreach($out as $g){ if($g->VM_Version ==0){ $err++; } }
+        $stat = 4;              // start as errored?
+        if($err == $tot){
+                $stat = 7;      // failure
+        }else if ($err ==0) {
+                $stat = 6;
+                if($stats->warnings > 0){ $stat =8; }   // we succeeded, but have warnings
+        }else{ $stat = 4; }     // errored
+        return $stat;
+}
+
+
+function runJob($j){
+
+
+	try{
+		startJob($j);
+		echo "Done w/ start job, now running prejob\n";
+		// if policy job, do stuff now, before preJob	****************
+		$cmd = $GLOBALS["AR"]."/hooks/preJob $j->jobID";
+		$msg = "Running PreJob: $cmd";
+		addJobLog($msg, 4, $j->jobID, 0);
+		$res = managedRun($cmd);
+		if($res->code !=0 ){
+			$err = "Job failed in preJob";
+			addJobLog($err ,1,$j->jobID,0);
+			endJob($j->jobID, 7);
+			throw new Exception($err);
+		}
+		$j = getJob($j->jobID);
+		if(count($j->vmsInJob)==0 && ($j->type == 0 || $j->type == 1 || $j->type == 5) ){
+			addJobLog("Job contains no systems to protect!" ,1,$j->jobID,0);
+			endJob($j->jobID, 7);
+			throw new Exception("Job seems to contain no systems... ");
+		}
+
+		echo "VM Concurrency: $j->numConcurrent\n";
+
+		$fl = getJobLockFile($j->jobID);
+		exec("echo 0 > $fl");
+		$fp = fopen($fl, "r+");
+		$flipped = false;
+		$totalVmCount = count($j->vmsInJob);
+		$hitMax=false;
+		$processed=0;
+
+		$topMsg = "Waiting for systems to prepare...";
+		$veid = addJobLog($topMsg,3, $j->jobID, 0);
+
+		foreach($j->vmsInJob as $v){
+			$nv = readLocked($fp,$fl);
+			while($nv >= $j->numConcurrent && !checkForCancel($j->jobID)){
+				sleep(1);
+				$nv = readLocked($fp,$fl);
+				$hitMax=true;
+				// do some timeout here?
+			}
+			if(checkForCancel($j->jobID)){
+				$flipped=true;
+				addJobLog("Processing job cancel request.", 2, $j->jobID, 0);
+				break;
+			}
+			$nv =incrementLocked($fp,$fl);
+			if($hitMax){ 
+				$processed++; 
+				updateJobProgress($j->jobID, $processed);
+			}
+			$dum = "systems";
+			if($nv == 1){ $dum = "system"; }
+			$msg = "Processing $nv $dum: $processed/$totalVmCount complete.";
+			echo "$msg\n";
+			updateJobLog("$msg",3, $veid);
+
+			$work = "backup of";
+			if($j->type ==5){ $work = "replication of"; }
+			else if($j->type ==1){ $work = "restore of"; }
+
+			$msg = "Beginning $work $v->VMName";
+			addJobLog($msg, 0, $j->jobID, $v->VMID);
+
+			echo "Processing VM ($v->VMID) nv: $nv\n";	
+			$cmd = $GLOBALS["settings"]->scripts."/processVM $j->jobID $v->VMID";
+			exec($cmd. " > /dev/null &");	// you must dev null to background
+			sleep( 3 );
+
+			//$jobTimeFile = "/tmp/job_ctl/". $j->jobID .".proctime";
+			//$ttime=0;
+			//if(file_exists($jobTimeFile)){ $ttime = file_get_contents($jobTimeFile); }
+			//updateJobProcessTime($j->jobID, $ttime);
+
+		}
+		$nv = readLocked($fp,$fl);
+		$processed = $totalVmCount - $nv;
+		echo "Out of loop- Processed: $processed / $totalVmCount ($nv) \n";
+		$steps=1;
+		while($nv > 0){
+			//gen_log(LOG_DEBUG,"Waiting on all VMs to finish processing ($nv)...");
+			sleep(2);
+			$nv = readLocked($fp,$fl);
+			$test = $totalVmCount - $nv;
+			if($test != $processed){
+				$processed = $test;
+				$dum = "systems";
+				if($nv == 1){ $dum = "system"; }
+				$msg = "Processing $nv $dum: $processed/$totalVmCount complete.";
+				if($totalVmCount == 1){ $msg = "Currently processing system..."; }
+				echo "$msg\n";
+				updateJobProgress($j->jobID, $processed);
+				updateJobLog("$msg",3, $veid);
+			}
+			// do some timeout here?
+			if(checkForCancel($j->jobID) && !$flipped){
+				$flipped=true;
+				addJobLog("Processing job cancel request.", 2, $j->jobID, 0);
+			}
+			if($steps %30 ==0 && $nv > 0 && checkForChildren($j->jobID)==false){
+				addJobLog("No systems being processed (processVM missing). Ending job.", 2, $j->jobID, 0);
+				updateJobStatus($j->jobID, 4);
+				$nv=0;
+			}
+			$steps++;
+		}
+		$prg = calcJobProgress($j->jobID);
+		updateJobProgress($j->jobID, $prg);
+		if($flipped){
+			updateJobLog("Processing cancelled.",2, $veid);
+		}else{
+			updateJobLog("Processing complete",0, $veid);
+		}
+
+		updateJobSizeTotal($j->jobID);
+		echo "Done with everyone!\n";
+		//gen_log(LOG_DEBUG, "Completed processing all systems");
+		fclose($fp);
+		unlink($fl);
+	}finally{
+		//gen_log(LOG_DEBUG, "About to call endJob");
+		endJob($j->jobID);
+	}
+}
+
+function checkForChildren($jid){
+	$cmd = "ps auxw | grep \"processVM $jid\"| grep -v grep";
+	$res = shell_exec($cmd);
+	if($res != ""){ return true; }
+	return false;
+}
+
+function pendedWait($j){
+	$mins = getSetting("pendedTimeoutMins");
+	if($mins == "" ){ $mins = 5; }
+
+	$timeout = 60 * $mins;
+
+	while($timeout > 0){
+		if(getJobCount($j->scheduleID, false) ==0){
+			return runJob($j);
+		}
+		sleep(5);		
+		$timeout -=5;
+	}
+	// we should log to the jld here that we timed out
+	$msg = "Timed out waiting to start job ($mins minutes). Previous job ($j->name) was still running.";
+	addJobLog($msg, 1, $j->jobID, 0);
+	$ts = time();
+        $sql = "UPDATE job set status =5, timeEnd=? where jobID = ?";
+	dbSet("nimbus", $sql, array($ts, $j->jobID));
+}
+
+function shouldSpawn($s){
+	// allow 1 active, and 1 pending of any schedule.  otherwise ignore
+	$num = getJobCount($s->scheduleID, false);
+	if($num == 0){ return 1; }
+	$num = getJobCount($s->scheduleID, true);
+	if($num ==0){ return 2; }
+	return 0;
+}
+
+
+function spawnJob($s, $pending){
+	$id = $s->scheduleID;
+	$status = 2;
+	if($pending){ $status = 0; }
+
+	$j = new stdClass();
+	$j->scheduleID=$id;
+	$st = time();
+	$j->timeEnd =0;
+	$j->sizeOnDisk =0;
+	$j->sizeSent=0;
+
+	$j->password = "";
+
+	$runBase = 1;
+	$virType = 2;
+	$pass="";
+	$user="";
+	$j->numConcurrent = $s->numConcurrent;
+	if(!is_numeric($j->numConcurrent) || $j->numConcurrent < 1){
+                $j->numConcurrent = 1;
+        }
+
+		// NB: there are a few commandeered fields:
+		//	target - used for VHD restore paths in restore jobs
+		//	username - used for job progress %
+		//	password - used for "Quick" jobs names so they include the VM in question (overriding the Schedule name in the UI)
+		$sql = "INSERT INTO Job (scheduleID, timeBegin, timeEnd, sizeOnDisk, sizeSent, target, username, password, status, stage, virtType, runBase, numConcurrent, deleteFlag) VALUES (?, ?, ?, ?, ?, ?, ?, ?,?, ?, ?, ?, ?, ?)";
+		$jobid = dbSet("nimbus", $sql, array($id, $st, 0, 0, 0, "", $user, $j->password,$status, 0, $virType, $runBase, $j->numConcurrent, NULL ));
+		$sql="UPDATE schedule set lastRan = ? where scheduleID=?";
+		dbSet("nimbus", $sql,array(time(), $id ));
+
+		foreach($s->VMs as $v){
+			if(!isset($v->VMID)){
+				addJobLog("Removed VM from job that no longer appears to exist ($v->name)" ,2,$jobid,0);
+				continue;
+			}
+			$vers=0;
+			if($s->jobType == jobType::restoreJob || $s->jobType == jobType::replicate || $s->jobType== jobType::offsiteJob){
+				if(isset($v->VM_Version)){
+					$vers = $v->VM_Version;
+				}
+			}
+			$sql = "INSERT into job_vms values(?, ?, ?)";
+			dbSet("nimbus", $sql,array($jobid, $v->VMID, $vers ));
+		}
+		$sql = "SELECT * from schedule_options where scheduleid=?";
+		$opts = dbGet("nimbus", $sql, array($s->scheduleID) );
+		$sql = "INSERT into job_options values(?, ?, ?)";
+		foreach($opts as $opt){
+			dbSet("nimbus",$sql,  array($jobid, $opt->option, $opt->val ));
+		}
+
+	if($pending){
+		addJobLog("Waiting for previous instance of this job to complete before starting.",2,$jobid,0);
+	}
+	
+	$GLOBALS['curJob'] = getJob($jobid);
+	return $GLOBALS['curJob'];
+}
+
+function getOrMakeBaseSched( $sn, $jtype=10){
+	// make a single schedule for all system jobs to share
+		$sql = "select scheduleID from schedule where name=?";
+		$rez =dbGetColumn("nimbus", $sql, array($sn ));
+		if($rez){ return $rez; }
+
+		$sql = "INSERT into Schedule (name,jobType) values(?, ?)";
+		$id = dbSet("nimbus", $sql, array($sn, $jtype ));
+	return $id;
+}
+
+function spawnVaultJob($vmid, $version, $pid, $siteId){
+
+        $res = licenseCheck(null, null, null, "vault");
+        // licensing problem
+        if($res->status == "error"){ throw new Exception("Licensing error: $res->message"); }   // no plan
+        if($res->status == "denied"){ throw new Exception("Licensing error- $res->message."); } // no DR
+
+
+
+	sleep( rand(5,15) );
+
+	$uuid = getVMUuid($vmid);
+	$vm = getVmSimple($uuid);
+	$t = jobType::offsiteJob;
+	$sn = "Vault of ". $vm->name;
+	$sid = getOrMakeBaseSched($sn,$t);
+	echo "$sn ($sid)\n";
+	$s = getSchedule($sid);
+	$s->Options["siteId"] = $siteId;
+	// Add the siteId variable
+        $sql = "INSERT OR REPLACE INTO Schedule_options VALUES (?, 'siteId', ?)";
+	dbSet("nimbus", $sql, array($sid, $siteId) );
+	
+	$doit = shouldSpawn($s);
+
+	if($doit == 0){
+		syslog(LOG_NOTICE, "Skipping vault of ($vm->name), a vault of this VM is already in progress.");
+		return;
+	}
+	$s->virtType=0;
+	$s->runBase=0;
+	$s->numConcurrent=0;
+	$v = new stdClass();
+	$v->VMID = $vmid;
+	$v->VM_Version = $version;
+	array_push($s->VMs, $v);
+	$j = null;
+	if($doit==1){
+		$j = spawnJob($s, false);
+	}else if($doit == 2){
+		$j = spawnJob($s, true);
+		while(true){
+			if(getJobCount($j->scheduleID, false) ==0){
+				break;
+			}
+		}
+	}
+	updateJobVaultPID($j->jobID, $pid);
+	if($pid != -1){
+		$rent = getSchedule($pid);
+		$vemail =0;
+		$vemailerr =0;
+		if(array_key_exists("allowJobEmail",$rent->Options)){
+			if($rent->Options["allowJobEmail"] == 1){ $vemail=1; }
+		}
+		$sql = "INSERT OR REPLACE INTO Job_options VALUES (?, 'allowJobEmail', ?)";
+		dbSet("nimbus", $sql, $j->jobID, $vemail);
+		if(array_key_exists("emailErrorsOnly",$rent->Options)){
+			if($rent->Options["emailErrorsOnly"] == 1){ $vemailerr=1; }
+		}
+		$sql = "INSERT OR REPLACE INTO Job_options VALUES (?, 'emailErrorsOnly', ?)";
+		dbSet("nimbus", $sql, array($j->jobID, $vemailerr) );
+	}
+	startJob($j);
+	try{
+		$ed = getEdition();
+		if($ed < 2){
+			addJobLog("Offsite Vaulting requires Alike DR Edition. ($ed)", 1, $j->jobID, 0);
+			endJob($j->jobID, 7);
+			return;
+		}
+		if(isODSMountedReal() != true){
+                        addJobLog("No Offsite Vault defined/mounted.  Please define your Offsite Storage on the A3 console before vaulting backups", 1, $j->jobID, 0);
+                        endJob($j->jobID, 7);
+                        return;
+                }
+		$manual =0;
+		if($pid == -1){ $manual = 1; } 
+		$cmd = $GLOBALS["settings"]->scripts."/processVM $j->jobID $vmid $manual";
+	print "Running: $cmd\n";
+		$rez =-1;
+		$out=array();
+		exec($cmd,$out,$res);
+
+		if($res==0){
+			endJob($j->jobID);
+		}else{
+			endJob($j->jobID, 4);
+		}
+	}catch(Exception $ex){
+		addJobLog("Job Error: ".$ex->getMessage(), 1, $j->jobID, 0);
+		endJob($j->jobID, 4);
+	}
+}
+
+function resumeJob($jobid, $vmid){
+	echo "You want me to resume: $jobid for vm: $vmid\n";
+	if(!is_numeric($jobid) || !is_numeric($vmid)){
+		echo "Invalid parameters given.\n";
+		return false;
+	}
+	// end the job
+	$vbase = $GLOBALS["settings"]->adsPath ."/validate/$jobid"."_$vmid";
+	$rezFile="";
+	foreach (glob($vbase."*.cursor") as $file) {
+		$rezFile = $file;
+	}
+
+	echo "I found: $rezFile\n";
+	if(!file_exists($rezFile)){
+		echo "Odd, I just found the file, now its not there ($rezFile)\n";
+	}
+	updateJobStatus($jobid, 2);
+
+	$a = array();
+        $a["command"] = "resume";
+        $a["path"] = "$rezFile";
+        $msg = "Resuming job $jobid ";
+        $eid = addJobLog($msg, 0, $jobid, $vmid, 17100222);
+
+        try{
+                $barf =issueJavaCmd($a, $jobid, $vmid, $eid);
+		$msg = "$msg}<}100";
+                updateJobLog($msg, 0, $eid);
+
+                endJob($jobid);
+        }catch(Exception $ex){
+                updateJobLogStatus(1, $eid);
+                addJobLog($ex->getMessage(), 1, $jobid, $vmid);
+                endJob($jobid, 4);
+        }
+}
+function mountHVHost($hid){
+	// 0 will mount all of them
+//	$cmd = "/usr/local/sbin/winMounter mountHV $hid";
+//	exec($cmd);
+}
+?>

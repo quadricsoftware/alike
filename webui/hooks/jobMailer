@@ -1,0 +1,203 @@
+#!/usr/bin/php -q
+<?php
+
+include_once("/usr/local/sbin/shared_lib");
+include_once("/usr/local/sbin/common_lib");
+
+if(count($argv) <= 1){
+        $msg = "Insufficient parameters\n\n";
+        $msg .= "Usage: jobMailer jobID \n";
+        print $msg;
+        exit(1);
+}
+$jobID = $argv[1];
+if(count($argv) > 2){
+        $arg = $argv[2];
+}
+
+$smtp = getSetting("smtpNotify");
+if($smtp != "true"){
+	echo "SMTP is globally disabled (setting).  No email will be sent\n";
+	return;
+}
+
+$j = null;
+
+try{
+        $j = getJob($jobID);
+}catch(Exception $ex){
+        print "Job $jobID not found. Error:" .$ex->getMessage() ."\n";
+        exit(1);
+}
+
+$s = getSchedule($j->scheduleID);
+
+if ( $j->type == jobType::offsiteJob ){
+        $ve = getSetting("enableVaultEmails");
+        if($ve == false){ exit; }
+}
+
+
+$send = false;
+if(array_key_exists("allowJobEmail",$j->Options)){
+	if($j->Options["allowJobEmail"] == 1){
+		$send =true;
+	}else{
+		echo "Job ($jobID) has email notifications disabled.  No emails will be sent.\n";
+		exit;
+	}
+}
+$maybeSend=false;
+if(array_key_exists("emailErrorsOnly",$j->Options)){
+	if($j->Options["emailErrorsOnly"] == 1){
+		$maybeSend=true;
+		$send =false;
+		if($j->status == 5 || $j->status == 7 || $j->status == 4){ $send=true; }
+	}
+}
+$errors = getJobLogsWithStatus($j->jobID, 1);
+$warnings = getJobLogsWithStatus($j->jobID, 2);
+
+// if the job has error/warning entries, notify
+if(count($errors) || count($warnings)){ $send =true; }
+
+if(!$send){
+	echo "No need to send email for job.\n";
+	exit;
+}
+
+print "Job type: $j->type\n";
+$msg ="";
+if($j->type == jobType::restoreJob){
+        $msg = restoreJobMail($j);
+}else if ( $j->type == jobType::backupJob || $j->type == jobType::rawBackup ||$j->type == jobType::agentBackup){
+        $msg = backupJobMail($j);
+}else if ( $j->type == jobType::replicate || $j->type == jobType::rawReplicate ){
+        $msg = repJobMail($j);
+}else if ( $j->type == jobType::offsiteJob ){
+        $msg = vaultJobMail($j);
+}
+
+if(count($errors)){
+	$msg .= mark("brow") . mark("tr") . td("e")."Job Errors". mark("be"). td("c") ."\n";
+	foreach($errors as $er){
+		$ts = $er->timestamp;
+		$m = $er->description;
+		$msg .= mark("crow"). " <font color='#0b5394'>$ts</font>, &nbsp; <font color='#7A0000'>$m</font>". mark("crowe")."\n";
+	}
+}else{
+	$msg .= mark("crow"). "<font color='black'>No Errors Found</font>". mark("crowe")."\n";
+}
+
+if(count($warnings)){
+	$msg .= mark("brow") . mark("tr") . td("w")."Job Warnings". mark("be"). td("c") ."\n";
+	foreach($warnings as $er){
+		$ts = $er->timestamp;
+		$m = $er->description;
+		$msg .= mark("crow"). " <font color='#0b5394'>$ts</font>, &nbsp; <font color='black'>$m</font>". mark("crowe")."\n";
+	}
+}else{
+	$msg .= mark("crow"). "<font color='black'>No warnings found Found</font>". mark("crowe")."\n";
+}
+
+
+sysmail(getSubject($j), $msg);
+
+
+
+function backupJobMail($j){
+	$s = getHeader($j);
+	$s .= getBackupStanza($j);
+
+	return $s;
+}
+function repJobMail($j){
+
+}
+function restoreJobMail($j){
+
+}
+function vaultJobMail($j){
+	$s = getHeader($j);
+        return $s;
+}
+
+function getBackupStanza($j){
+	$os = bytesToString($j->originalSize);
+	$ss = bytesToString($j->sizeSent);
+	$cp = 0;
+	if($j->originalSize > 0){
+		$cp = round((100 -($j->sizeSent / $j->originalSize) * 100),0,PHP_ROUND_HALF_UP  );
+	}
+
+	$s = mark("tr") . td("b"). "Total Protected". mark("be"). td("c"). $os . mark("ce")."\n";
+	$s .= mark("tr") . td("b"). "Storage Used". mark("be"). td("c"). $ss . mark("ce")."\n";
+	$s .= mark("tr") . td("b"). "Compression". mark("be"). td("c"). "$cp%" . mark("ce")."\n";
+	return $s;
+}
+function getRestoreStanza($j){
+	$s = mark("tr"). td("b"). "Total amount restored". mark("be"). td("c"). bytesToString($j->originalSize).mark("cr");
+	return $s;
+}
+function getJobEntries($j){
+}
+function getSubject($j){
+	return "Alike Job (". $j->name.") ". getStatusStr($j);
+}
+function getHeader($j){
+	$len = $j->timeEnd - $j->timeBegin;
+	$len = secondsToString($len);
+	$s = "<html><body><p><h2>Alike Job Summary</h2>";
+	$s .= "<table style='border:none;border-collapse:collapse'><colgroup><col width='220'><col ></colgroup><tbody>";
+	$s .= mark("tr") . td("b"). "Job". mark("be"). td("c"). "$j->name (Job#: $j->jobID)" ."\n";
+	$s .= mark("tr") . td("b"). "Run Time". mark("be"). td("c"). "$len" ."\n";
+	return $s;
+}
+function getStatusStr($j){
+	if($j->status == 5){
+		return "was cancelled";
+	}else if( $j->status == 7){
+		return "failed";
+	}else if( $j->status == 4 || $j->status ==3){
+		return "had errors";
+	}else if( $j->status == 6 ){
+		return "completed successfully";
+	}
+}
+
+////////////// God this is terrible.  Cover your eyes....
+
+function td($t){
+	$s = "background-color:rgb(89,156,89)'><b style='color:rgb(255,255,255)'>";
+	if($t == "b"){
+		$s = "background-color:rgb(61,133,198)'><b style='color:rgb(255,255,255)'>";
+	}else if($t == "w"){
+		$s = "background-color:rgb(255,217,102)'><b style='color:rgb(0,0,0)'>";
+	}else if($t == "e"){
+		$s = "background-color:rgb(205,0,0)'><b style='color:rgb(255,255,255)'>";
+	}else if($t == "c"){
+		$s = "'> <font color='#0b5394'>";
+	}
+	return "<td style='border:1px solid rgb(255,255,255);vertical-align:top;padding:7px;$s";
+}
+function mark($t){
+	$s = "";
+	if($t == "be"){
+		$s = "</b><br></td>";
+	}else if($t == "ce"){
+		$s = "</font><br></td>";
+	}else if($t == "tr"){
+		$s = "<tr style='height:0px'>";
+	}else if($t == "brow"){
+		$s = "<tr style='height:20px'><td colspan=2></td></tr>";
+	}else if($t == "crow"){
+		$s = "<tr style='height:0px'> <td style='border:1px solid rgb(255,255,255);vertical-align:top;padding:5px' colspan=2><font color='#0b5394'>";
+	}else if($t == "crowe"){
+		$s = "</font></td></tr>";
+	}
+
+	return $s;
+}
+
+
+?>

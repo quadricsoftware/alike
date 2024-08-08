@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Configuration status="INFO">
+<properties>
+		<property name="servicename">blockvaulter</property>
+		<property name="filename">/var/log/${servicename}.log</property>
+		<property name="patternTime">%d{yyyy-MM-dd HH:mm:ss.SSS} | %-5.5p | %-10.10t | %-20.20C:%-5.5L | %msg%n</property>
+		<property name="patternNoTime">%-5.5p | %-10.10t | %-20.20C:%-5.5L | %msg%n</property>
+</properties>
+
+  <Appenders>
+    <Console name="Console" target="SYSTEM_ERR">
+      <PatternLayout pattern="%d{HH:mm:ss.SSS} [%t] %-5level %logger{36} - %msg%n"/>
+    </Console>
+    <Syslog name="Syslog" 
+			host="localhost" port="514" protocol="UDP" appName="${servicename}" 
+			format="RFC5424" includeMDC="true" enterpriseNumber="18060" messageId="Audit"
+			mdcId="blockvaulter">
+		 <LoggerFields>
+			<KeyValuePair key="priority" value="%p"/>
+			<KeyValuePair key="exception" value="%ex{full}"/>
+		</LoggerFields>
+		<ExceptionPattern>%ex{full}</ExceptionPattern>
+	
+	</Syslog>
+  </Appenders>
+  <Loggers>
+    <Root level="info">
+	<AppenderRef ref="Syslog"/>
+    </Root>
+  </Loggers>
+</Configuration>

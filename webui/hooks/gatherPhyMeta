@@ -1,0 +1,133 @@
+#!/usr/bin/php -q
+<?php
+include_once("/usr/local/sbin/common_lib");
+include_once("/usr/local/sbin/phys_common");
+include_once("/usr/local/sbin/shared_lib");
+
+
+if( (count($argv) == 2 && $argv[1] == "-h") ){
+        echo "Usage:\n";
+        echo "gatherPhyMeta <hostID>\n";
+        echo "If hostID is 0, or omitted, all Physical hosts will be scanned!\n\n";
+        exit(0);
+}
+
+$hid =0;
+if(count($argv) >=2){
+	$hid = $argv[1];
+	if(!is_numeric($hid)){
+		echo "Invalid hostID: $hid\n";
+		exit(1);
+	}
+        if(count($argv) > 3 && $argv[2] == '-j'){
+                echo "I got jobid: $argv[3]\n";
+                $GLOBALS["__insta_job_id"] = $argv[3];
+                gen_log(LOG_INFO, "Starting enumeration for hostID: $hid");
+        }
+
+}
+
+
+$start = microtime(true);
+
+$a3Guid = getInstallID();
+
+try{
+                if($hid >0){
+                        $v = getVMUuid($hid);
+                        $v = getVmSimple($v);
+                        updateAgent($v);
+                        exit();
+                }
+
+		gen_log(LOG_INFO,"Collecting metainfo for all known Physical targets");
+		$seen = array();
+		$vms = getAllPhysicalVms();
+		foreach($vms as $v){
+			if(($v->poolID == "licensed" && $v->hostID == $a3Guid) || getNodeMode() == 2 ){
+				// Agents are 'owned' by specific A3s
+				// if this agent isn't ours, remove it from our tm_vminfo table so it doesn't show as a source for jobs
+				try{
+					updateAgent($v);
+				}catch(Exception $ex){
+					gen_log(LOG_WARNING, "Failed to gather meta for Agent $v->VMName ($v->accessIP): ". $ex->getMessage() );
+				}
+			}else{
+				echo "Skipping $v->VMName ($v->UUID) unlicensed or we don't own it.\n";
+				removeTmInfo($v->UUID);
+			}
+		}
+}catch(Exception $ex){
+	gen_log(LOG_ERR, "Failed with error: ". $ex->getMessage());
+	exit(1);
+}
+
+$t1 = microtime(true);
+$sec = ($t1 - $start);
+
+function removeTmInfo($uuid){
+	$sql = "DELETE from tm_vminfo where uuid=?";
+	dbSet("nimbus", $sql, array( $uuid));
+	gen_log(LOG_INFO, "Purge unlicensed Agent ($uuid) ");
+}
+
+function updateAgent($vm){
+	if(empty($vm->accessIP)){
+		echo "Failed to update Agent, no IP found\n";
+		return;
+	}
+	gen_log(LOG_INFO, "Beginning update for agent $vm->VMName");
+	$ip = $vm->accessIP;
+	$st = agentStatus($ip);
+	if(empty($st) || !is_object($st)){
+		throw new Exception("Failed to connect to agent on IPL $vm->accessIP");
+	}
+	gen_log(LOG_INFO, "Checking Agent status...  Received: ".$st->version);
+	recordAgent($vm->VMID, $st);
+
+	$h = new stdClass();
+
+	$q =  "SELECT DNSHostName, Name,NumberOfProcessors,TotalPhysicalMemory,HypervisorPresent from Win32_ComputerSystem";
+	$out= agentWmiCmd($ip, $q );
+	$hvInfo1 = agentParseWmi($out);
+	$h->name = $hvInfo1->Name;
+
+	$q = "SELECT Caption,Version,FreePhysicalMemory  from Win32_OperatingSystem";
+	$out= agentWmiCmd($ip, $q );
+	$hvInfo = agentParseWmi($out);
+	$h->osName = $hvInfo->Caption;
+
+	$disks = getPhysDisks($ip);
+	$size =0;
+	foreach($disks as $d){
+		$size += $d->size;
+	}
+//	$vifs = getPhysVifs($ip);
+	try{
+
+		// isHidden is now the virttype!
+		$q =  "INSERT OR REPLACE INTO tm_vminfo (uuid,name,osName, powerState, isTemplate, isHidden,hostUUID, size, ipaddress) VALUES (?,?,?,?,?,?,?,?,?)";
+                dbSet("nimbus", $q, array( $vm->UUID,$h->name,$h->osName,2,0,10,0,$size,$ip  ) );
+                echo "Updated tm_vminfo for $h->name \n";
+		foreach($disks as $v){
+			$q =  "INSERT INTO tm_vmdisk (vmuuid, uuid,name,size,position) VALUES (?,?,?,?,?)";
+			if(property_exists($v, "position")){ 
+				$pos = $v->position;
+			}else{
+				$pos = $v->userdevice; 
+			}
+			dbSet("nimbus", $q, array( $vm->UUID, $v->uuid, "Disk $pos", $v->size,$pos  ) );
+		}
+
+	}catch(Exception $ex){
+		gen_log(LOG_ERR, "Failure in DB update: ".$ex->getMessage());
+	}
+	gen_log(LOG_INFO, "Update of Agent $h->name ($vm->VMName) is complete");
+
+}
+
+
+
+
+
+?>

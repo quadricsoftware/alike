@@ -1,0 +1,34 @@
+<html>
+<head>
+<link rel="stylesheet" href="/css/alike.css">
+<link rel="stylesheet" href="/css/jquery.reject.css">
+<link rel="stylesheet" href="/css/bootstrap.min.css">
+<link rel="stylesheet" href="/css/bootstrap-theme.min.css">
+<script>
+      function bounce () { setTimeout(goHome, 1400); }
+      function goHome() { document.location.href = '/admin/'; }
+</script>
+<style> 
+	body { 
+	background: rgb(2,0,36);
+	background: linear-gradient(to bottom, rgba(2,0,36,1) 0%, rgba(0,0,56,1) 67%, rgba(0,78,255,1) 100%); 
+	color: white;
+	} 
+</style>
+
+    <title>Page Not Found</title>
+  </head>
+  <body onLoad="setTimeout('bounce()', 5000)">
+
+	<!-- <div style='position:absolute; top:50%; left: 40%'> -->
+	<div style='position:relative; resize: vertical; top: 30%;'>
+	<div style='padding: 20px;margin: 0 auto; width: 400px; background: #101010; color: white; text-align: center; box-shadow: 8px 8px 2px 1px rgba(0, 100, 100, .2); border-radius: 5px;'>
+	<span style='font-size: 68px;'>404</span><br>
+	Looks like this page couldn't be found.<br>
+	Heading back <a href='/admin/'>home...</a>
+	<br>
+	</div>
+	</div>
+
+
+</html>

@@ -1,0 +1,36 @@
+<html lang="en">
+  <head>
+<link rel="stylesheet" href="/css/alike.css">
+<link rel="stylesheet" href="/css/jquery.reject.css">
+<link rel="stylesheet" href="/css/bootstrap.min.css">
+<link rel="stylesheet" href="/css/bootstrap-theme.min.css">
+<style> body { background-image: linear-gradient(to top, #00176D , #0082A2 ); } </style>
+
+    <title>Alike is loading</title>
+  </head>
+  <body>
+        <div id='loader' style="width: 400px; height:120px; padding: 10px; border-radius: 25px; background: #f2f2f2; text-align: center; position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);">
+        <h1>Please wait...</h1>
+        <p style="font-size: 25px;">
+      <img src="images/loading.gif" alt="Ouroboros">
+        Alike is starting... </p>
+    </div>
+    <script>
+            function refreshPage(){
+                var i = 0;
+                var max = 60;
+                if(document.location.search) {
+                        i = parseInt(document.location.search.substring(1).split('=')[1]);
+                        if(i >= max){ i = 0; }
+                } 
+                i++;
+                if(i >= max){
+                        document.getElementById('loader').innerHTML ="<h2>Loading timed out!</h2>You can try <a href='/admin.php'>logging in here</a>.<br>If that fails, check your Docker & Alike logs";
+                }else{
+                    window.location.href = window.location.pathname + "?refresh=" + i;
+                }
+            }
+            setInterval(refreshPage, 2000);
+    </script>
+  </body>
+</html>
