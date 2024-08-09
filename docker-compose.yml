@@ -6,7 +6,7 @@ volumes:
 services:
     alike:
         container_name: alike
-        image: quadricsoftware/alike-v7:9631b
+        image: quadricsoftware/alike-v7:LTR
         stop_grace_period: 60s
         privileged: true
         init: true
