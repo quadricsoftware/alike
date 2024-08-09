@@ -38,7 +38,6 @@ services:
         environment:
             HOST_BLD: ${HOST_BLD:?The HOST_BLD environment variable is missing from your /home/alike/.env file}
             HOST_IP: ${HOST_IP:?The HOST_IP environment variable is missing from your /home/alike/.env file}
-            #HOST_NFS: ${HOST_NFS:?The HOST_NFS environment variable is missing from your /home/alike/.env file}
         cap_add:
             - NET_ADMIN
             - SYS_ADMIN
