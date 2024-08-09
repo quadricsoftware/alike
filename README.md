@@ -2,9 +2,9 @@
 Project for Alike Backup, a BDR solution for XenServer, XCP-ng, and Hyper-V virtualization platforms. Download the prebuilt platform with the Docker 
 
 ## Prebuilt Docker Images
-Dev Preview: quadricsoftware/alike-v7:preview 
+Public Preview: quadricsoftware/alike-v7:preview 
 
-Current Longterm Stable: quadricsoftware/alike-v7:9631b
+Latest Stable: quadricsoftware/alike-v7:9631b
 
 
 ## Building from Sources
