@@ -6,7 +6,7 @@ Please use the docker-compose example file to set up your container quickly and 
 
 Public Preview: quadricsoftware/alike-v7:preview 
 
-Latest Stable: quadricsoftware/alike-v7:9631b
+Longterm Stable: quadricsoftware/alike-v7:LTR
 
 
 ## Building from Sources
