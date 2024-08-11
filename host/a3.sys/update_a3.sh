@@ -18,7 +18,7 @@ if [ ${force} -eq 0 ]; then
 	if [[ -f /usr/local/sbin/rev.num ]];then
 		LOCAL_BLD=`cat /usr/local/sbin/rev.num`
 	fi
-	CURRENT=`wget -qO - 'https://github.com/quadricsoftware/alike/host/a3.rev.num'`
+	CURRENT=`wget -qO - 'https://raw.githubusercontent.com/quadricsoftware/alike/main/host/a3.rev.num'`
 	
 	echo "Us: ${LOCAL_BLD} vs them: ${CURRENT}"
 	if [ ${CURRENT} -gt ${LOCAL_BLD} ]; then
@@ -29,7 +29,7 @@ if [ ${force} -eq 0 ]; then
 	fi
 fi
 
-wget -qO qs.sh 'https://github.com/quadricsoftware/alike/host/a3_update.sh' && bash qs.sh -quiet $@
+wget -qO qs.sh 'https://raw.githubusercontent.com/quadricsoftware/alike/main/host/a3_update.sh' && bash qs.sh -quiet $@
 if [[ -f qs.sh ]]; then
         rm qs.sh
 fi
