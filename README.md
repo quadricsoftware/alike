@@ -1,12 +1,20 @@
 # alike
 Project for Alike Backup, a BDR solution for XenServer, XCP-ng, and Hyper-V virtualization platforms. Download the prebuilt platform with the Docker 
 
+## Xen Virtual Appliance (A3)
+The simplest and fastest way to get up and running with Alike is to use our pre-made, Alpine Linux based virtual appliance.
+To install, [download the XVA image](https://github.com/quadricsoftware/alike/raw/main/binaries/A3_v1.0.5.xva.zip), and import into your Xen environment
+Boot the VM, follow the command line menu steps to add storage, and start the Alike services.
+Once the Alike services start, switch to the Web UI to continue the setup and get started.
+
 ## Prebuilt Docker Images
 Please use the docker-compose example file to set up your container quickly and easily. There are two main images to choose from:
 
-Public Preview: quadricsoftware/alike-v7:preview 
+Public Preview (Alike v7.5): 
+quadricsoftware/alike-v7:preview 
 
-Longterm Stable: quadricsoftware/alike-v7:LTR
+Longterm Stable (Alike v7.2): 
+quadricsoftware/alike-v7:LTR
 
 
 ## Building from Sources
