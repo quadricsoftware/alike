@@ -1,1 +1,1 @@
-wget -q -O - https://github.com/quadricsoftware/alike/host/install.sh | bash
+wget -q -O - https://raw.githubusercontent.com/quadricsoftware/alike/main/host/install.sh | bash
