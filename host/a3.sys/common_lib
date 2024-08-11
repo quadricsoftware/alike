@@ -478,7 +478,7 @@ function getLatestBuildNum($force=false){
 	if(file_exists($cache) && filemtime($cache) > (time() - 3600)  && $force==false){
 		return trim(file_get_contents($cache));
 	}
-	$url = "https://github.com/quadricsoftware/alike/build.num";
+	$url = "https://raw.githubusercontent.com/quadricsoftware/alike/main/build.num";
 	$res = json_decode(shell_exec("wget $url -q -O -"));
 	return trim($res);
 }
