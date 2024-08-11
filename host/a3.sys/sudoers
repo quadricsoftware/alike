@@ -1,0 +1,27 @@
+root ALL=(ALL) ALL
+
+## Uncomment to allow members of group sudo to execute any command
+%sudo   ALL=(ALL) ALL
+%sudo ALL=(root) NOPASSWD: /sbin/apk
+%sudo ALL=(root) NOPASSWD: /bin/mount
+%sudo ALL=(root) NOPASSWD: /bin/chown
+%sudo ALL=(root) NOPASSWD: /bin/chmod
+%sudo ALL=(root) NOPASSWD: /bin/umount
+%sudo ALL=(root) NOPASSWD: /bin/dmesg
+%sudo ALL=(root) NOPASSWD: /bin/df
+%sudo ALL=(root) NOPASSWD: /usr/bin/docker
+%sudo ALL=(root) NOPASSWD: /usr/bin/docker-compose
+%sudo ALL=(root) NOPASSWD: /usr/local/sbin/goofys
+%sudo ALL=(root) NOPASSWD: /bin/chmod
+%sudo ALL=(root) NOPASSWD: /sbin/mkfs.ext4
+%sudo ALL=(root) NOPASSWD: /usr/sbin/parted
+%sudo ALL=(root) NOPASSWD: /usr/bin/xenstore-ls
+%sudo ALL=(root) NOPASSWD: /sbin/reboot
+%sudo ALL=(root) NOPASSWD: /bin/lsblk
+%sudo ALL=(root) NOPASSWD: /usr/local/sbin/update_a3.sh
+%sudo ALL=(root) NOPASSWD: /usr/local/sbin/mount-local.sh
+%sudo ALL=(root) NOPASSWD: /usr/local/sbin/mount-s3.sh
+%sudo ALL=(root) NOPASSWD: /usr/local/sbin/mount-nfs.sh
+%sudo ALL=(root) NOPASSWD: /usr/local/sbin/mount-cifs.sh
+%sudo ALL=(root) NOPASSWD: /usr/local/sbin/update-check.sh
+

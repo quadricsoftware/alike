@@ -1,0 +1,38 @@
+#!/usr/bin/php -q
+<?php
+include_once("common_lib");
+
+$myDir = "/tmp/support_tmp";
+$logDir = "/home/alike/logs";
+$dbDir = "/mnt/ads/prodDBs";
+
+if(is_dir($myDir)) {
+        echo "Cleaning support temp area...\n";
+        shell_exec("rm -fr $myDir");
+}
+echo "Creating temp area...\n";
+shell_exec("mkdir $myDir");
+echo "Dumping Docker info to $logDir\n";
+shell_exec("cd /home/alike; sudo docker-compose logs > $logDir/docker.log");
+shell_exec("cp $logDir/a3.log $myDir");
+shell_exec("cp $logDir/engine.log $myDir");
+shell_exec("cp $logDir/syslog $myDir");
+shell_exec("cp $logDir/docker.log $myDir");
+echo "Copying nimbusdb\n";
+shell_exec("cp $dbDir/nimbusdb.db $myDir");
+
+
+echo "Obtaining DU\n";
+exec("sudo df -h > /$myDir/du.txt");
+echo "Obtaining dmesg\n";
+exec("sudo dmesg > $myDir/dmesg.txt");
+$tar = "/tmp/support".time().".tar.gz";
+echo "Generating TAR....\n";
+$myCmd = "tar -czvf $tar $myDir";
+echo "$myCmd\n";
+exec($myCmd);
+echo "Cleaning up\n";
+//exec("rm -f $outTar");
+shell_exec("rm -fr $myDir");
+echo "DONE!\n";
+?>

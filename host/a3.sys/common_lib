@@ -1,0 +1,643 @@
+<?php
+
+
+// menu stuff
+function getYN($quiet=false){
+	if($quiet ==false){
+	        echo "Continue? (y/N): ";
+	}
+        $resp = trim(fgets(STDIN));
+        if (strcasecmp($resp, "y") == 0) { return true; }
+        return false;
+}
+function getChoice($timeout=null){
+	echo "Your choice: ";
+        $read = array(STDIN);
+	$write = array();
+	$except = array();
+	$rez = stream_select($read, $write, $except, $timeout);
+	if($rez === 0) {
+		return "";
+	}
+	$resp = trim(fgets(STDIN));
+        stream_set_timeout(STDIN, 0);
+	return $resp;
+}
+function getEntry(){
+        echo "# ";
+        $resp = trim(fgets(STDIN));
+        return $resp;
+}
+function getPassword() {
+        $oldStyle = shell_exec('stty -g');
+        shell_exec('stty -icanon -echo min 1 time 0');
+        $password = '';
+        while (true) {
+            $char = fgetc(STDIN);
+            if ($char === "\n") {
+                break;
+            } else if (ord($char) === 127) {
+                if (strlen($password) > 0) {
+                    fwrite(STDOUT, "\x08 \x08");
+                    $password = substr($password, 0, -1);
+                }
+            } else {
+                fwrite(STDOUT, "*");
+                $password .= $char;
+            }
+        }
+        // Reset old style
+        shell_exec('stty ' . $oldStyle);
+        // Return the password
+        return $password;
+}
+
+function opt($txt){
+        echo "\033[1;33m$txt\033[0m)";
+}
+
+function setupSigHandlers(){
+        // remember to add this line to the top of the script:
+        // declare(ticks = 1);
+
+        // setup signal handlers
+        pcntl_signal(SIGTERM, "sig_handler");
+        pcntl_signal(SIGHUP,  "sig_handler");
+        pcntl_signal(SIGUSR1, "sig_handler");
+        pcntl_signal(SIGINT, "sig_handler");
+        pcntl_signal(SIGTSTP, "sig_handler");
+        //pcntl_signal(SIGSTOP, "sig_handler");
+}
+function sig_handler($signo) {
+     switch ($signo) {
+         case SIGSTOP:
+             echo "Caught SIGSTOP...\n";
+                if($GLOBALS["breakable"]==1){ exit; }
+             break;
+         case SIGTSTP:
+             break;     // ctrl-z
+         case SIGINT:
+                if($GLOBALS["breakable"]==1){ exit; }
+             break;     // ctrl-c
+         case SIGTERM:
+                if($GLOBALS["breakable"]==1){ exit; }
+             break;
+         case SIGHUP:
+                if($GLOBALS["breakable"]==1){ exit; }
+             break;
+         case SIGUSR1:
+             break;
+         default:
+     }
+}
+function run($cmd){
+        if( ($fp = popen("$cmd", "r")) ) {
+            while( !feof($fp) ){
+                echo fread($fp, 1024);
+                flush(); // you have to flush buffer
+            }
+            fclose($fp);
+        }
+}
+
+
+function getIP(){
+	$cmd = "ifconfig eth0| grep \"inet addr\" | tr -s \":\" \" \" | awk {'print $3'} ";
+	return trim(shell_exec($cmd));
+}
+function getDNS(){
+	$cmd = "cat /etc/resolv.conf | grep nameserver | awk {'print $2'}";
+	return explode("\n",trim(shell_exec($cmd)));
+}
+
+function isDHCP(){
+	$cmd = "cat /etc/network/interfaces | grep \"iface eth0\"";
+	$r = trim(shell_exec($cmd));
+	if (strpos($r, "dhcp") === false){ return false; }
+	return true;
+}
+
+function enableDHCP(){
+	$s ="auto lo\n iface lo inet loopback\nauto eth0\n iface eth0 inet dhcp";
+	$fn = "/etc/network/interfaces";
+	file_put_contents($fn, $s);
+}
+function setStaticIP($err=0){
+	if($err > 3){ return false; }
+        echo "Enter IP Address/mask (eg. 192.168.1.10/24): ";
+        $ip = trim(fgets(STDIN));
+	if(!strpos($ip, '/')){
+		echo "Missing Subnet Mask\n";
+		return setStaticIP($err++);
+	}else{
+		list( $clean, $mask ) = explode( '/', $ip, 2 );
+		if(!filter_var($clean, FILTER_VALIDATE_IP)) {
+			echo "Invalid IP ($clean)\n";
+			return setStaticIP($err++);
+		}
+	}
+        echo "Enter Default Gateway: ";
+        $gw = trim(fgets(STDIN));
+        echo "Enter DNS Server: ";
+        $dns = trim(fgets(STDIN));
+
+        echo "You entered:\n";
+        echo "IP: $ip\n";
+        echo "Gateway: $gw\n";
+        echo "DNS: $dns\n";
+        echo "Is this correct? (y/n) ";
+        $res = trim(fgets(STDIN));
+        if($res == "y" || $res == "Y"){
+		$s ="auto lo\n iface lo inet loopback\nauto eth0\n iface eth0 inet static\n";
+		$s .= "\taddress $ip\n";
+		$s .= "\tgateway $gw\n";
+		$fn = "/etc/network/interfaces";
+		file_put_contents($fn, $s);
+
+		$s = "nameserver $dns";
+		$fn = "/tmp/resolv.conf";
+		file_put_contents($fn, $s);
+		shell_exec("sudo cp /tmp/resolv.conf /etc/");
+        }else{
+		return false;
+	}
+	return true;
+}
+
+function getCurrentDS($type){
+	$ads = new stdClass();
+
+	$t = "ads";
+	if($type == "ods"){ $t = "ods"; }
+
+	$cmd = "mount | grep $t | awk {'print $1'}";
+	$ads->path = str_replace('\040', " ", trim(shell_exec($cmd)) );
+
+	$cmd = "mount | grep $t | awk {'print $5'}";
+	$ads->type = strtoupper(trim(shell_exec($cmd)) );
+	if($ads->type == "FUSE"){ $ads->type = "S3 Compatible"; }
+
+
+
+	return $ads;
+}
+
+function getDockerStatus(){
+	$mode = getNodeMode();
+	$cmd = "sudo docker ps | grep alike-v7 | wc -l";
+	$isRunning = trim(shell_exec($cmd));
+	if($mode ==0){ return $isRunning; }
+
+	if($isRunning){
+		$tries=5;
+		while(!file_exists("/mnt/ads/docker.up")){
+			sleep(1);
+			$tries--;
+			if($tries <=0){ return false; }
+		}
+		if (file_exists("/mnt/ads/docker.up")){
+			return true;
+		}
+	}
+	return $isRunning;
+}
+function getDockerStatusText(){
+        $stat = "\033[1;31mSTOPPED\033[0m";
+        $cmd = "sudo docker ps | grep alike-v7 | wc -l";
+        $isRunning = trim(shell_exec($cmd));
+	$mode = getNodeMode();
+	if($mode ==0){
+                return "\033[1;32mRunning\033[0m";	// managers don't use the docker.up convention
+	}
+
+
+        if($isRunning){
+                if (file_exists("/mnt/ads/docker.up")){
+                        $stat = "\033[1;32mRunning\033[0m";
+                }else{
+                        $stat = "\033[1;33mStarting\033[0m";
+                }
+        }
+        return $stat;
+}
+
+function getViableDisks(){
+
+        $out = shell_exec("sudo /bin/lsblk --bytes --output NAME,FSTYPE,HOTPLUG,STATE,SIZE,TYPE,MOUNTPOINT,MODEL,VENDOR -J 2> /dev/null");
+
+        $obj = json_decode($out);
+        $disks = array();
+        if(count($obj->blockdevices)==0){ return $disks; }
+        foreach($obj->blockdevices as $d){
+                if($d->type != "disk"){ continue; }
+                if($d->fstype == "linux_raid_member"){ continue; }
+                if(!isset($d->mountpoint) && !isset($d->children) ){    // unmounted, unpartitioned disks (may or may not have a fs)
+                        array_push($disks, $d);
+                }else if(isset($d->children)){
+                        foreach($d->children as $c){
+                                if(!isset($c->mountpoint) && $c->size > 1024 * 1024 *1024 *1){
+                                        array_push($disks, $c);
+                                }
+                        }
+                }
+        }
+        $res = trim(shell_exec("cat /proc/mdstat | grep md | awk '{print $1}'"));
+        if($res != ""){
+                $out = shell_exec("/bin/lsblk --bytes --output NAME,FSTYPE,HOTPLUG,STATE,SIZE,TYPE,MOUNTPOINT,MODEL,VENDOR -J /dev/$res 2> /dev/null");
+                $obj = json_decode($out);
+                if(count($obj->blockdevices)==0){ return $disks; }
+                else{
+                        foreach($obj->blockdevices as $d){
+                                if(strpos($d->type, "raid") !== false ){
+                                        if(!isset($d->mountpoint)  ){    // unmounted, unpartitioned disks (may or may not have a fs)
+                                                array_push($disks, $d);
+                                        }
+                                }
+                        }
+                }
+        }
+
+        return $disks;
+}
+
+function formatVolume($name){
+        echo "Formatting now...";
+        $cmd = "sudo /sbin/mkfs.ext4 /dev/$name ";
+        exec($cmd);
+        $cmd = "sudo /bin/chown alike.alike /dev/$name ";
+        exec($cmd);
+        echo "Format complete.\n";
+}
+
+// allows user to pick a local disk/volume for use as a datastore
+function getLocalVolumeForDS(){
+        $disks = getViableDisks();
+        if(count($disks)==0){
+                echo "Sorry, no local disks/volumes were found.\n";
+                echo "Only block devices or volumes that are not currently mounted can be used.\n";
+                echo "Press any key to continue.";
+                $inp = trim(fgets(STDIN));
+                return "";
+        }
+        $guys = array();
+        $i=0;
+        foreach($disks as $d){ $guys[$i] = $d; $i++; }
+        echo "Available local disks/volumes for use:\n";
+        foreach($guys as $i =>$d){
+                $sz = bytesToString($d->size);
+                $model = trim($d->model);
+                $type = "Disk";
+                if($d->type != "disk"){
+                        $type = "$d->fstype volume";
+                }else{
+                        if($model == ""){ $type = "Local Disk"; }
+                        else{$type = $model; }
+                }
+                print opt($i). " $d->name [$type]  ($sz) \n";
+        }
+        print opt("x"). " Exit and return to main menu \n\n";
+        echo "Please enter your choice: ";
+        $inp = trim(fgets(STDIN));
+        if($inp =="X" || $inp == "x"){
+		return;
+        }
+        if(is_numeric($inp)== false || $inp > count($guys)){
+                return getLocalVolumeForDS();
+        }else{
+                $isNew=false;
+                $d = $guys[$inp];
+                $name = $d->name;
+                echo "You selected: $name\n";
+                if($d->type == "disk"){
+                        echo "You selected a disk (not partition).\n";
+                        echo "If you proceed, this disk will be FORMATTED now.\n";
+                        echo "This will ERASE all data on this disk!\n";
+                        echo "Proceed? (y/N) ";
+                        $inp = trim(fgets(STDIN));
+                        if($inp =="y" || $inp == "Y"){
+                                $cmd = "sudo parted /dev/$name --script -- mklabel gpt mkpart primary 0% 100%";
+                                exec($cmd);
+                                echo "Disk has been partitioned.\n";
+                                exec('sync');
+                                sleep(1);
+                                $name = $name."1";
+                                formatVolume($name);
+                                $isNew=true;
+                        }else{
+                                echo "Skipping.\n\n";
+                                return getLocalVolumeForDS();
+                        }
+                 }else if($d->fstype ==""){
+                        echo "Looks like this volume ($name) is not formatted.\n";
+                        echo "Format it now? (y/N) ";
+                        $inp = trim(fgets(STDIN));
+                        if($inp =="y" || $inp == "Y"){
+                                formatVolume($name);
+                                $isNew=true;
+
+                        }else{
+                                echo "Exiting.\n\n";
+                                return getLocalVolumeForDS();
+                        }
+                }
+                return "/dev/$name";
+        }
+}
+
+function bytesToString($bytes){
+        if ($bytes >= 1099511627776){
+            $bytes = number_format($bytes / 1099511627776, 2) . ' TB';
+        }
+        elseif ($bytes >= 1073741824){
+            $bytes = number_format($bytes / 1073741824, 2) . ' GB';
+        }
+        elseif ($bytes >= 1048576){
+            $bytes = number_format($bytes / 1048576, 2) . ' MB';
+        }
+        elseif ($bytes >= 1024){
+            $bytes = number_format($bytes / 1024, 2) . ' KB';
+        }
+        elseif ($bytes > 1){
+            $bytes = $bytes . ' bytes';
+        }
+        elseif ($bytes == 1){
+            $bytes = $bytes . ' byte';
+        }
+        else{
+            $bytes = '0 bytes';
+        }
+
+        return $bytes;
+}
+
+function managedRun($cmd){
+        $process = proc_open("$cmd", array(
+                0 => array('pipe', 'r'), // STDIN
+                1 => array('pipe', 'w'), // STDOUT
+                2 => array('pipe', 'w')  // STDERR
+        ), $pipes);
+
+        $res = new stdClass();
+
+        if(is_resource($process)) {
+                fclose($pipes[0]);      // stdin
+                $res->stdOut = stream_get_contents($pipes[1]);
+                fclose($pipes[1]);
+                $res->stdErr = stream_get_contents($pipes[2]);
+                fclose($pipes[2]);
+                $res->code = proc_close($process);
+                return $res;
+        }
+        $res->stdOut ="";
+        $res->stdErr ="Failed to run command";
+        $res->code =2;
+        return $res;
+}
+
+function getMountFreeMB($path){
+        $cmd = "df -B 1M $path  | grep -v 'Available' | awk '{ print $3 }'";
+        $free =  trim(shell_exec($cmd));
+        return $free;
+}
+
+function doWebPost($url, $o){
+        $data = array('data' => $o );
+        $options = array(
+            'http' => array(
+                'header'  => "Content-type: application/x-www-form-urlencoded\r\n",
+                'method'  => 'POST',
+                'content' => http_build_query($data)
+            )
+        );
+        $context  = stream_context_create($options);
+        $result = file_get_contents($url, false, $context);
+        if ($result === FALSE) {
+                $res = new stdClass();
+                $res->result = "error";
+                $res->message = "Webservice encountered an error ($url)!";
+                echo "Webservice encountered an error ($url)!\n";
+                return $res;
+        }
+        return $result;
+}
+
+function getSetting($set){
+        $db = "/mnt/ads/prodDBs/nimbusdb.db";
+	if(!file_exists($db)){
+		throw new Exception("NimbusDB not found!");
+	}
+        $sql = "select val from settings where name='$set'";
+        return trim(shell_exec("sqlite3 $db \"$sql\"")); 
+
+        $dbc = new PDO("sqlite:$db");
+        $sql = "select val from settings where name=?";
+        $stmt = $dbc->prepare($sql);
+        $stmt->execute(array($set ));
+        $val= $stmt->fetchColumn();
+        return $val;
+}
+function setSetting($set, $val){
+        $db = "/mnt/ads/prodDBs/nimbusdb.db";
+        if(!file_exists($db)){
+                throw new Exception("NimbusDB not found!");
+        }
+
+        $sql = "insert or replace into settings (name, val) VALUES ('$set','$val')";
+        return trim(shell_exec("sqlite3 $db \"$sql\"")); 
+
+	exec("mkdir -p /tmp/db-tmp");
+	exec("rm -f /tmp/db-tmp/*");
+	exec("cp /mnt/ads/prodDBs/nimbusdb.db* /tmp/db-tmp/");
+	$tmpDB = "/tmp/db-tmp/nimbusdb.db";
+
+        $dbc = new PDO("sqlite:$tmpDB");
+	$dbc->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+
+        $sql = "insert or replace into settings (name, val) VALUES (?,?)";
+        $stmt = $dbc->prepare($sql);
+        $stmt->execute(array($set, $val ));
+
+	exec("cp /tmp/db-tmp/nimbusdb.db* /mnt/ads/prodDBs/");
+}
+
+function getA3Info(){
+
+	$out = new stdClass();
+	$out->guid = "N/A";
+        $file = "/mnt/ads/guid.id";
+	if(!file_exists($file)){
+		return $out;
+	}
+
+	$out->guid = trim(file_get_contents($file));;
+	return $out;
+}
+
+function getLatestBuildNum($force=false){
+	$cache = "/tmp/latest.bld";
+	if(file_exists($cache) && filemtime($cache) > (time() - 3600)  && $force==false){
+		return trim(file_get_contents($cache));
+	}
+	$url = "https://github.com/quadricsoftware/alike/build.num";
+	$res = json_decode(shell_exec("wget $url -q -O -"));
+	return trim($res);
+}
+
+
+function getModeStr($mode){
+	if($mode ==0){ return "Manager"; }
+	else if($mode ==1){ return "Headless Node"; }
+	else if($mode ==2){ return "Full Stack"; }
+}
+function setNodeMode($m){
+	if(!is_numeric($m)){ throw new Exception("Invalid node mode: $m"); }
+	if($m <0 || $m>2){ throw new Exception("Invalid node mode: $m"); }
+
+	$fn = "/home/alike/configs/node_mode";
+	file_put_contents($fn, $m);
+}
+
+function getNodeMode(){
+        $mode =2;
+        $fn = "/home/alike/configs/node_mode";
+        if(!file_exists($fn)){
+                file_put_contents($fn, 2);
+        }else{
+                $barf = trim(file_get_contents($fn));
+                if(is_numeric($barf) && $barf <3 && $barf >= 0){
+                        $mode = $barf;
+                }
+        }
+        return $mode;
+}
+
+function isModeDefined(){
+	$fn = "/home/alike/configs/node_mode";
+	if(file_exists($fn)){ return true; }
+	return false;
+}
+
+function genToken(){
+	$len = 12;
+	$half = ceil($len / 2);
+	$tok = substr(str_shuffle('0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'), 0, $len);
+	$tok = substr_replace($tok, '-', $half, 0);
+	return $tok;
+}
+
+function getAllIPs(){
+        $out = shell_exec("/sbin/ip -o -4 addr show | awk '{print $2, $4}' | grep -v '^br-' | grep -v 127.0.0.1 | grep -v '^docker'");
+        $ips = [];
+        $lines = explode("\n", trim($out));
+        foreach ($lines as $line) {
+		$line = preg_replace('/\s+/', ' ', $line);
+		list($dev, $ip) = explode(' ',$line);
+		list($ip, $mask) = explode('/',$ip);
+                $ips[] = $ip;
+        }
+        return $ips;
+}
+
+function getEnvs(){
+        $env = "/home/alike/.env";
+        $envs = [];
+        $lines = explode(PHP_EOL, @file_get_contents($env));
+        foreach ($lines as $line) {
+                $pair = explode('=', trim($line));
+                if (count($pair) == 2) {
+                        $key = trim($pair[0]);
+                        $value = trim($pair[1]);
+                        $envs[$key] = $value;
+		}
+        }
+        return $envs;
+}
+function checkEnvs(){
+        $env = "/home/alike/.env";
+        $envs = getEnvs();
+        $rev = @trim(file_get_contents("/usr/local/sbin/rev.num"));
+        if(is_numeric($rev)){ $envs["HOST_BLD"] = $rev; }
+
+	if(!array_key_exists("HOST_IP", $envs)){
+		$ip = pickIP();
+		if($ip === false){ return false; }
+		$envs["HOST_IP"] = $ip;
+		echo "Added $ip as HOST_IP\n";
+	}else {
+	        $ips = getAllIPs();
+		if(!in_array($envs["HOST_IP"], $ips)){
+			echo "Defined IP: ". $envs["HOST_IP"] ." NOT FOUND ON A3\n";
+			$ip = pickIP();
+			if($ip === false){ return false; }
+			$envs["HOST_IP"] = $ip;
+			echo "Using ". $envs["HOST_IP"]." as HOST_IP\n";
+		}
+	}
+
+	// write it out
+	$out = '';
+	foreach ($envs as $k=> $v) { $out .= "$k=$v". PHP_EOL; }
+	file_put_contents($env, $out);
+	return true;
+}
+
+
+function pickIP(){
+        $ips = getAllIPs();
+	if( count($ips) ==1){ 
+		// if just one, return it
+		return $ips[0]; 
+	}	 
+	else if(count($ips) == 0){ return false; }
+
+        echo "Please select your hostIP:\n";
+        echo "This IP will be used by clients to connect to your A3\n";
+        for($i=0; $i < count($ips);  $i++){
+                echo "$i) ". $ips[$i] ."\n";
+        }
+        $resp = getChoice();
+
+        while($resp < 0 || $resp > count($ips) -1){
+                echo "Invalid choice ($resp).  Choose again:\n";
+                $resp = getChoice();
+        }
+        echo "You selected: ". $ips[$resp] ."\n";
+        return $ips[$resp];
+}
+
+function checkNFSSec($list, $ip){
+    $ipArray = explode(',', $list);
+    foreach ($ipArray as $entry) {
+        $entry = trim($entry);
+
+        // Check if the entry is an IP or a subnet
+        if (filter_var($entry, FILTER_VALIDATE_IP)) {
+            // Check if the localIP matches the specific IP
+            if ($localIP === $entry) {
+                return true;
+            }
+        } elseif (strpos($entry, '/') !== false){
+
+            // Check if localIP is in the specified subnet
+            list($subnet, $mask) = explode('/', $entry);
+            if ((ip2long($ip) & ~((1 << (32 - $mask)) - 1)) == ip2long($subnet)) {
+                return true;
+            }
+	}
+    }
+
+    return false;
+}
+function getLocalIPs() {
+	$output = shell_exec('ip address show');
+	preg_match_all('/inet ([\d.]+)/', $output, $matches);
+	$ips = array();
+	foreach($matches[1] as $m){
+		if($m != "127.0.0.1" && $m != "172.17.0.1"){
+			array_push($ips,$m);
+		}
+	}
+	return $ips;
+}
+
+?>

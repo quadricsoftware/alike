@@ -1,0 +1,1145 @@
+#!/usr/bin/php -q
+<?php
+include_once("common_lib");
+
+declare(ticks = 1);
+
+setupSigHandlers();
+
+$GLOBALS["msg"]=" ";
+$GLOBALS["breakable"]=0;
+$GLOBALS["path_to_scripts"]= "/use/local/sbin";
+
+
+while (true){
+        mainMenu();
+}
+
+function mainMenu(){
+        system('clear');
+	$cur = getLatestBuildNum();
+        $bld = getCurrentBuild();
+	$bldShow = "\033[32m$bld\033[0m";
+	if($cur != null && $cur > $bld){
+		$bldShow = "\033[31m$bld (out of date: $cur)\033[0m";
+	}
+        $rev = trim(file_get_contents("/usr/local/sbin/rev.num"));
+        echo "\033[1;96mWelcome to the A3 Console\033[0m (Alike Build: $bldShow, A3 Host Rev# \033[32m$rev\033[0m)\n";
+
+
+        $webstate = getDockerStatusText();
+
+        $ip = getIP();
+        $mode = getNodeMode();
+
+        echo "The Alike Services are $webstate (\033[33mhttp://$ip/\033[0m)\n";
+	if($mode ==0){
+	}else{
+		if(!haveADS() ){
+		        echo "\033[1;33mNO ADS Detected!\033[0m\n";
+		}else{
+			$inf = getA3Info();
+		        echo "A3 Guid: \033[1;34m$inf->guid\033[0m\n";
+		}
+	}
+
+	echo "Mode: ". getModeStr($mode)."\n";
+
+	$svcstate = "Start";
+	if(getDockerStatus()){ $svcstate = "Stop"; }
+
+        echo "\nPlease choose from the following options:\n";
+        echo opt(1)." Configure IP & DNS\n";
+	if($mode != 0){
+	        echo opt(2)." Manage Backup Storage\n";
+	}
+        echo opt(3)." $svcstate Alike Services\n";
+        echo opt(4)." Command Prompt\n";
+        echo opt(5)." Check For Update\n";
+        echo opt(6)." Advanced Options\n";
+        echo opt(7)." \033[1;33mView Running Logs\033[0m\n";
+        echo opt(0)." Restart Appliance\n";
+
+        echo "\n\033[1;33m ".$GLOBALS["msg"] ." \033[0m\n";
+
+	$resp = getChoice(300);
+        if($resp ==""){
+                $GLOBALS["msg"]="";
+        }else{
+                processMainChoice($resp);
+        }
+}
+function processMainChoice($resp){
+        switch ($resp) {
+            case "1":
+                configNet();
+                break;
+            case "2":
+		if(getNodeMode() ==0){
+	                $GLOBALS["msg"] = "Not available for Managers.  Try again";
+		}else{
+			manageStorage();
+		}
+                break;
+            case "3":
+                doServiceState();
+                break;
+            case "4":
+		echo "Exiting to shell.  To return to this menu at anytime, enter \"menu\"\n";
+		exit(0);
+                break;
+            case "5":
+                getUpdate();
+                break;
+            case "6":
+                doAdvanced();
+                break;
+            case "7":
+                doViewLogs();
+                break;
+            case "0":
+                doRestart();
+                break;
+            default:
+                $GLOBALS["msg"] = "Unknown choice ($resp).  Try again";
+        }
+}
+
+function doViewLogs(){
+        echo "\nView System Logs:\n";
+        echo opt(1)." View console log file (Docker)\n";
+        echo opt(2)." View A3 log\n";
+        echo opt(3)." View Engine log\n";
+        echo opt(4)." View Syslog \n";
+        echo opt(0)." Return to Main Menu\n";
+
+        $resp = getChoice();
+        if($resp ==""){
+                $GLOBALS["msg"]="";
+        }else{
+                if ($resp == "1"){
+                        return doViewLogFile("docker");
+                }else if ($resp == "2"){
+                        return doViewLogFile("a3");
+                }else if ($resp == "3"){
+                        return doViewLogFile("engine");
+                }else if ($resp == "4"){
+                        return doViewLogFile("syslog");
+                }else if ($resp == "0"){
+                        return mainMenu();
+                }else{
+                        system('clear');
+                        echo "Invalid choice: $resp\n";
+                        return doViewLogs();
+                }
+        }
+}
+
+function doAdvanced(){
+        $mode = getNodeMode();
+	$ms = getModeStr($mode);
+
+	echo "\nCurrent Mode: $ms\n";
+        echo "\nAdvanced Options:\n";
+	if($mode ==2){
+	        echo opt(1)." Set Local Authentication (Alike UI)\n";
+	}
+	if($mode > 0){
+	        echo opt(2)." Create Support Archive\n";
+	}
+	try{
+		$sf = getSetting("noXenStartup");
+		if(!$sf){
+		        echo opt(3)." Enable \"Safe\" Xen startup (No NFS SR)\n";
+		}else{
+		        echo opt(3)." Disable \"Safe\" Xen startup (No NFS SR)\n";
+		}
+	}catch(Exception $ex){
+		echo "\033[1;31mWARNING:\033[0m  No DBs found for ADS- Safe mode settings unavailable\n";
+	}
+	$ms = getModeStr($mode);
+        echo opt(4)." Change Local Node Mode [$ms]\n";
+	if($mode == 1){
+	        if(!file_exists( "/mnt/ads/prodDBs/nimbusdb.db" )){ echo "*** No ADS/DBs found-- cannot see/set Manager Token.\n"; }
+		else{
+			$tok = getSetting("a3ManagerPass");
+			$tok = "\033[1;33m$tok\033[0m";
+		        echo opt(5)." Regenerate Manager Token [current: $tok]\n";
+		}
+	}
+        echo opt(0)." Return to Main Menu\n";
+
+	$resp = getChoice();
+        if($resp ==""){
+                $GLOBALS["msg"]="";
+        }else{
+		if ($resp == "1"){
+			return doLocalAuth();
+		}else if ($resp == "2"){
+			return doSupportTar();
+		}else if ($resp == "3"){
+			return doSafeMode();
+		}else if ($resp == "4"){
+			return doModeChange();
+		}else if ($resp == "5"){
+			return doTokenReset();
+		}else if ($resp == "0"){
+			return mainMenu();
+		}else{
+		        system('clear');
+			echo "Invalid choice: $resp\n";
+			return doAdvanced();
+		}
+        }
+}
+function doTokenReset(){
+        echo "\nRegenerate the Manager Token?\n";
+	echo "\nYou will need to enter the new token in your Manager UI\n";
+	if(getDockerStatus()){
+		echo "\nError: \033[1;33mServices Must Be Stopped first.\033[0m\n";
+		readline("Press any key to continue.");
+		return;
+
+	}
+	echo "\nContinue? (y/n) \n";
+	$resp = getYN(true);
+	if($resp){
+		$tok = genToken();
+		setSetting("a3ManagerPass", $tok);
+		echo "The local token has been changed.\n\n";
+		echo "Your new token is: \033[1;33m$tok\033[0m\n";
+		echo "Note: This token is case-sensitive.\n";
+		echo "Please start this node, then add the token to your A3 Manager\n";
+		readline("Press any key to continue.");
+		return;
+	}else{
+		return doAdvanced();
+	}
+	readline("Press any key to continue.");
+}
+function doModeChange($err=""){
+	if(getDockerStatus()){ $err = "Services Must Be Stopped!"; }
+
+        echo "\nSet Node Mode:\n";
+        $mode = getNodeMode();
+        echo opt(1)." Manager Only -- No backup services, managed remote A3 nodes\n";
+        echo opt(2)." Headless A3 Node --no UI, managed by an A3 Manager\n";
+        echo opt(3)." FullStack A3 -- All services (typical)\n";
+	echo opt(4)." Return to Advanced Menu\n";
+	echo opt(0)." Return to Main Menu\n";
+	if($err!=""){
+		echo "Note: \033[1;33m$err\033[0m\n";
+	}
+
+	$p = getChoice();
+        if($p ==""){
+                $GLOBALS["msg"]="";
+        }else{
+                if ($p == "1"){
+                        return setMode(0);
+                }else if ($p == "2"){
+                        return setMode(1);
+                }else if ($p == "3"){
+                        return setMode(2);
+                }else if ($p == "4"){
+			return doAdvanced();
+                }else if ($p == "0"){
+			return mainMenu();
+                }else{
+                        system('clear');
+                        return doModeChange("Invalid choice: $resp");
+                }
+        }
+}
+
+function setMode($m){
+	if(getDockerStatus()){ return doModeChange("Services Must Be Stopped!"); }
+
+        $cur = getNodeMode();
+	$sm = getModeStr($m);
+	if($cur == $m){
+		echo "You are already set to $sm\n";
+		readline("Press any key to continue.");
+		return doModeChange();
+	}
+	// we we have no node_mode file, then we can be whatever we want
+	// if we 1 or 2, then check for an ADS and error.  If no ads, then warn and allow
+	// if going between 1 & 2, we're good.
+
+	// we already have a node type.  Check for problems
+	if (isModeDefined()){
+		if($cur == 0){
+			echo "Switching from a standalone Manager is not recommended.\n";
+			echo "Any settings will be lost!\nContinue? (y/N) ";
+			$resp = getYN(true);
+			if(!$resp){  return doModeChange(); }
+
+		}else if($m == 0){
+			if(haveADS() ){
+				echo "ADS is still mounted!\n";
+				echo "Please unmount your ADS before changing to a $sm\n";
+				return doModeChange();
+			}
+		}
+	}
+
+	echo "Mode set to: $sm\n";
+	setNodeMode($m);
+	if($m > 0 && !haveADS()){
+		echo "\nDon't forget to define an ADS!\n\n";
+	}
+	readline("Press any key to continue.");
+
+}
+
+function doSafeMode(){
+	if(getDockerStatus() ){
+		echo "\033[1;33mAlike is Running! \033[0m \n";
+		echo "Please stop the Alike Services before continuing.\n\n";
+		readline("Press any key to continue.");
+		return;
+	}
+	try{
+		$sf = getSetting("noXenStartup");
+		$val = 0;
+		$state = "disabled";
+		if($sf == 0){
+			$val = 1;
+			$state = "enabled";
+		}
+		setSetting("noXenStartup", $val);
+		echo "\"Safe\" Xen mode $state\n";
+	}catch(Exception $ex){
+		echo "Error setting Xen mode:\n";
+		echo $ex->getMessage() ."\n";
+	}
+	echo "Press any key to continue\n";
+	trim(fgets(STDIN));
+	return;
+}
+
+function doSupportTar(){
+	echo "\nPreparing support archive...\n";
+	exec("/usr/local/sbin/makeSupportTar &>/dev/null");
+	echo "Archive created in /tmp/support_(timestamp).tar.gz \n";
+	echo "Press any key to continue\n";
+	trim(fgets(STDIN));
+}
+
+function doLocalAuth(){
+	echo "\nSet Local Login for Alike UI\n";
+	if(!file_exists("/mnt/ads/a3.lic.enc")){
+		echo "\nPlease note- This is only for use when the A3 cannot reach the internet.\n";
+		echo "The user/password will ONLY BE VALID FOR ONE LOGIN.\n\n";
+	}
+	echo "Please enter your username:\n";
+	$user = getEntry();
+	while (empty($user) ){
+		echo "\nSorry, please enter a valid username\n";
+		$user = getEntry();
+	}
+	echo "Please enter your Password:\n";
+	$pass = getPassword();
+	while (strpos($pass, ',') !== false || empty($pass)){
+		echo "\nInvalid password! Empty passwords and commas are not allowed.\n";
+		echo "Please re-enter password:\n";
+		$pass = getPassword();
+	}
+	echo "\nProceed?\n";
+	if(getYN() ){
+		exec("echo \"$user,$pass\" > /mnt/ads/a3.local.auth");
+		echo "\nLocal authentication set.\nPress any key to continue.";
+		trim(fgets(STDIN));
+	}
+
+}
+
+function doServiceState(){
+	$mode =getNodeMode();
+	if(getDockerStatus()){
+		if($mode !=0){
+			echo "Stop Alike?\nAny running jobs will be cancelled.\n";
+		}else{
+			echo "Stop Alike Manager?\nLicensing requests will be unavailable for new jobs while the services are down.\n";
+		}
+		if(getYN() ){
+			exec("cd /home/alike; sudo docker-compose down &");
+			return doViewDockerLog();
+		}else{
+			echo "No action taken";
+			return;
+		}
+	}else{
+		$mode =getNodeMode();
+		if(!haveADS() && $mode !=0 ){
+			echo "Please create/attach your backup storage first!\n";
+			echo "Press any key to continue.\n";
+			$resp = trim(fgets(STDIN));
+			return;
+		}
+		if($mode ==0){
+			echo "Starting Alike Manager, please wait...";
+		}else{
+			if(!checkEnvs()){
+				echo "Cancelling start due to failed environment check.\n";
+				echo "Press any key to continue.\n";
+				$resp = trim(fgets(STDIN));
+				return;
+			}
+			echo "Starting Alike, please wait...";
+		}
+		exec("cd /home/alike; sudo docker-compose up -d");
+		return doViewDockerLog();
+	}
+}
+
+function haveADS(){
+	if(file_exists("/mnt/ads/nods") || !is_dir("/mnt/ads/journals") ){
+		return false;
+	}
+	return true;
+}
+function haveODS(){
+	if(file_exists("/mnt/ods/nods") || !is_dir("/mnt/ods/journals") ){
+		return false;
+	}
+	return true;
+}
+
+function manageStorage(){
+        system('clear');
+	echo "Storage Options\n";
+        echo "\nPlease choose which storage to configure:\n\n";
+        echo opt(1)." Configure Primary Backup Storage (ADS)\n";
+	echo opt(2)." Configure Offsite Vault Storage (ODS)\n";
+        echo opt(9)." ADS Database tools\n";
+	echo opt(0)." Return to main menu\n\n";
+
+//        echo opt(9)." TEST TEST TEST REGISTER\n";
+
+	$resp = getChoice();
+        if($resp =="" || !is_numeric($resp)){
+                return manageStorage();
+        }
+	if($resp ==0){
+		return;
+	}else if($resp == 1){
+                return configDS("ads");
+	}else if($resp == 2){
+		return configDS("ods");
+	}else if($resp == 9){
+		return adsTools();
+		//return registerADS();
+	}
+
+	return manageStorage();
+}
+
+function adsTools(){
+
+	////	Check for ADS space!
+	$freeMB = getMountFreeMB("/mnt/ads");
+
+	if ($freeMB < 200){
+		echo "\033[1;33mWARNING:\033[0m Very Low Space on ADS! ($freeMB free)\n";
+		echo "Recovery may not work until more space is available.\n\n";
+		readline("Press any key to continue.");
+	}
+
+	echo "Tools to repair/recover ADS Databases\n";
+	echo opt(1)." Attempt DB Repair\n";
+	echo opt(2)." Attempt complete NimbusDB Recovery\n";
+	echo opt(0)." Return to previous menu\n";
+        $resp = getChoice();
+        while($resp =="" || !is_numeric($resp)){
+		echo "Invalid choice ($resp)\n";
+	        $resp = getChoice();
+        }
+	if ($resp ==3){
+		return manageStorage();
+	}
+	if(getDockerStatus() ){
+		echo "\033[1;33mAlike is Running! \033[0m \n";
+		echo "Please stop Alike before attempting any recovery\n\n";
+		readline("Press any key to continue.");
+		return manageStorage();
+	}
+	if ($resp ==1){
+		return repairDbMenu();
+	}else{
+		echo "Invalid choice!\n";
+		return manageStorage();
+	}
+}
+
+function repairDbMenu(){
+	echo "\nAttempt to repair a malformed DB\n";
+	echo "Please choose your DB:\n";
+	echo opt(1)." NimbusDB\n";
+	echo opt(2)." NimbusJobs\n";
+	echo opt(3)." GFS\n";
+	echo opt(4)." CacheDB\n";
+	echo opt(9)." Return to main menu\n";
+	echo opt(0)." Return to previous menu\n";
+        $resp = getChoice();
+        while($resp =="" || !is_numeric($resp)){
+		echo "Invalid choice ($resp)\n";
+	        $resp = getChoice();
+        }
+	if ($resp ==0){ return adsTools(); }
+	$dbFile ="";
+	if($resp == 1){ $dbFile = "nimbusdb.db"; }
+	else if($resp == 2){ $dbFile = "nimbusjobs.db"; }
+	else if($resp == 3){ $dbFile = "gfs.db"; }
+	else if($resp == 4){ $dbFile = "cache.db"; }
+	else if($resp == 9){ return; }
+	else{
+		echo "Invalid choice\n";
+		return repairDbMenu();
+	}
+	return fixDB($dbFile);
+}
+
+function fixDB($dbFile){
+	$test = "/usr/bin/sqlite3 /mnt/ads/prodDBs/$dbFile \"pragma integrity_check\"";
+	$res = trim(shell_exec($test));
+	if ($res == "ok"){
+		echo "$dbFile does not require repair. (Status $res)\n";
+		readline("Press any key to continue.");
+		return repairDbMenu();
+	}
+	echo "Attempting repair of $dbFile\n";
+	$test = "/usr/bin/sqlite3 /mnt/ads/prodDBs/$dbFile \".dump\" > /tmp/$dbFile";
+	$res = trim(shell_exec($test));
+	$test = "/usr/bin/sqlite3 /tmp/repaired.$dbFile < /tmp/$dbFile";
+	$res = trim(shell_exec($test));
+	echo "Copying existing DB to $dbFile.bak\n";
+	$res = trim(shell_exec("mv /mnt/ads/prodDBs/$dbFile /mnt/ads/prodDBs/$dbFile.bak"));
+	echo "Copying repaired DB to $dbFile\n";
+	$res = trim(shell_exec("mv /tmp/repaired.$dbFile /mnt/ads/prodDBs/$dbFile"));
+
+	echo "Repair Complete\n";
+	readline("Press any key to continue.");
+	return repairDbMenu();
+}
+
+function configDS($dsType){
+	$dsLabel = strtoupper($dsType);
+	$dsDesc = "Local Backups";
+	if($dsType == "ods"){ $dsDesc = "Offsite Backups"; }
+
+	if(getDockerStatus() ){
+		echo "\033[1;33mAlike is Running! \033[0m \n";
+		echo "Please stop Alike before adding or changing your $dsLabel\n\n";
+		readline("Press any key to continue.");
+		return;
+	}
+	$cur = getCurrentDS($dsType);
+	try{
+		$good = ["0","1","2","3","x"];
+		if ($cur->path != ""){
+			echo "\033[1;32mCurrent $dsLabel:\033[0m";
+			echo "\nType: \033[1;33m".$cur->type ."\033[0m \n";
+			echo "Path: \033[1;33m". $cur->path ."\033[0m \n";
+			echo "\nChange $dsLabel ($dsType):\n";
+			$good = ["0","1","2","3","4","x"];
+		}else{
+			echo "\033[1;33mNo $dsLabel Defined \033[0m \n";
+			echo "\nDefine $dsLabel ($dsDesc):\n";
+		}
+		echo opt(1)." Use NFS\n";
+		echo opt(2)." Use CIFS (SMB)\n";
+		if($dsType == "ads"){
+			echo opt(3)." Use Local Disk $dsLabel\n";
+		}else{
+	                echo opt(3)." Use S3 (or S3-compatible)\n";
+		}
+		if ($cur->path != ""){
+			echo opt(4)." Create Blank $dsType at existing path [warning]\n";
+			echo opt('x') . " Forget/Detach $dsLabel\n";
+		}
+
+		echo opt(0)." Return to main menu\n";
+		$resp = getChoice();
+		if( (!in_array($resp, $good, true) )){
+			return configDS($dsType);
+		}
+
+		if($resp =="0"){
+			return mainMenu();
+		}else if($resp == "1"){
+			setupNFS($dsType);
+		}else if($resp == "2"){
+			setupCIFS($dsType);
+		}else if($resp == "3"){
+			if($dsType == "ads"){
+				setupLocal($dsType);
+			}else{
+				setupS3($dsType);
+			}
+		}else if($resp == "4"){
+			if(haveADS()){
+				echo "Existing ADS detected at path.  Please provide a blank mount for /mnt/ads\n";
+				readline( "Press any key to continue.\n");
+				return configDS($dsType);
+			}
+			echo "This will create a blank new ADS.\nIf any data exists in the /mnt/ads location, it will be lost.\n";
+			echo "Continue? (y/N) ";
+			$resp = getYN(true);
+			if(!$resp){ return configDS($dsType); }
+
+		}else if($resp == "x"){
+			return forgetDS($dsType);
+		}
+
+		handleNewDS($dsType);
+        }catch(Exception $ex){
+		echo "Caught exception: ".$ex->getMessage();
+	}
+
+
+	readline("Press any key to return to main menu.");
+}
+
+function handleNewDS($type){
+	$up = strtoupper($type);
+	if (file_exists("/mnt/$type/nods") ) {
+		echo "Warning!  $up (/mnt/$type) is not properly mounted!\n";
+		echo "Please check system logs and fix the mount error.\n";
+		return;
+	}
+
+	// we need to check the /mnt/Xds for an ads.dat file
+	if($type== "ads"){
+		if(!haveADS()){
+			echo "This appears to be a new ADS.\n";
+			echo "Initializing new data-store.\n";
+//			echo "Would you like to initialize the default structure? (Y/n): ";
+//			$resp = getYN(true);
+//			if(!$resp){
+//				echo "Are you sure?\nAn uninitialized ADS will prevent Alike from functioning.\n";
+//				echo "Initialize the ADS? (Y/n): ";
+//				$resp = getYN(true);
+//				if(!$resp){  "Skipping ADS initialize...\n"; return;  }
+//			}
+			initDS($type);
+		}else{
+			$guid = "";
+			$gText ="";
+			if (file_exists("/mnt/ads/guid.id")){
+				$guid = trim(file_get_contents("/mnt/ads/guid.id"));
+				$gText = "(GUID: $guid)";
+			}
+			echo "\nFound existing ADS $gText\n";
+			echo "Please choose an option:\n";
+		        echo opt(1)." Reconnect ADS (preserve GUID)\n";
+		        echo opt(2)." Register ADS and reconnect (regenerate GUID)\n";
+		        echo opt(3)." Cancel and unmount\n";
+		        $resp = getChoice();
+		        while($resp =="" || !is_numeric($resp)){
+				echo "Invalid choice ($resp)\n";
+			        $resp = getChoice();
+		        }
+			if($resp == 3){
+				echo "Cancelling\n";
+				forgetDS($type);
+				return;
+			} else if($resp == 1){
+				echo "ADS Reconnected $gText\n";
+				return;
+			}else if($resp == 2){
+				registerADS(); // we need to register our installID
+				return;
+			}
+
+		}
+	}else if($type == "ods"){
+		if(!haveODS()){
+		//if( !file_exists("/mnt/ods/transact.tx") ){
+			echo "This appears to be a new ODS.\n";
+			echo "Would you like to initialize the default structure? [Required if new] (y/n): ";
+			$resp = getYN(true);
+			if(!$resp){ return; }
+			initDS($type);
+		}else{
+			//echo "Found existing ODS\n";
+		}
+	}
+}
+
+function registerADS(){
+	echo "Please wait, refreshing system libraries...";
+	exec("sudo docker pull quadricsoftware/a3-tool");
+	echo "Complete.\n";
+	$ip = getIP();
+	$hip = "hostIP=$ip";
+	$out =  managedRun("sudo docker run -v /mnt/ads:/ads quadricsoftware/a3-tool register $hip");
+	if($out->code != 0){
+		echo "Error creating new ADS!\n";
+		echo "Code: $out->code, Error: $out->stdOut ($out->stdErr)";
+	}
+	echo "\nPress any key to continue";
+	fgets(STDIN);
+	return $out->code;
+}
+
+function initDS($type){
+	echo "Please wait, refreshing system libraries...";
+	exec("sudo docker pull quadricsoftware/a3-tool");
+	echo "Complete.\n";
+	echo "Creating a new $type\n";
+	if($type=="ads"){
+		exec("sudo chown -R alike.alike /mnt/ads");
+		$bs = "blockSize=2048";
+		echo "BlockSize: 2MB  Change? (y/N): ";
+		$resp = getYN(true);
+		if($resp){
+			echo "Enter your desired block-size in MB. [2, 4, 6, or 8]: ";
+			$resp = trim(fgets(STDIN));
+			while($resp != 2 && $resp != 4 && $resp != 6 && $resp !=8){
+				echo "\nPlease try again.\n";
+				echo "Enter your desired block-size in MB. [2, 4, 6, or 8]: ";
+				$resp = trim(fgets(STDIN));
+			}
+			$nbs = $resp * 1024;
+			$bs="blockSize=$nbs";
+		}
+		$enc = "0";
+		echo "Enable block encryption? (y/N): ";
+		$resp = getYN(true);
+		if($resp){
+			echo "Please enter your encryption key.\n";
+			echo "Please record this safely.\n";
+			echo "(Blank to skip)\n";
+			$key = trim(fgets(STDIN));
+			if(!empty($key)){
+				$enc = "encKey=$key";
+			}
+		}
+		$ip = getIP();
+		$hip = "hostIP=$ip";
+		echo "Building ADS, please wait...\n";
+		echo shell_exec("sudo docker run -v /mnt/ads:/ads quadricsoftware/a3-tool ads $bs $enc $hip");
+		exec("sudo docker volume rm alike_instaboot > /dev/null 2>&1");
+		echo "\nPress any key to continue";
+		fgets(STDIN);
+	}else{
+		exec("sudo chown -R alike.alike /mnt/ods");
+		echo shell_exec("sudo docker run -v /mnt/ods:/ods quadricsoftware/a3-tool ods");
+	}
+}
+
+function configNet(){
+	system('clear');
+	$ip = getIP();
+	$dns = getDNS();
+
+	$dhcp =isDHCP();
+	$d = " [Static IP]";
+	if($dhcp ){ $d = " [DHCP] "; }
+
+	echo "\033[33mCurrent IP:\033[0m $ip $d\n";
+	echo "\033[33mCurrent DNS:\033[0m ";
+	foreach ($dns as $d){
+		echo "$d ";
+	}
+
+	if(getDockerStatus() ){
+		echo "\n\n\033[1;33mAlike is Running! \033[0m \n";
+		echo "Please stop Alike before adding or changing your networking\n\n";
+		readline("Press any key to continue.");
+		return;
+	}
+	echo "\n";
+        echo "\nPlease an option:\n\n";
+	if($dhcp){
+	        echo opt(1)." Configure Static IP & DNS\n";
+	}else{
+		echo opt(1)." Enable DHCP\n";
+	}
+        echo opt(0)." Return to main menu\n\n";
+
+        $resp = getChoice();
+        if($resp =="" || !is_numeric($resp)){
+                return configNet();
+        }
+        if($resp ==0){
+                return;
+        }else if($resp == 1){
+		if($dhcp){
+			// do some static ip collection
+			if(setStaticIP() ){
+				echo "IP config set\n\033[1;31mSystem Reboot Required!\033[0m\n";
+				echo "Please restart system for settings to take effect\n";
+				echo "Press any key to continue.\n";
+				fgets(STDIN);
+				return;
+			}
+		}else{
+			echo "Enable DHCP? (y/n) ";
+		        $c = trim(fgets(STDIN));
+		        if($c == "y" || $c == "Y"){
+				enableDHCP();
+				echo "DHCP enabled for eth0\n\033[1;31mSystem Reboot Required!\033[0m\n";
+				echo "Please restart system for settings to take effect\n";
+				echo "Press any key to continue.\n";
+				fgets(STDIN);
+				return;
+			}else { return configNet(); }
+		}
+        }
+
+        return configNet();
+}
+
+
+
+function setupCIFS($type){
+	echo "Please enter your CIFS Share path:\n";
+	echo "(Ex. //192.168.1.100/Share_path)\n";
+	$path = getEntry();
+	$path = str_replace("\\","/", $path);
+	if(empty($path)){ return; }
+	echo "Username:\n";
+	$user = getEntry();
+	echo "Password:\n";
+	$pass = getPassword();
+	echo "\nDomain: (leave blank for none)\n";
+	$dom = getEntry();
+	run("sudo /usr/local/sbin/mount-cifs.sh \"$path\" $type $user \"$pass\" $dom");
+	readline("Press any key to continue.");
+}
+
+function setupNFS($type){
+        echo "Please enter your NFS Server IP address:\n";
+        echo "(Ex. 192.168.1.100)\n";
+        $ip = getEntry();
+        if(filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) === false){
+                echo "Invalid IP: $ip\n";
+                echo "Try again (y/n)\n";
+                if(!getYN() ){ return configDS($type); }
+                else{ return setupNFS($type); }
+        }
+	$vers =3;
+	$versions = explode(",", trim(shell_exec("rpcinfo -s $ip| awk '$1 == 100003 {print $2}'")) );
+	if (count($versions) > 1){
+		echo "Select NAS supported NFS protocol:\n";
+		foreach($versions as $v){
+			if($v ==2){ break; }
+                        echo opt($v). " NFSv$v\n";
+		}
+	        echo opt("x") . " - Return to main menu\n";
+	        $r = getChoice();
+		while (!in_array($r, $versions) ){
+		        if($r == "x" ){
+		                echo "Exiting...\n";
+		                return mainMenu();
+			}
+			echo "Invalid choice ($r), try again.\n";
+		        $r = getChoice();
+		}
+		$vers=$r;
+	}else{
+		echo "NFS Versions could not be detected!  Defaulting to NFSv3\n";
+	}
+
+        echo "Getting export list, please wait...\n";
+        $raw = explode("\n", trim(shell_exec("showmount -e $ip | grep -v \"Export list\"")));
+        $shares = [];
+
+        foreach ($raw as $line) {
+            $parts = explode(" ", $line, 2);
+            $key = trim($parts[0]);
+            $value = isset($parts[1]) ? trim($parts[1]) : '';
+            $shares[$key] = $value;
+        }
+        if(empty($shares)){
+                echo "No NFS shares found for IP $ip\n";
+                readline("Press any key to continue.");
+                return setupNFS($type);
+        }
+        $ips = getLocalIPs();
+        $i=1;
+        echo "Please select your share:\n";
+        $paths = array();
+        foreach($shares as $s => $v){
+                $allowed = false;
+                foreach($ips as $lcl){
+                        if(checkNFSSec($v, $lcl)){
+                                $allowed = true; break;
+                        }
+                }
+                array_push($paths, $s);
+                if($allowed){
+                        echo opt($i). " $s\n";
+                }else{
+                        echo opt($i). " $s [\033[1;31mMay not be allowed by NFSServer ($v)\033[0m ]\n";
+                }
+                $i++;
+        }
+        echo opt("x") . " - Return to previous menu\n";
+        $r = getChoice();
+        if($r == "x" || $r== "X"){
+                echo "Exiting...\n";
+                return configDS($type);
+        }
+        $baseShare = $ip . ":". $paths[$r-1];
+        echo "Ok, using $baseShare\n";
+        exec("mkdir -p /home/alike/mnt-tmp");
+        $cmd = "sudo mount -o vers=$vers,soft,nolock,noatime,nodiratime,user $baseShare /home/alike/mnt-tmp; echo $?";
+        $res= shell_exec($cmd);
+        echo "Result: $res\n";
+        echo "Please enter the full path to your $type:\n$baseShare/";
+        $resp = trim(fgets(STDIN));
+        $fullPath = $baseShare ."/". $resp;
+        $lclTmp = "/home/alike/mnt-tmp/$resp";
+        echo "You said: $fullPath\n";
+        if(!is_dir($lclTmp)){
+                echo "Path does not exist: $fullPath\nCreate folder now? (y/n) ";
+                if(!getYN(true) ){
+                        exec( "sudo umount /home/alike/mnt-tmp");
+                        return configDS($type);
+                }
+                $cmd = "mkdir -p $lclTmp";
+                $res = shell_exec("mkdir -p $lclTmp; echo $?");
+                echo "Folder create result: $res\n";
+        }else{
+                echo "path $lclTmp exists\n";
+        }
+        $out = [];
+        $code = 0;
+        exec("stat -c '%a %U %G' {$lclTmp} 2>&1", $out, $code);
+        exec( "sudo umount /home/alike/mnt-tmp");
+        if ($code !== 0 ) {
+                echo  "Error retrieving filesystem attributes for the mount point ($code).";
+                echo "NFS Server may have permission/setting errors for this share.\n";
+                readline("Press any key to continue.");
+                return configDS($type);
+        }
+        list($perm, $owner, $group) = explode(' ', $out[0]);
+
+        if (($perm != "755" && $perm != "777") ) {
+                echo "The mounted NFS path does not have the expected permissions (755).";
+		echo "Found $perm $owner:$group\n";
+                echo "Please refer to the Alike KB article on configuring your NFS storage for Alike\n";
+                readline("Press any key to continue.");
+                return configDS($type);
+        }
+        echo "Remouting full path: $fullPath\n";
+        run("sudo /usr/local/sbin/mount-nfs.sh \"$fullPath\" $type $vers");
+        readline("Press any key to continue.");
+}
+
+function setupS3($type){
+        echo "Please enter your Storage Bucket Name:\n";
+        $bucket = getEntry();
+	if(empty($bucket)){ return; }
+        echo "Cloud Provider's Storage endpoint:\n";
+        echo "(Ex. s3.us-east-1.amazonaws.com, s3.wasabisys.com, etc)\n";
+        $ep = getEntry();
+        echo "Please enter your Access Key/ID:\n";
+        $key = getEntry();
+        echo "Please enter your Secret Key:\n";
+        $secret = getEntry();
+
+        run("sudo /usr/local/sbin/mount-s3.sh $bucket $ep $key \"$secret\" ");
+        readline("Press any key to continue.");
+}
+function setupLocal($type){
+	echo "\033[33mNote: Local virtual storage is not advised for Production backups!\033[0m\n\n";
+
+	$part = getLocalVolumeForDS();
+	if($part != ""){
+		run("sudo /usr/local/sbin/mount-local.sh $part $type");
+	}else{
+		echo "No local storage found.";
+		echo "\nPress any key to return to menu\n";
+		fgets(STDIN);
+	}
+}
+
+function forgetDS($type){
+	echo "Forgetting $type\n";
+	$cmd = "sudo umount /mnt/$type";
+	shell_exec($cmd);
+	$cmd = "rm -f /usr/local/sbin/mount-$type.sh";
+	shell_exec($cmd);
+	readline("Press any key to continue.");
+}
+
+function getUpdate(){
+	getLatestBuildNum(true);
+
+	echo "Checking for updates, please wait...\n";
+
+        $local = trim(file_get_contents("/usr/local/sbin/rev.num"));
+        $latest = trim(shell_exec("/usr/bin/curl --silent https://github.com/quadricsoftware/alike/host/a3.rev.num"));
+	if($latest > $local){
+		echo "A new update is available for the host environment (non Alike software)\n";
+		echo "This update will require a reboot.";
+		if(getDockerStatus() ){
+			echo "\n\033[1;33mAlike is Running! \033[0m \n";
+			echo "Please stop the services before applying updates.\n";
+			readline("\nPress any key to continue.");
+			return;
+		}
+		echo "Proceed? (y/N) ";
+
+		if(getYN()){
+			exec("sudo /usr/local/sbin/update_a3.sh");
+		}else{
+			echo "Host update skipped.\n";
+		}
+	}else{
+		echo "Host scripts are up to date ($local)\n";
+	}
+
+
+	$res= shell_exec("sudo /usr/local/sbin/update-check.sh");
+	if( strpos($res,"Update available" ) !== false){
+		$update = true;
+		echo "Alike Software has an update!\n";
+		echo "\033[0;32mUpdates are available! \033[0m \n";
+		if(getDockerStatus() ){
+			echo "\033[1;33mAlike is Running! \033[0m \n";
+			echo "Please restart the Alike Services to apply updates.\n\n";
+			readline("Press any key to continue.");
+			return;
+		}
+		readline("Press any key to continue.");
+	}else{
+		echo "No software updates (Alike) are available.\nPress any key to return to menu\n";
+		fgets(STDIN);
+	}
+}
+
+function doRestart(){
+	echo "Restart A3 Appliance now?\n";
+	if(getYN() ){
+		echo "Rebooting...";
+		exec("sudo reboot");
+		exit(0);
+	}else{
+		echo "Skipping reboot\n";
+	}
+
+}
+
+function doViewDockerLog(){
+	echo "Displaying docker log \n\033[1;33m[Press any key to exit]\033[0m\n";
+
+	$logLines = trim(shell_exec("sudo docker-compose --project-directory /home/alike logs -t --tail 10 2> /dev/null | grep -v 'exited with code' | grep -v 'Attaching to'"));
+	$lines = array_filter(explode("\n", $logLines));
+	$last = "";
+	foreach($lines as $l){
+		$l = trim($l);
+		if (empty($l)){ continue; }
+		echo "$l\n";
+		$last = $l;
+	}
+	while(true){
+	    if (keyPressed()) {
+			echo "Exiting!\n";
+			break;
+		}else if(  strpos($last, 'Enabling web UI') !== false ){
+			echo "End of log file reached.  Press any key to continue.\n";
+			fgets(STDIN);
+			return;
+		}
+		$logLine = trim(shell_exec("sudo docker-compose --project-directory /home/alike logs -t --tail 1 2> /dev/null| grep -v 'exited with code' | grep -v 'Attaching to'"));
+		if($logLine != $last){
+			echo "$logLine\n";
+			$last = $logLine;
+		}
+	        usleep(100000);
+
+	}
+	fgets(STDIN);
+}
+
+function doViewLogFile($log){
+        system('clear');
+	$logFile = '/home/alike/logs/a3.log';
+	if($log == "engine"){
+		$logFile = '/home/alike/logs/engine.log';
+	}else if($log == "syslog"){
+		$logFile = '/home/alike/logs/syslog';
+	}else if($log == "docker"){
+		return doViewDockerLog();
+	}
+	echo "Displaying recent entries in: $logFile \n\033[1;33m[Press any key to exit]\033[0m\n";
+	$logLines = shell_exec("tail -10 $logFile");
+	echo $logLines;
+	if (empty($logLines)) {
+		echo "Failed to open the log file: $log";
+		echo "\nPress any key to return\n";
+		fgets(STDIN);
+		return;
+	}
+
+	$last = trim(shell_exec("tail -1 $logFile"));
+	while (true){
+		if (keyPressed()) {
+			echo "Exiting!\n";
+			break;
+		}
+		$array = array_filter(explode("\n", trim(shell_exec("tail -20 $logFile")) ) );
+		$lines=  getNewItems($array, $last);
+		if (empty($lines)) {
+			usleep(100000);
+			continue;
+		}
+		$cnt =count($lines);
+		foreach($lines as $line){
+			echo "$line\n";
+			$last = $line;
+		}
+	}
+
+	fclose($file);
+}
+
+function getInput() {
+        stream_set_blocking(STDIN, false);
+        $read = array(STDIN);
+        $write = null;
+        $except = null;
+        $result = stream_select($read, $write, $except, 0);
+        stream_set_blocking(STDIN, true);
+        return $result;
+}
+
+function keyPressed() {
+        stream_set_blocking(STDIN, false);
+        $read = array(STDIN);
+        $write = null;
+        $except = null;
+        $result = stream_select($read, $write, $except, 0);
+        stream_set_blocking(STDIN, true);
+        return ($result === 1);
+}
+
+function getNewItems($array, $search) {
+	$array = array_map('trim', $array);
+	$found = array_search($search, $array);
+	if ($found !== false) {
+		$newArray = array_slice($array, $found + 1);
+		return $newArray;
+	}
+	return $array;
+}
+function getCurrentBuild(){
+        $bld = "N/A";
+
+	$static = trim(shell_exec("grep \"image: quadricsoftware/alike-v7:\" /home/alike/docker-compose.yml | awk -F':' '{print \$NF}'"));
+	if(!empty($static)){
+		return $static;
+	}
+	$res =  trim(shell_exec("sudo docker ps | grep alike-v7"));
+        if(empty($res)){ return $bld; }
+
+        $res =  trim(shell_exec("sudo docker-compose -f /home/alike/docker-compose.yml  exec alike cat /home/alike/Alike/build.num"));
+        if(!empty($res)){ $bld = $res; }
+        return $bld;
+}
+?>
