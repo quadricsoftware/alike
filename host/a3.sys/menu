@@ -973,7 +973,7 @@ function getUpdate(){
 	echo "Checking for updates, please wait...\n";
 
         $local = trim(file_get_contents("/usr/local/sbin/rev.num"));
-        $latest = trim(shell_exec("/usr/bin/curl --silent https://github.com/quadricsoftware/alike/host/a3.rev.num"));
+        $latest = trim(shell_exec("/usr/bin/curl --silent https://raw.githubusercontent.com/quadricsoftware/alike/main/host/a3.rev.num"));
 	if($latest > $local){
 		echo "A new update is available for the host environment (non Alike software)\n";
 		echo "This update will require a reboot.";
