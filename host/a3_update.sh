@@ -41,7 +41,7 @@ fi
 [ -f /home/alike/logs/ws.log ] && rm /home/alike/logs/ws.log
 
 echo "Downloading latest A3 Host updates"
-wget -qO /tmp/a3.sys.tgz https://github.com/quadricsoftware/alike/host/a3.sys.tgz
+wget -qO /tmp/a3.sys.tgz https://raw.githubusercontent.com/quadricsoftware/alike/main/host/a3.sys.tgz
 tar -zxf /tmp/a3.sys.tgz -C /usr/local/sbin/
 dos2unix /usr/local/sbin/makeSupportTar
 mv /usr/local/sbin/bashrc /home/alike/.bashrc
@@ -69,11 +69,11 @@ echo "0 2 * * *    /usr/local/sbin/docker-clean.sh 2&>1 > /dev/null" | crontab -
 
 if [ ! -f "/home/alike/docker-compose.yml" ]; then
 	echo "Downloading Alike default contigs"
-	wget -qO /home/alike/docker-compose.yml https://github.com/quadricsoftware/alike/docker/docker-compose.yml 
+	wget -qO /home/alike/docker-compose.yml https://raw.githubusercontent.com/quadricsoftware/alike/main/docker/docker-compose.yml 
 else
 	echo "Existing docker-compose.yml found.  Skipping update, using existing config."
 fi
-wget -qO - 'https://github.com/quadricsoftware/alike/host/a3.rev.num' > /usr/local/sbin/rev.num
+wget -qO - 'https://raw.githubusercontent.com/quadricsoftware/alike/main/host/a3.rev.num' > /usr/local/sbin/rev.num
 echo 
 if [ ${sysUpdate} -eq 1 ]; then
 	echo "Updating A3 system packages"
