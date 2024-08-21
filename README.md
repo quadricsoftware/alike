@@ -3,7 +3,7 @@ Project for Alike Backup, a BDR solution for XenServer, XCP-ng, and Hyper-V virt
 
 ## Xen Virtual Appliance (A3)
 The simplest and fastest way to get up and running with Alike is to use our pre-made, Alpine Linux based virtual appliance.
-To install, [download the XVA image](https://github.com/quadricsoftware/alike/raw/main/binaries/A3_v1.0.5.xva.zip), and import into your Xen environment
+To install, [download the XVA image](https://github.com/quadricsoftware/alike/raw/main/binaries/A3_v1.0.5.xva.7z), and import into your Xen environment
 Boot the VM, follow the command line menu steps to add storage, and start the Alike services.
 Once the Alike services start, switch to the Web UI to continue the setup and get started.
 
