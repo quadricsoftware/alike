@@ -1,5 +1,6 @@
 # alike
-Project for Alike Backup, a BDR solution for XenServer, XCP-ng, and Hyper-V virtualization platforms. Download the prebuilt platform with the Docker 
+Project for Alike Backup, a BDR solution for XenServer, XCP-ng, and Hyper-V virtualization platforms. 
+Download the prebuilt platform with the Docker image, or you can use our pre-made virtual appliance (below)
 
 ## Xen Virtual Appliance (A3)
 The simplest and fastest way to get up and running with Alike is to use our pre-made, Alpine Linux based virtual appliance.
