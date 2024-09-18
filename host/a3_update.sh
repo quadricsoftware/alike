@@ -13,8 +13,6 @@ do
             ;;
         --*) echo "bad option $1"
             ;;
-#        *) echo "argument $1"
-#            ;;
     esac
     shift
 done
@@ -28,17 +26,17 @@ if [ ${quiet} -eq 0 ]; then
 	echo
 fi
 
-if [ -f /usr/local/sbin/mount-ods.sh ]; then
-	ourHash="6dbab42575e12eb0e54d4a7c4d4c71c8"
-	testee="/usr/local/sbin/mount-ods.sh"
-	theirHash=$(md5sum "$testee" | awk '{print $1}')
-	if [ "$theirHash" == "$ourHash" ]; then
-	    rm "$testee"
-	#    echo "File $testee has been deleted."
-	fi
+[ -f /home/alike/logs/ws.log ] && rm /home/alike/logs/ws.log
+
+if ! id -nG "alike" | grep -qw "docker"; then                                                                                                                                                 
+    if sudo addgroup -S "alike" "docker" ; then                                                                                                                                               
+        echo "User alike successfully added to group docker."                                                                                                                                 
+    else                                                                                                                                                                                      
+        echo "Failed to add user alike to docker group."                                                                                                                                      
+        exit 1                                                                                                                                                                                
+    fi
 fi
 
-[ -f /home/alike/logs/ws.log ] && rm /home/alike/logs/ws.log
 
 echo "Downloading latest A3 Host updates"
 wget -qO /tmp/a3.sys.tgz https://raw.githubusercontent.com/quadricsoftware/alike/main/host/a3.sys.tgz
@@ -48,7 +46,6 @@ mv /usr/local/sbin/bashrc /home/alike/.bashrc
 chown alike.alike /home/alike/.bashrc
 if [ -f /usr/local/sbin/sudoers ]; then
 	mv -f /usr/local/sbin/sudoers /etc/
-#	sudo mv -f /usr/local/sbin/sudoers /etc/	
 	chown root.root /etc/sudoers
 	chmod 440 /etc/sudoers
 fi
@@ -62,10 +59,6 @@ ln -sfn /usr/local/sbin/update_a3.sh /etc/periodic/daily/
 ln -sfn /usr/local/sbin/update-check.sh /etc/periodic/daily/
 
 echo "0 2 * * *    /usr/local/sbin/docker-clean.sh 2&>1 > /dev/null" | crontab -
-#crontab - <<EOF
-#0 2 * * * /usr/local/sbin/docker-clean.sh 2>&1 > /dev/null
-#0 3 * * * /usr/local/sbin/update-check.sh 2>&1 > /dev/null
-#EOF
 
 if [ ! -f "/home/alike/docker-compose.yml" ]; then
 	echo "Downloading Alike default contigs"
